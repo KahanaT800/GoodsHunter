@@ -1,0 +1,84 @@
+name: Build and Push Images
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: ["main"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: api
+            dockerfile: build/api/Dockerfile
+            image_name: goodshunter-api
+          - name: crawler
+            dockerfile: build/crawler/Dockerfile
+            image_name: goodshunter-crawler
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase Repo Owner
+        run: |
+          echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push (${{ matrix.name }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_OWNER }}/${{ matrix.image_name }}:latest
+            ghcr.io/${{ env.REPO_OWNER }}/${{ matrix.image_name }}:${{ github.sha }}
+
+  deploy-ec2:
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/GoodsHunter
+            
+            # 1. 拉取最新代码 (主要是 docker-compose.yml 和 nginx 配置)
+            git pull origin main
+            
+            # 2. 登录 GHCR (使用 GitHub 临时 Token 比较复杂，通常建议在 EC2 手动登录一次或使用 PAT)
+            # 或者，如果您的仓库是 Public 的，则不需要登录即可拉取
+            
+            # 3. 拉取最新镜像
+            docker compose pull api crawler
+
+            # 4. 重启业务服务 (包含 nginx 以应用最新配置)
+            docker compose up -d api crawler nginx
+            
+            # 5. 清理旧镜像
+            docker image prune -f

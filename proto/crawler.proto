@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package crawler;
+
+option go_package = "./pb";
+
+// 支持多平台的爬虫服务接口。
+service CrawlerService {
+  // 进行商品抓取。
+  rpc FetchItems(FetchRequest) returns (FetchResponse) {}
+}
+
+// 平台枚举。
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_MERCARI = 1;
+  PLATFORM_YAHOO_AUCTION = 2;
+}
+
+// 排序字段。
+enum SortBy {
+  SORT_BY_CREATED_TIME = 0; // 默认，按创建时间
+  SORT_BY_PRICE = 1; // 价格
+  SORT_BY_SCORE = 2; // 相关度/评分
+  SORT_BY_NUM_LIKES = 3; // 点赞/收藏数
+}
+
+// 排序方向。
+enum SortOrder {
+  SORT_ORDER_DESC = 0; // 默认，降序
+  SORT_ORDER_ASC = 1; // 升序
+}
+
+// 爬虫请求参数。
+message FetchRequest {
+  // 基础信息
+  string task_id = 1;
+  Platform platform = 2;
+  string keyword = 3;
+
+  // 过滤条件
+  int32 min_price = 4;
+  int32 max_price = 5;
+  repeated string exclude_keywords = 6;
+  bool only_on_sale = 7;
+
+  // 控制参数
+  int32 limit = 8;
+  SortBy sort = 9;
+  SortOrder order = 10;
+}
+
+// 商品信息。
+message Item {
+  // 核心数据
+  string source_id = 1;
+  string title = 2;
+  int32 price = 3;
+  string image_url = 4;
+  string item_url = 5;
+
+  // 元数据
+  Platform platform = 6;
+  string status = 7;
+  string currency = 8;
+}
+
+// 抓取响应。
+message FetchResponse {
+  repeated Item items = 1;
+  int32 total_found = 2;
+  string error_message = 3;
+}

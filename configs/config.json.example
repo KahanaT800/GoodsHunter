@@ -1,0 +1,38 @@
+{
+  "app": {
+    "env": "local",
+    "log_level": "info",
+    "http_addr": ":8081",
+    "crawler_grpc_addr": "localhost:50051",
+    "schedule_interval": "5m",
+    "new_item_duration": "1h",
+    "max_items_per_task": 300,
+    "worker_pool_size": 50,
+    "queue_capacity": 1000
+  },
+  "mysql": {
+    "dsn": "root:your_password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local"
+  },
+  "redis": {
+    "addr": "localhost:6379",
+    "password": "your_redis_password"
+  },
+  "browser": {
+    "bin_path": "",
+    "proxy_url": "",
+    "headless": true,
+    "max_concurrency": 5,
+    "max_fetch_count": 50
+  },
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "your_email@gmail.com",
+    "smtp_pass": "your_app_password",
+    "from_email": "your_email@gmail.com"
+  },
+  "security": {
+    "jwt_secret": "change_me_in_production",
+    "invite_code": ""
+  }
+}
