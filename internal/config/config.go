@@ -37,6 +37,11 @@ type AppConfig struct {
 	WorkerPoolSize   int           `json:"worker_pool_size"`   // Worker Pool 大小（并发任务数）
 	QueueCapacity    int           `json:"queue_capacity"`     // 队列容量
 	JWTSecret        string        `json:"jwt_secret"`         // JWT 签名密钥
+
+	// Redis Streams 任务队列配置
+	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
+	TaskQueueStream  string `json:"task_queue_stream"`  // Redis Stream 名称
+	TaskQueueGroup   string `json:"task_queue_group"`   // Consumer Group 名称
 }
 
 // MySQLConfig MySQL 数据库配置。
@@ -172,6 +177,11 @@ func getDefaultConfig() *Config {
 			WorkerPoolSize:   50,
 			QueueCapacity:    1000,
 			JWTSecret:        "dev_secret_change_me",
+
+			// Redis Streams 默认配置
+			EnableRedisQueue: false, // 默认关闭，渐进式升级
+			TaskQueueStream:  "goodshunter:task:queue",
+			TaskQueueGroup:   "scheduler_group",
 		},
 		MySQL: MySQLConfig{
 			DSN: "root:password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local",
@@ -240,6 +250,13 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.QueueCapacity == 0 {
 		cfg.App.QueueCapacity = defaults.App.QueueCapacity
+	}
+	// Redis Streams 默认值
+	if cfg.App.TaskQueueStream == "" {
+		cfg.App.TaskQueueStream = defaults.App.TaskQueueStream
+	}
+	if cfg.App.TaskQueueGroup == "" {
+		cfg.App.TaskQueueGroup = defaults.App.TaskQueueGroup
 	}
 	if cfg.Security.JWTSecret == "" {
 		if cfg.App.JWTSecret != "" {
@@ -328,6 +345,17 @@ func applyEnvOverrides(cfg *Config) {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.App.QueueCapacity = i
 		}
+	}
+
+	// Redis Streams 环境变量
+	if v := os.Getenv("APP_ENABLE_REDIS_QUEUE"); v != "" {
+		cfg.App.EnableRedisQueue = v == "true" || v == "1"
+	}
+	if v := os.Getenv("APP_TASK_QUEUE_STREAM"); v != "" {
+		cfg.App.TaskQueueStream = v
+	}
+	if v := os.Getenv("APP_TASK_QUEUE_GROUP"); v != "" {
+		cfg.App.TaskQueueGroup = v
 	}
 
 	if v := viper.GetString("jwt_secret"); v != "" {

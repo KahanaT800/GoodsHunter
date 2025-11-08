@@ -1,0 +1,184 @@
+// Package metrics 提供 Prometheus 监控指标定义和工具函数。
+package metrics
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Redis Queue 相关指标
+var (
+	// RedisQueueLength Redis Stream 当前队列长度
+	RedisQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_redis_queue_length",
+		Help: "Current length of Redis Streams task queue",
+	})
+
+	// RedisQueuePending Consumer Group 待处理消息数量
+	RedisQueuePending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_redis_queue_pending",
+		Help: "Number of pending messages in consumer group",
+	})
+
+	// RedisQueueLag 消费延迟（队列最新消息 ID 与消费者读取位置的差距）
+	RedisQueueLag = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_redis_queue_lag",
+		Help: "Consumer lag in Redis Streams (difference between latest and consumed message ID)",
+	})
+)
+
+// Worker Pool 相关指标
+var (
+	// WorkerPoolActive 当前活跃的 Worker 数量
+	WorkerPoolActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_worker_pool_active",
+		Help: "Number of currently active workers",
+	})
+
+	// WorkerPoolPending 内存队列中待处理任务数量
+	WorkerPoolPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_worker_pool_pending",
+		Help: "Number of pending tasks in worker pool queue",
+	})
+
+	// WorkerPoolCapacity Worker Pool 总容量
+	WorkerPoolCapacity = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_worker_pool_capacity",
+		Help: "Total capacity of worker pool",
+	})
+
+	// WorkerPoolUtilization Worker Pool 利用率（百分比）
+	WorkerPoolUtilization = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_worker_pool_utilization",
+		Help: "Worker pool utilization percentage (0-100)",
+	})
+)
+
+// 任务处理相关指标
+var (
+	// TasksProcessedTotal 已处理任务总数（按状态分类）
+	TasksProcessedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_tasks_processed_total",
+		Help: "Total number of processed tasks",
+	}, []string{"status"}) // status: success, failed, timeout, dropped
+
+	// TaskProcessingDuration 任务处理耗时分布
+	TaskProcessingDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_task_processing_duration_seconds",
+		Help:    "Task processing duration in seconds",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}, // 0.1s ~ 5min
+	}, []string{"action"}) // action: execute, stop
+
+	// TaskQueueWaitTime 任务在队列中的等待时间
+	TaskQueueWaitTime = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "goodshunter_task_queue_wait_time_seconds",
+		Help:    "Time tasks spend waiting in queue before processing",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30},
+	})
+
+	// ActiveTasks 当前正在执行的任务数量
+	ActiveTasks = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_active_tasks",
+		Help: "Number of tasks currently being processed",
+	})
+)
+
+// HTTP API 相关指标
+var (
+	// HTTPRequestsTotal HTTP 请求总数
+	HTTPRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_http_requests_total",
+		Help: "Total number of HTTP requests",
+	}, []string{"method", "path", "status"})
+
+	// HTTPRequestDuration HTTP 请求耗时分布
+	HTTPRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_http_request_duration_seconds",
+		Help:    "HTTP request latencies in seconds",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5},
+	}, []string{"method", "path"})
+
+	// HTTPRequestSize HTTP 请求体大小
+	HTTPRequestSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_http_request_size_bytes",
+		Help:    "HTTP request size in bytes",
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6), // 100B ~ 10MB
+	}, []string{"method", "path"})
+
+	// HTTPResponseSize HTTP 响应体大小
+	HTTPResponseSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_http_response_size_bytes",
+		Help:    "HTTP response size in bytes",
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6),
+	}, []string{"method", "path"})
+)
+
+// 爬虫相关指标
+var (
+	// CrawlerRequestsTotal 爬虫请求总数
+	CrawlerRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_crawler_requests_total",
+		Help: "Total number of crawler requests",
+	}, []string{"platform", "status"}) // platform: amazon, jd, taobao; status: success, failed
+
+	// CrawlerRequestDuration 爬虫请求耗时
+	CrawlerRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_crawler_request_duration_seconds",
+		Help:    "Crawler request duration in seconds",
+		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60},
+	}, []string{"platform"})
+
+	// CrawlerErrorsTotal 爬虫错误总数
+	CrawlerErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_crawler_errors_total",
+		Help: "Total number of crawler errors",
+	}, []string{"platform", "error_type"}) // error_type: timeout, parse_error, network_error
+)
+
+// 数据库相关指标（GORM 会自动暴露部分指标）
+var (
+	// DBConnectionsActive 当前活跃数据库连接数
+	DBConnectionsActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_db_connections_active",
+		Help: "Number of active database connections",
+	})
+
+	// DBConnectionsIdle 当前空闲数据库连接数
+	DBConnectionsIdle = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_db_connections_idle",
+		Help: "Number of idle database connections",
+	})
+
+	// DBQueryDuration 数据库查询耗时
+	DBQueryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_db_query_duration_seconds",
+		Help:    "Database query duration in seconds",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2},
+	}, []string{"table", "operation"}) // operation: select, insert, update, delete
+)
+
+// 系统指标
+var (
+	// SchedulerMode 调度器当前模式（0=polling, 1=redis_streams）
+	SchedulerMode = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_scheduler_mode",
+		Help: "Scheduler mode (0=db_polling, 1=redis_streams)",
+	})
+
+	// ServiceUptime 服务启动时间（Unix timestamp）
+	ServiceUptime = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_service_uptime_seconds",
+		Help: "Service uptime in seconds since startup",
+	})
+)
+
+// InitMetrics 初始化指标（设置静态值）
+func InitMetrics(enableRedis bool, workerCapacity int) {
+	if enableRedis {
+		SchedulerMode.Set(1)
+	} else {
+		SchedulerMode.Set(0)
+	}
+
+	WorkerPoolCapacity.Set(float64(workerCapacity))
+}

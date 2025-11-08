@@ -14,10 +14,13 @@ import (
 	"goodshunter/internal/api/scheduler"
 	"goodshunter/internal/config"
 	"goodshunter/internal/model"
+	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/notify"
+	"goodshunter/internal/pkg/taskqueue"
 	"goodshunter/proto/pb"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -30,14 +33,15 @@ import (
 //
 // 它持有数据库连接、Redis 客户端、爬虫 gRPC 客户端以及 Gin 路由引擎。
 type Server struct {
-	cfg     *config.Config
-	logger  *slog.Logger
-	db      *gorm.DB
-	rdb     *redis.Client
-	crawler pb.CrawlerServiceClient
-	router  *gin.Engine
-	sched   *scheduler.Scheduler
-	auth    *auth.Handler
+	cfg          *config.Config
+	logger       *slog.Logger
+	db           *gorm.DB
+	rdb          *redis.Client
+	crawler      pb.CrawlerServiceClient
+	router       *gin.Engine
+	sched        *scheduler.Scheduler
+	auth         *auth.Handler
+	taskProducer *taskqueue.Producer // Redis Streams 任务生产者
 }
 
 // NewServer 初始化 API 服务器。
@@ -97,9 +101,24 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		2*time.Minute,
 		cfg.App.NewItemDuration,
 		cfg.App.MaxItemsPerTask,
-		cfg.App.WorkerPoolSize, // Worker Pool 大小
-		cfg.App.QueueCapacity,  // 队列容量
+		cfg.App.WorkerPoolSize,   // Worker Pool 大小
+		cfg.App.QueueCapacity,    // 队列容量
+		cfg.App.EnableRedisQueue, // 是否启用 Redis Streams
 	)
+
+	// 初始化任务生产者（如果启用 Redis Streams）
+	var taskProducer *taskqueue.Producer
+	if cfg.App.EnableRedisQueue {
+		taskProducer = taskqueue.NewProducer(rdb, logger, cfg.App.TaskQueueStream)
+		logger.Info("task producer initialized",
+			slog.String("stream", cfg.App.TaskQueueStream),
+			slog.Bool("enabled", true))
+	} else {
+		logger.Info("redis queue disabled, using polling mode")
+	}
+
+	// 初始化 Prometheus 指标
+	metrics.InitMetrics(cfg.App.EnableRedisQueue, cfg.App.WorkerPoolSize)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -107,14 +126,15 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 	r.Use(middleware.RequestLogger(logger))
 
 	s := &Server{
-		cfg:     cfg,
-		logger:  logger,
-		db:      db,
-		rdb:     rdb,
-		crawler: crawlerClient,
-		router:  r,
-		sched:   sched,
-		auth:    auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
+		cfg:          cfg,
+		logger:       logger,
+		db:           db,
+		rdb:          rdb,
+		crawler:      crawlerClient,
+		router:       r,
+		sched:        sched,
+		auth:         auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
+		taskProducer: taskProducer,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -130,8 +150,13 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 //
 //	error: 服务器运行出错时返回
 func (s *Server) Run() error {
-	// 在后台启动调度器
+	// 在后台启动调度器（主消费者）
 	go s.sched.Run(context.Background())
+
+	// 如果启用了 Redis Streams，启动周期发布器
+	if s.cfg.App.EnableRedisQueue {
+		go s.sched.RunPeriodicPublisher(context.Background())
+	}
 
 	s.logger.Info("api server listening", slog.String("addr", s.cfg.App.HTTPAddr))
 	return s.router.Run(s.cfg.App.HTTPAddr)
@@ -177,6 +202,9 @@ func (s *Server) registerRoutes() {
 	s.router.StaticFile("/", "./web/index.html")
 	s.router.Static("/assets", "./web/assets")
 
+	// Prometheus metrics 端点
+	s.router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
 	s.router.GET("/healthz", s.handleHealthz)
 
 	s.router.POST("/register", s.auth.Register)
@@ -193,6 +221,7 @@ func (s *Server) registerRoutes() {
 	authed.POST("/me/delete", s.handleDeleteAccount)
 	authed.POST("/tasks", s.handleCreateTask)
 	authed.GET("/tasks", s.handleListTasks)
+	authed.PATCH("/tasks/:id", s.handleUpdateTask)
 	authed.POST("/tasks/:id/status", s.handleUpdateTaskStatus)
 	authed.PATCH("/tasks/:id/notify", s.handleToggleNotify)
 	authed.DELETE("/tasks/:id", s.handleDeleteTask)
@@ -254,6 +283,14 @@ type updateTaskStatusRequest struct {
 
 type updateNotifyRequest struct {
 	Enabled bool `json:"enabled"`
+}
+
+type updateTaskRequest struct {
+	Keyword  *string `json:"keyword"`
+	MinPrice *int32  `json:"min_price"`
+	MaxPrice *int32  `json:"max_price"`
+	Platform *int    `json:"platform"`
+	Sort     *string `json:"sort"`
 }
 
 // handleDeleteTask 删除任务并清理关联。
@@ -474,6 +511,74 @@ func (s *Server) handleUpdateTaskStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": req.Status})
 }
 
+func (s *Server) handleUpdateTask(c *gin.Context) {
+	if getUserRole(c) == "guest" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "演示模式下禁止修改任务"})
+		return
+	}
+	id := c.Param("id")
+	userID := getUserID(c)
+
+	var req updateTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if req.Keyword != nil {
+		keyword := strings.TrimSpace(*req.Keyword)
+		if keyword == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid keyword"})
+			return
+		}
+		updates["keyword"] = keyword
+	}
+	if req.MinPrice != nil {
+		if *req.MinPrice < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid min_price"})
+			return
+		}
+		updates["min_price"] = *req.MinPrice
+	}
+	if req.MaxPrice != nil {
+		if *req.MaxPrice < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid max_price"})
+			return
+		}
+		updates["max_price"] = *req.MaxPrice
+	}
+	if req.Platform != nil {
+		if *req.Platform <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid platform"})
+			return
+		}
+		updates["platform"] = *req.Platform
+	}
+	if req.Sort != nil {
+		sortBy, sortOrder := mapSortAndOrder(*req.Sort)
+		if sortBy == -1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sort"})
+			return
+		}
+		updates["sort_by"] = sortBy
+		updates["sort_order"] = sortOrder
+	}
+
+	if len(updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no updates"})
+		return
+	}
+
+	if err := s.db.Model(&model.Task{}).Where("id = ? AND user_id = ?", id, userID).Updates(updates).Error; err != nil {
+		s.logger.Error("update task failed", slog.String("error", err.Error()))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"updated": true})
+}
+
 // handleCreateTask 处理创建监控任务的请求。
 //
 // POST /tasks
@@ -532,9 +637,24 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		return
 	}
 
-	// 如果任务状态为 running，立即启动调度器
+	// 如果任务状态为 running，发布到队列
 	if task.Status == "running" {
-		s.sched.StartTask(context.Background(), &task)
+		if s.cfg.App.EnableRedisQueue && s.taskProducer != nil {
+			// 新模式：发布到 Redis Streams
+			if err := s.taskProducer.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
+				s.logger.Warn("publish task to redis failed, fallback to direct schedule",
+					slog.Uint64("task_id", uint64(task.ID)),
+					slog.String("error", err.Error()))
+				// 降级：如果 Redis 失败，使用原有方式
+				s.sched.StartTask(context.Background(), &task)
+			} else {
+				s.logger.Info("task submitted to redis queue",
+					slog.Uint64("task_id", uint64(task.ID)))
+			}
+		} else {
+			// 旧模式：直接启动调度器
+			s.sched.StartTask(context.Background(), &task)
+		}
 	}
 
 	c.JSON(http.StatusOK, createTaskResponse{ID: task.ID})
@@ -673,7 +793,9 @@ func (s *Server) handleTimeline(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"items": items,
+		"items":   items,
+		"status":  s.loadTaskCrawlStatus(c, taskID),
+		"message": s.loadTaskCrawlMessage(c, taskID),
 	})
 }
 
@@ -687,7 +809,11 @@ func (s *Server) handleTimelineGuest(c *gin.Context) {
 	cacheKey := "guest:task:" + taskID + ":items"
 	raw, err := s.rdb.Get(c, cacheKey).Result()
 	if err != nil || raw == "" {
-		c.JSON(http.StatusOK, gin.H{"items": []timelineItem{}})
+		c.JSON(http.StatusOK, gin.H{
+			"items":   []timelineItem{},
+			"status":  s.loadTaskCrawlStatus(c, taskID),
+			"message": s.loadTaskCrawlMessage(c, taskID),
+		})
 		return
 	}
 
@@ -699,7 +825,35 @@ func (s *Server) handleTimelineGuest(c *gin.Context) {
 	for i := range items {
 		items[i].ItemURL = toFullMercariURL(items[i].ItemURL)
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	c.JSON(http.StatusOK, gin.H{
+		"items":   items,
+		"status":  s.loadTaskCrawlStatus(c, taskID),
+		"message": s.loadTaskCrawlMessage(c, taskID),
+	})
+}
+
+func (s *Server) loadTaskCrawlStatus(ctx context.Context, taskID string) string {
+	if taskID == "" {
+		return ""
+	}
+	key := "task:crawl_status:" + taskID
+	status, err := s.rdb.Get(ctx, key).Result()
+	if err != nil {
+		return ""
+	}
+	return status
+}
+
+func (s *Server) loadTaskCrawlMessage(ctx context.Context, taskID string) string {
+	if taskID == "" {
+		return ""
+	}
+	key := "task:crawl_message:" + taskID
+	message, err := s.rdb.Get(ctx, key).Result()
+	if err != nil {
+		return ""
+	}
+	return message
 }
 
 // toFullMercariURL 将相对URL转换为完整的Mercari URL。

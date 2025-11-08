@@ -8,7 +8,10 @@
     "new_item_duration": "1h",
     "max_items_per_task": 300,
     "worker_pool_size": 50,
-    "queue_capacity": 1000
+    "queue_capacity": 1000,
+    "enable_redis_queue": false,
+    "task_queue_stream": "goodshunter:task:queue",
+    "task_queue_group": "scheduler_group"
   },
   "mysql": {
     "dsn": "root:your_password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local"
