@@ -68,8 +68,8 @@ jobs:
           script: |
             cd ~/GoodsHunter
             
-            # 1. 拉取最新代码 (主要是 docker-compose.yml 和 nginx 配置)
-            git pull origin main
+            # 1. 拉取最新代码 (包含 docker-compose.yml、nginx 配置)
+            git pull --ff-only origin main
             
             # 2. 登录 GHCR (使用 GitHub 临时 Token 比较复杂，通常建议在 EC2 手动登录一次或使用 PAT)
             # 或者，如果您的仓库是 Public 的，则不需要登录即可拉取
@@ -79,6 +79,19 @@ jobs:
 
             # 4. 重启业务服务 (包含 nginx 以应用最新配置)
             docker compose up -d api crawler nginx
+
+            # 5. 如启用 Grafana Cloud 采集，则启动采集器与 exporters
+            if [ -f .env ]; then
+              set -a
+              . ./.env
+              set +a
+            fi
+            if [ -n "${GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL:-}" ] && [ -n "${GRAFANA_CLOUD_PROM_USERNAME:-}" ]; then
+              docker compose --profile monitoring-cloud up -d alloy cadvisor node-exporter redis-exporter mysql-exporter
+            fi
             
-            # 5. 清理旧镜像
+            # 6. 清理旧镜像
             docker image prune -f
+            
+            # 7. 验证服务状态
+            docker compose ps

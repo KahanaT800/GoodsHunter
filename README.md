@@ -2,7 +2,7 @@
 
 **语言 / Languages / 言語**: [中文](README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-[![Go Version](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go)](https://go.dev/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Live Demo](https://img.shields.io/badge/Demo-Online-success)](https://goods-hunter.com)
@@ -25,7 +25,7 @@ GoodsHunter 是一个**高性能网络爬虫**系统，专为监控电商平台�
 - **水平可扩展**: 架构设计支持扩展为分布式部署（多实例 + 负载均衡）
 - **任务调度系统**: 自动化定时轮询，支持可配置间隔和去重
 - **实时通知**: 新商品和价格变动的邮件提醒
-- **有状态缓存**: 基于 Redis 的增量爬取，最小化冗余请求
+- **有状态缓存与分布式队列**: Redis 去重状态 + Redis Streams 任务队列
 - **生产环境部署**: 完全自动化的 CI/CD 流程，支持 Docker、HTTPS 和云托管
 
 本项目从零开始构建，旨在展示**适用于生产环境的全栈后端能力**。架构设计为未来的分布式扩展预留了空间。
@@ -41,7 +41,7 @@ graph TB
     
     API -->|gRPC| Crawler[爬虫服务<br/>端口 50051]
     API -->|读写| MySQL[(MySQL 8.0<br/>用户、任务、商品)]
-    API -->|缓存| Redis[(Redis 7<br/>去重状态)]
+    API -->|缓存/队列| Redis[(Redis 7<br/>去重 + Streams 队列)]
     
     Crawler -->|缓存检查| Redis
     Crawler -->|无头浏览器| Target[目标网站<br/>Mercari]
@@ -65,7 +65,7 @@ graph TB
 | **API 服务器** | Go + Gin 框架 | 用户认证（JWT）、RESTful API、任务调度 |
 | **爬虫服务** | Go + Rod | 无头浏览器自动化、HTML 解析、gRPC 服务端 |
 | **数据库** | MySQL 8.0 | 用户、任务和爬取商品的持久化存储 |
-| **缓存层** | Redis 7 | 去重追踪、价格变动检测 |
+| **缓存层** | Redis 7 | 去重追踪、价格变动检测、任务队列 |
 | **网关** | Nginx + Let's Encrypt | HTTPS 终端、静态文件服务、反向代理 |
 | **CI/CD** | GitHub Actions | 自动化测试、Docker 镜像构建、EC2 部署 |
 
@@ -80,6 +80,7 @@ graph TB
 
 ### 智能去重
 - **基于 Redis 的指纹识别**: 追踪已见商品，避免重复通知
+- **Redis Streams 队列**: 支持分布式调度与多实例消费
 - **价格变动检测**: 监控商品降价时自动提醒用户
 - **增量爬取**: 仅抓取上次运行后的新增数据
 
@@ -113,13 +114,13 @@ graph TB
 
 ### **数据层**
 - **主数据库**: MySQL 8.0（关系型数据库，提供 ACID 保证）
-- **缓存存储**: Redis 7（高速键值存储，用于去重逻辑）
-- **消息队列**: 自定义内存队列（用于爬虫任务分发）
+- **缓存存储**: Redis 7（去重、状态与队列）
+- **消息队列**: Redis Streams + 内存队列（可切换）
 
 ### **DevOps**
 - **版本控制**: Git + GitHub
 - **容器镜像仓库**: GitHub Container Registry (GHCR)
-- **监控**: Docker 健康检查 + 结构化日志（slog）
+- **监控**: Docker 健康检查 + 结构化日志（slog）+ Grafana Cloud（日志与指标）
 - **配置管理**: 基于环境变量的配置（12-factor 应用方法论）
 
 ---
@@ -153,7 +154,7 @@ docker compose up -d
 
 ### **4. 访问应用**
 - **Web 界面**: http://localhost
-- **API 健康检查**: http://localhost/api/healthz
+- **API 健康检查**: http://localhost/healthz
 
 ### **5. 注册和登录**
 ```bash
@@ -175,6 +176,9 @@ GoodsHunter/
 ├── cmd/
 │   ├── api/                 # API 服务入口
 │   └── crawler/             # 爬虫服务入口
+├── configs/                 # 配置模板与示例
+├── deploy/                  # 生产部署配置（Grafana Alloy）
+├── docs/                    # 项目文档与验收清单
 ├── internal/
 │   ├── api/                 # HTTP 处理器、中间件、认证
 │   │   ├── auth/            # JWT 令牌管理
@@ -191,12 +195,13 @@ GoodsHunter/
 │   ├── api/Dockerfile       # API 多阶段构建文件
 │   └── crawler/Dockerfile   # 爬虫多阶段构建文件
 ├── proto/                   # gRPC 服务定义
+├── scripts/                 # 统一脚本入口与运维工具
 ├── web/                     # 前端静态文件（HTML/CSS/JS）
 ├── .github/workflows/       # CI/CD 流水线
 │   ├── ci.yml              # 代码检查和测试
 │   └── deploy.yml          # 自动化部署
 ├── docker-compose.yml       # 本地开发编排配置
-└── init-letsencrypt.sh     # HTTPS 证书自动化脚本
+└── scripts/init-letsencrypt.sh     # HTTPS 证书自动化脚本
 ```
 
 ---
@@ -215,6 +220,7 @@ POST /api/verify-email?token=xxx  # 邮箱验证
 ```http
 GET    /api/tasks           # 列出用户的监控任务
 POST   /api/tasks           # 创建新任务
+PATCH  /api/tasks/:id       # 编辑任务条件
 DELETE /api/tasks/:id       # 删除任务
 ```
 

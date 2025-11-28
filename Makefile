@@ -1,4 +1,4 @@
-.PHONY: all up down logs ps build clean test lint vet help
+.PHONY: all up down logs ps build clean test lint vet run run-api run-crawler dev stop-dev help
 
 # 默认目标：执行本地质量检查和编译
 all: lint test build
@@ -54,6 +54,33 @@ build:
 	go build -o bin/crawler ./cmd/crawler
 	@echo "Build complete: bin/api, bin/crawler"
 
+# 运行本地服务 (先编译，然后在独立终端运行)
+run: build
+	@echo "Starting services locally..."
+	@echo "Note: Run these in separate terminals:"
+	@echo "  Terminal 1: ./bin/crawler"
+	@echo "  Terminal 2: ./bin/api"
+	@echo ""
+	@echo "Or use 'make run-crawler' and 'make run-api' in separate terminals"
+
+# 运行 API 服务
+run-api: build
+	@echo "Starting API server..."
+	./bin/api
+
+# 运行 Crawler 服务
+run-crawler: build
+	@echo "Starting Crawler service..."
+	./bin/crawler
+
+# 开发模式：同时运行两个服务
+dev:
+	@./scripts/dev.sh
+
+# 停止开发服务
+stop-dev:
+	@./scripts/stop_dev.sh
+
 # 整理 Go 依赖
 tidy:
 	go mod tidy
@@ -65,11 +92,25 @@ proto:
 help:
 	@echo "Usage: make [target]"
 	@echo ""
-	@echo "Targets:"
+	@echo "Docker Targets:"
 	@echo "  up           Start docker environment"
 	@echo "  down         Stop docker environment"
+	@echo "  logs         View docker logs"
+	@echo "  ps           List docker containers"
+	@echo ""
+	@echo "Local Development Targets:"
+	@echo "  build        Build binaries locally"
+	@echo "  run          Build and show run instructions"
+	@echo "  run-api      Build and run API server"
+	@echo "  run-crawler  Build and run Crawler service"
+	@echo "  dev          Start both services in background (recommended)"
+	@echo "  stop-dev     Stop background services"
 	@echo "  test         Run tests locally"
 	@echo "  lint         Run linter"
-	@echo "  build        Build binaries locally"
+	@echo "  vet          Run go vet"
+	@echo ""
+	@echo "Other Targets:"
 	@echo "  proto        Generate gRPC code"
+	@echo "  tidy         Tidy go.mod"
+	@echo "  clean        Clean up docker volumes and binaries"
 
