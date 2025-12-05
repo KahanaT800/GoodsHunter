@@ -42,6 +42,9 @@ type Scheduler struct {
 	taskConsumer *taskqueue.Consumer // 任务消费者
 	taskProducer *taskqueue.Producer // 任务生产者（用于周期发布）
 	streamName   string              // Redis Stream 名称
+	groupName    string              // Consumer Group 名称
+	batchSize    int                 // 轮询批量入队大小
+	taskHandler  func(context.Context, uint) error
 }
 
 // NewScheduler 创建一个新的调度器实例。
@@ -59,11 +62,13 @@ type Scheduler struct {
 //	workers: Worker Pool 大小（并发任务数，0 表示使用默认值 50）
 //	capacity: 队列容量（0 表示使用默认值 1000）
 //	enableRedis: 是否启用 Redis Streams 模式
+//	streamName: Redis Stream 名称
+//	groupName: Redis Consumer Group 名称
 //
 // 返回值:
 //
 //	*Scheduler: 调度器实例
-func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, enableRedis bool) *Scheduler {
+func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, enableRedis bool, streamName string, groupName string, batchSize int) *Scheduler {
 	// 使用默认值（如果参数为 0）
 	if workers <= 0 {
 		workers = 50 // 默认 50 个并发 worker
@@ -83,18 +88,28 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 			slog.String("error", err.Error()))
 	})
 
+	if streamName == "" {
+		streamName = "goodshunter:task:queue"
+	}
+	if groupName == "" {
+		groupName = "scheduler_group"
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
 	// 初始化 Redis Streams 消费者（如果启用）
 	var taskConsumer *taskqueue.Consumer
 	var taskProducer *taskqueue.Producer
 	if enableRedis {
-		consumer, err := taskqueue.NewConsumer(rdb, logger, "scheduler_group", "")
+		consumer, err := taskqueue.NewConsumer(rdb, logger, streamName, groupName, "")
 		if err != nil {
 			logger.Error("failed to create task consumer, fallback to polling mode",
 				slog.String("error", err.Error()))
 			enableRedis = false
 		} else {
 			taskConsumer = consumer
-			taskProducer = taskqueue.NewProducer(rdb, logger)
+			taskProducer = taskqueue.NewProducer(rdb, logger, streamName)
 			logger.Info("redis streams consumer initialized")
 		}
 	}
@@ -113,7 +128,10 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 		enableRedis:     enableRedis,
 		taskConsumer:    taskConsumer,
 		taskProducer:    taskProducer,
-		streamName:      "goodshunter:task:queue",
+		streamName:      streamName,
+		groupName:       groupName,
+		batchSize:       batchSize,
+		taskHandler:     nil,
 	}
 }
 
@@ -211,7 +229,7 @@ func (s *Scheduler) runPollingMode(ctx context.Context) {
 	s.logger.Info("scheduler running in DB polling mode")
 
 	// 首次立即调度一次
-	s.enqueueRunningTasks()
+	s.enqueueRunningTasks(ctx)
 
 	// 定时调度循环
 	ticker := time.NewTicker(s.interval)
@@ -233,7 +251,7 @@ func (s *Scheduler) runPollingMode(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			s.enqueueRunningTasks()
+			s.enqueueRunningTasks(ctx)
 
 		case <-statsTicker.C:
 			// 打印队列统计信息
@@ -259,6 +277,24 @@ func (s *Scheduler) reportRedisMetrics(ctx context.Context) {
 	if err == nil {
 		metrics.RedisQueuePending.Set(float64(pending))
 	}
+
+	groups, err := s.rdb.XInfoGroups(ctx, s.streamName).Result()
+	if err != nil {
+		return
+	}
+
+	groupName := s.taskConsumer.GroupName()
+	for _, group := range groups {
+		if group.Name != groupName {
+			continue
+		}
+		if group.Lag < 0 {
+			metrics.RedisQueueLag.Set(0)
+		} else {
+			metrics.RedisQueueLag.Set(float64(group.Lag))
+		}
+		return
+	}
 }
 
 // handleTaskMessage 处理从 Redis 接收到的任务消息。
@@ -276,15 +312,8 @@ func (s *Scheduler) handleTaskMessage(ctx context.Context, msg *taskqueue.Messag
 
 	switch taskMsg.Action {
 	case "execute":
-		// 提交到内存队列执行
-		s.enqueueTaskID(taskMsg.TaskID)
-
-		// 确认消息已处理
-		if err := s.taskConsumer.Ack(ctx, msg.ID); err != nil {
-			s.logger.Error("ack message failed",
-				slog.String("msg_id", msg.ID),
-				slog.String("error", err.Error()))
-		}
+		// 提交到内存队列执行，由 worker 完成后再 ack
+		s.enqueueTaskMessage(ctx, msg)
 
 	case "stop":
 		// 未来可以实现停止逻辑
@@ -391,7 +420,7 @@ func (s *Scheduler) StartTask(parentCtx context.Context, task *model.Task) {
 	if task == nil || task.Status != "running" {
 		return
 	}
-	s.enqueueTaskID(task.ID)
+	s.enqueueTaskID(parentCtx, task.ID)
 }
 
 // StopTask 仅记录日志，实际停止由任务状态控制。
@@ -400,35 +429,123 @@ func (s *Scheduler) StopTask(taskID uint) {
 }
 
 // enqueueRunningTasks 查询并入队所有 running 任务。
-func (s *Scheduler) enqueueRunningTasks() {
-	var taskIDs []uint
-	if err := s.db.Model(&model.Task{}).Where("status = ?", "running").Pluck("id", &taskIDs).Error; err != nil {
-		s.logger.Error("failed to load running tasks", slog.String("error", err.Error()))
-		return
+func (s *Scheduler) enqueueRunningTasks(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	for _, id := range taskIDs {
-		s.enqueueTaskID(id)
+
+	batchSize := s.batchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if capLimit := s.queue.Cap() / 5; capLimit > 0 && batchSize > capLimit {
+		batchSize = capLimit
+	}
+
+	var lastID uint
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		var taskIDs []uint
+		if err := s.db.WithContext(ctx).
+			Model(&model.Task{}).
+			Select("id").
+			Where("status = ? AND id > ?", "running", lastID).
+			Order("id ASC").
+			Limit(batchSize).
+			Pluck("id", &taskIDs).Error; err != nil {
+			s.logger.Error("failed to load running tasks", slog.String("error", err.Error()))
+			return
+		}
+
+		if len(taskIDs) == 0 {
+			return
+		}
+
+		for _, id := range taskIDs {
+			if ctx.Err() != nil {
+				return
+			}
+			s.enqueueTaskID(ctx, id)
+			lastID = id
+		}
 	}
 }
 
-func (s *Scheduler) enqueueTaskID(taskID uint) {
-	if !s.queue.Enqueue(func(ctx context.Context) error {
-		s.handleTaskByID(ctx, taskID)
-		return nil
-	}) {
-		s.logger.Warn("queue full, task dropped",
+func (s *Scheduler) enqueueTaskID(ctx context.Context, taskID uint) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.queue.EnqueueBlocking(ctx, func(ctx context.Context) error {
+		if s.taskHandler != nil {
+			return s.taskHandler(ctx, taskID)
+		}
+		return s.handleTaskByID(ctx, taskID)
+	}); err != nil {
+		s.logger.Warn("enqueue task blocked or canceled",
 			slog.Uint64("task_id", uint64(taskID)),
+			slog.String("error", err.Error()),
 			slog.Int("queue_len", s.queue.Len()),
 			slog.Int("queue_cap", s.queue.Cap()))
 	}
 }
 
-func (s *Scheduler) handleTaskByID(parentCtx context.Context, taskID uint) {
-	var task model.Task
-	if err := s.db.Where("id = ? AND status = ?", taskID, "running").First(&task).Error; err != nil {
+func (s *Scheduler) enqueueTaskMessage(ctx context.Context, msg *taskqueue.MessageWithID) {
+	if msg == nil || msg.Message == nil {
 		return
 	}
-	s.handleTask(parentCtx, &task)
+
+	if err := s.queue.EnqueueBlocking(ctx, func(workerCtx context.Context) error {
+		var err error
+		if s.taskHandler != nil {
+			err = s.taskHandler(workerCtx, msg.Message.TaskID)
+		} else {
+			err = s.handleTaskByID(workerCtx, msg.Message.TaskID)
+		}
+		if err != nil {
+			if s.taskConsumer != nil {
+				action, retryErr := s.taskConsumer.HandleFailure(workerCtx, msg, err)
+				switch action {
+				case taskqueue.FailureActionRetry:
+					metrics.TaskRetryTotal.WithLabelValues("execute_failed").Inc()
+				case taskqueue.FailureActionDLQ:
+					metrics.TaskDLQTotal.Inc()
+				}
+				if retryErr != nil {
+					s.logger.Error("retry/dlq failed",
+						slog.String("msg_id", msg.ID),
+						slog.String("error", retryErr.Error()))
+				}
+			}
+			return err
+		}
+
+		if s.taskConsumer != nil {
+			if ackErr := s.taskConsumer.Ack(workerCtx, msg.ID); ackErr != nil {
+				s.logger.Error("ack message failed",
+					slog.String("msg_id", msg.ID),
+					slog.String("error", ackErr.Error()))
+				return ackErr
+			}
+		}
+		return nil
+	}); err != nil {
+		s.logger.Warn("enqueue task blocked or canceled",
+			slog.Uint64("task_id", uint64(msg.Message.TaskID)),
+			slog.String("error", err.Error()),
+			slog.Int("queue_len", s.queue.Len()),
+			slog.Int("queue_cap", s.queue.Cap()))
+	}
+}
+
+func (s *Scheduler) handleTaskByID(parentCtx context.Context, taskID uint) error {
+	var task model.Task
+	if err := s.db.Where("id = ? AND status = ?", taskID, "running").First(&task).Error; err != nil {
+		return nil
+	}
+	return s.handleTask(parentCtx, &task)
 }
 
 // handleTask 处理单个任务的抓取逻辑。
@@ -436,7 +553,7 @@ func (s *Scheduler) handleTaskByID(parentCtx context.Context, taskID uint) {
 // 1. 构造 gRPC 请求参数。
 // 2. 调用爬虫服务 FetchItems。
 // 3. 处理返回的商品列表。
-func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
+func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) error {
 	start := time.Now()
 	s.logger.Info("task run started",
 		slog.Uint64("task_id", uint64(task.ID)),
@@ -467,7 +584,7 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 			slog.String("error", err.Error()),
 			slog.String("duration", time.Since(start).String()),
 		)
-		return
+		return err
 	}
 
 	status := "success"
@@ -503,7 +620,7 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 			} else {
 				s.logger.Info("guest task stopped due to inactivity", slog.String("task_id", req.TaskId))
 			}
-			return
+			return nil
 		}
 	}
 
@@ -534,6 +651,7 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 		slog.Int("items", len(resp.Items)),
 		slog.String("duration", time.Since(start).String()),
 	)
+	return nil
 }
 
 func (s *Scheduler) setTaskCrawlStatus(ctx context.Context, taskID uint, status, message string) {

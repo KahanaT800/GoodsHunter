@@ -4,31 +4,37 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go)](https://go.dev/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker)](https://www.docker.com/)
+[![CI](https://github.com/KahanaT800/GoodsHunter/actions/workflows/ci.yml/badge.svg)](https://github.com/KahanaT800/GoodsHunter/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Live Demo](https://img.shields.io/badge/Demo-Online-success)](https://goods-hunter.com)
 
-> **可扩展的微服务爬虫系统，支持实时监控电商平台商品**  
+> **面向生产环境的分布式爬虫系统，聚焦高可靠与可观测**
 
 **在线演示**: [https://goods-hunter.com](https://goods-hunter.com)
 
 ## 应用预览
 
+**访客界面**
 ![GoodsHunter 访客界面](image/guestpage.png)
+
+**系统监控仪表盘**
+![系统监控仪表盘](image/grafana_sys.png)
+
+**爬虫监控仪表盘**
+![爬虫监控仪表盘](image/grafana_crawler.png)
 
 ---
 
 ## 项目概述
 
-GoodsHunter 是一个**高性能网络爬虫**系统，专为监控电商平台（如Mercari）中符合用户搜索条件的新商品而设计。本项目通过以下方式展示企业级系统设计能力：
+GoodsHunter 是一个**高性能网络爬虫**系统，专为监控电商平台（如 Mercari）中符合用户搜索条件的新商品而设计。当前版本已升级为可分布式部署的高可靠架构：
 
-- **微服务架构**: API 和爬虫服务独立部署，通过 gRPC 通信
-- **水平可扩展**: 架构设计支持扩展为分布式部署（多实例 + 负载均衡）
-- **任务调度系统**: 自动化定时轮询，支持可配置间隔和去重
-- **实时通知**: 新商品和价格变动的邮件提醒
-- **有状态缓存与分布式队列**: Redis 去重状态 + Redis Streams 任务队列
-- **生产环境部署**: 完全自动化的 CI/CD 流程，支持 Docker、HTTPS 和云托管
-
-本项目从零开始构建，旨在展示**适用于生产环境的全栈后端能力**。架构设计为未来的分布式扩展预留了空间。
+- **Redis Streams 消费模型**：生产者-消费者模式，支持阻塞消费与背压
+- **分布式限流**：Redis Lua 原子令牌桶，多实例共享配额
+- **全局去重**：API 入口侧 URL 去重，减少无效任务入库
+- **可靠性机制**：ACK、重试、死信队列（DLQ）
+- **批量调度**：DB 轮询采用 Cursor 分页 + 批量限制，避免阻塞
+- **可观测性**：Prometheus + Grafana 监控关键指标
 
 ---
 
@@ -37,107 +43,127 @@ GoodsHunter 是一个**高性能网络爬虫**系统，专为监控电商平台�
 ```mermaid
 graph TB
     User[用户] -->|HTTPS| Nginx[Nginx + SSL]
-    Nginx -->|反向代理| API[API 服务<br/>端口 8080]
-    
-    API -->|gRPC| Crawler[爬虫服务<br/>端口 50051]
-    API -->|读写| MySQL[(MySQL 8.0<br/>用户、任务、商品)]
-    API -->|缓存/队列| Redis[(Redis 7<br/>去重 + Streams 队列)]
-    
-    Crawler -->|缓存检查| Redis
-    Crawler -->|无头浏览器| Target[目标网站<br/>Mercari]
-    
-    API -->|SMTP| Email[邮件服务<br/>通知推送]
-    
-    CI[GitHub Actions] -->|构建推送| GHCR[GitHub 容器镜像仓库]
-    CI -->|部署| EC2[AWS EC2]
-    
-    style API fill:#4CAF50
-    style Crawler fill:#2196F3
-    style MySQL fill:#FF9800
-    style Redis fill:#F44336
-    style Nginx fill:#9C27B0
+    Nginx -->|API| API[API 服务<br/>Ingress Dedup]
+    API -->|写入| MySQL[(MySQL)]
+    API -->|发布任务| Stream[(Redis Streams)]
+    Stream -->|消费| Scheduler[Scheduler<br/>Batch Pull]
+    Scheduler -->|阻塞入队| Worker[Worker Pool]
+    Worker -->|限流| Limiter[Rate Limiter<br/>Redis Lua]
+    Worker -->|gRPC| Crawler[爬虫服务]
+    Crawler -->|抓取| Target[目标网站]
+    Crawler -->|落库| MySQL
+    API -->|指标| Prom[Prometheus]
+    Crawler -->|指标| Prom
+    Prom -->|可视化| Grafana[Grafana]
 ```
 
-### **核心组件**
+### 核心组件
 
 | 服务 | 技术栈 | 职责 |
 |---------|-----------|----------------|
-| **API 服务器** | Go + Gin 框架 | 用户认证（JWT）、RESTful API、任务调度 |
-| **爬虫服务** | Go + Rod | 无头浏览器自动化、HTML 解析、gRPC 服务端 |
-| **数据库** | MySQL 8.0 | 用户、任务和爬取商品的持久化存储 |
-| **缓存层** | Redis 7 | 去重追踪、价格变动检测、任务队列 |
+| **API 服务器** | Go + Gin | 任务创建、入口去重、API 网关 |
+| **Scheduler** | Go | Redis Streams 消费、ACK/Retry/DLQ、批量拉取 |
+| **爬虫服务** | Go + Rod | 无头浏览器自动化、HTML 解析 |
+| **限流器** | Redis Lua | 全局令牌桶，跨实例协调 |
+| **数据库** | MySQL 8.0 | 用户、任务和商品持久化 |
+| **缓存/队列** | Redis 7 | 去重状态、Streams 队列、限流协作 |
 | **网关** | Nginx + Let's Encrypt | HTTPS 终端、静态文件服务、反向代理 |
-| **CI/CD** | GitHub Actions | 自动化测试、Docker 镜像构建、EC2 部署 |
 
 ---
 
-## 核心功能
+## 核心特性
 
-### 智能任务调度
-- 用户自定义搜索查询转换为**周期性爬取任务**
-- 可配置的执行间隔（5分钟到每天），自动执行
-- **工作池（Worker Pool）**模式，精确控制并发数
+### 可靠的任务调度
+- Redis Streams 生产者-消费者模型
+- ACK 仅在 Worker 成功处理后执行
+- Pending 回收与 Auto-Claim，防止任务丢失
+- 失败重试与 DLQ，拒绝静默失败
 
-### 智能去重
-- **基于 Redis 的指纹识别**: 追踪已见商品，避免重复通知
-- **Redis Streams 队列**: 支持分布式调度与多实例消费
-- **价格变动检测**: 监控商品降价时自动提醒用户
-- **增量爬取**: 仅抓取上次运行后的新增数据
+### 分布式限流
+- Redis Lua 原子令牌桶，跨实例共享配额
+- 阻塞等待 + 微小抖动，避免惊群效应
+- `APP_RATE_LIMIT` / `APP_RATE_BURST` 可配置
 
-### 生产级认证系统
-- **基于 JWT 的会话管理**，安全的令牌存储
-- **邮箱验证**流程，用于新用户注册
-- **邀请码系统**，控制用户注册权限
+### 全局去重
+- API 入口侧 URL Hash 去重
+- 重复任务在入库与入队前被拦截
+- 降低无效爬取与资源浪费
 
-### 自动化部署
-- **零停机更新**: CI/CD 流水线在 `git push` 后自动部署
-- **健康检查**: Docker 原生健康检查确保服务可靠性
-- **默认 HTTPS**: 通过 Certbot 自动管理 SSL 证书
+### 批量调度与背压
+- DB 轮询使用 Cursor 分页，默认批量 `APP_QUEUE_BATCH_SIZE=100`
+- Worker Pool 阻塞入队，避免“满即丢”
 
 ---
 
 ## 技术栈
 
-### **后端**
-- **语言**: Go 1.25（选择原因：强大的并发原语和高性能）
-- **Web 框架**: Gin（高性能 HTTP 框架，丰富的中间件生态）
-- **RPC**: gRPC + Protocol Buffers（用于服务间通信）
-- **ORM**: GORM（数据库抽象层，支持迁移）
-- **浏览器自动化**: Rod（快速可靠的 DevTools 协议库）
+### 后端
+- **语言**: Go 1.24
+- **Web 框架**: Gin
+- **RPC**: gRPC + Protocol Buffers
+- **ORM**: GORM
+- **浏览器自动化**: Rod
 
-### **基础设施**
+### 基础设施
 - **容器化**: Docker + Docker Compose
-- **编排**: 多阶段构建，优化镜像体积
-- **CI/CD**: GitHub Actions（代码检查、构建、自动化部署）
-- **云服务商**: AWS EC2（Ubuntu 22.04 LTS）
-- **SSL 管理**: Let's Encrypt + Certbot（自动续期）
+- **CI/CD**: GitHub Actions
+- **云平台**: AWS EC2
+- **SSL**: Let's Encrypt + Certbot
 
-### **数据层**
-- **主数据库**: MySQL 8.0（关系型数据库，提供 ACID 保证）
-- **缓存存储**: Redis 7（去重、状态与队列）
-- **消息队列**: Redis Streams + 内存队列（可切换）
+### 数据与队列
+- **MySQL**: 持久化存储
+- **Redis**: 去重、Streams 队列、限流协作
 
-### **DevOps**
-- **版本控制**: Git + GitHub
-- **容器镜像仓库**: GitHub Container Registry (GHCR)
-- **监控**: Docker 健康检查 + 结构化日志（slog）+ Grafana Cloud（日志与指标）
-- **配置管理**: 基于环境变量的配置（12-factor 应用方法论）
+### 可观测性
+- **Prometheus**: 指标采集
+- **Grafana**: 仪表盘与告警
+
+---
+
+## 监控与可观测性
+
+### 指标端点
+- **API**: `http://<host>:8080/metrics`
+- **Crawler**: `http://<host>:2112/metrics`（可通过 `CRAWLER_METRICS_ADDR` 覆盖）
+
+### 核心指标（Grafana）
+- `goodshunter_ratelimit_wait_duration_seconds`：限流等待耗时
+- `goodshunter_task_dlq_total`：进入死信队列的任务数
+- `goodshunter_task_duplicate_prevented_total`：入口去重拦截数
+
+### Grafana Cloud（可选）
+```bash
+docker compose --profile monitoring-cloud up -d alloy
+```
+
+---
+
+## Redis Streams 模式（可选）
+
+默认使用数据库轮询调度任务；启用 Redis Streams 后，任务通过队列分发，实现更低延迟与多实例水平扩展。
+
+启用方式（`.env`）：
+```bash
+APP_ENABLE_REDIS_QUEUE=true
+APP_TASK_QUEUE_STREAM=goodshunter:task:queue
+APP_TASK_QUEUE_GROUP=scheduler_group
+```
 
 ---
 
 ## 快速开始
 
-### **前置要求**
-- Docker 20.10+ 和 Docker Compose v2+
-- （可选）用于邮件通知的 SMTP 凭据
+### 前置要求
+- Docker 20.10+ 与 Docker Compose v2+
+- （可选）邮件通知 SMTP 凭据
 
-### **1. 克隆仓库**
+### 1. 克隆仓库
 ```bash
 git clone https://github.com/KahanaT800/GoodsHunter.git
 cd GoodsHunter
 ```
 
-### **2. 配置环境变量**
+### 2. 配置环境变量
 ```bash
 cp .env.example .env
 # 编辑 .env 文件，设置以下内容：
@@ -147,25 +173,38 @@ cp .env.example .env
 # - SMTP 凭据（可选）    # 用于邮件通知
 ```
 
-### **3. 启动服务**
+### 3. 启动服务
 ```bash
 docker compose up -d
 ```
 
-### **4. 访问应用**
+### 4. 访问应用
 - **Web 界面**: http://localhost
 - **API 健康检查**: http://localhost/healthz
+- **API 指标**: http://localhost/metrics
+- **Crawler 指标**: http://localhost:2112/metrics
 
-### **5. 注册和登录**
-```bash
-# 游客登录（无需邮箱）
-curl -X POST http://localhost/api/login/guest
+---
 
-# 或创建完整账户
-curl -X POST http://localhost/api/register \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","password":"secure123","invite_code":"YOUR_CODE"}'
-```
+## 配置说明（节选）
+
+以下配置直接影响系统吞吐与稳定性（详见 `.env.example`）：
+
+- `APP_SCHEDULE_INTERVAL`：轮询调度间隔
+- `APP_WORKER_POOL_SIZE`：Worker Pool 并发数
+- `APP_QUEUE_CAPACITY`：内存队列容量
+- `APP_QUEUE_BATCH_SIZE`：批量拉取大小
+- `APP_RATE_LIMIT` / `APP_RATE_BURST`：全局限流速率与桶容量
+- `APP_DEDUP_WINDOW`：URL 去重窗口（秒）
+- `APP_ENABLE_REDIS_QUEUE`：是否启用 Streams 模式
+
+---
+
+## 质量保证
+
+- `internal/pkg/ratelimit`：并发与超时测试覆盖
+- `internal/pkg/dedup`：Redis 去重逻辑测试覆盖
+- `internal/api/scheduler`：ACK、重试、DLQ 逻辑测试覆盖
 
 ---
 
@@ -180,114 +219,100 @@ GoodsHunter/
 ├── deploy/                  # 生产部署配置（Grafana Alloy）
 ├── docs/                    # 项目文档与验收清单
 ├── internal/
-│   ├── api/                 # HTTP 处理器、中间件、认证
-│   │   ├── auth/            # JWT 令牌管理
-│   │   ├── middleware/      # CORS、日志、认证中间件
-│   │   └── scheduler/       # 后台任务调度器
+│   ├── api/                 # HTTP 处理器、中间件、调度器
 │   ├── crawler/             # Chromium 自动化、HTML 解析
-│   ├── config/              # 配置加载器（支持环境变量）
-│   ├── model/               # 数据库模型（GORM）
+│   ├── config/              # 配置加载器（环境变量）
 │   └── pkg/                 # 共享工具库
-│       ├── logger/          # 结构化日志包装器
-│       ├── notify/          # 邮件通知服务
-│       └── queue/           # 线程安全任务队列
+│       ├── dedup/           # 全局去重组件
+│       ├── ratelimit/       # 分布式限流器
+│       ├── metrics/         # Prometheus 指标
+│       └── taskqueue/       # Redis Streams 消费封装
 ├── build/
-│   ├── api/Dockerfile       # API 多阶段构建文件
-│   └── crawler/Dockerfile   # 爬虫多阶段构建文件
-├── proto/                   # gRPC 服务定义
-├── scripts/                 # 统一脚本入口与运维工具
-├── web/                     # 前端静态文件（HTML/CSS/JS）
-├── .github/workflows/       # CI/CD 流水线
-│   ├── ci.yml              # 代码检查和测试
-│   └── deploy.yml          # 自动化部署
-├── docker-compose.yml       # 本地开发编排配置
-└── scripts/init-letsencrypt.sh     # HTTPS 证书自动化脚本
+│   ├── api/Dockerfile
+│   └── crawler/Dockerfile
+├── proto/
+├── web/
+├── .github/workflows/
+├── docker-compose.yml
+└── scripts/
 ```
 
 ---
 
 ## API 文档
 
-### **认证相关**
+### 认证相关
 ```http
-POST /api/register           # 用户注册
-POST /api/login              # 用户登录
-POST /api/login/guest        # 游客登录
-POST /api/verify-email?token=xxx  # 邮箱验证
+POST /api/register
+POST /api/login
+POST /api/login/guest
+POST /api/verify-email?token=xxx
 ```
 
-### **任务管理**
+### 任务管理
 ```http
-GET    /api/tasks           # 列出用户的监控任务
-POST   /api/tasks           # 创建新任务
-PATCH  /api/tasks/:id       # 编辑任务条件
-DELETE /api/tasks/:id       # 删除任务
+GET    /api/tasks
+POST   /api/tasks
+PATCH  /api/tasks/:id
+DELETE /api/tasks/:id
 ```
 
-### **时间线**
+### 时间线
 ```http
-GET /api/timeline?limit=50  # 获取最新爬取的商品
+GET /api/timeline?limit=50
 ```
 
-### **健康检查**
+### 健康检查
 ```http
-GET /healthz                # 服务状态（Docker 使用）
+GET /healthz
 ```
 
 ---
 
 ## 生产环境部署
 
-### **架构亮点**
-- **AWS EC2**: t3.small 实例（2 vCPU，2GB 内存）
-- **HTTPS**: Let's Encrypt 通配符证书，自动续期
-- **零停机 CI/CD**: GitHub Actions 构建 Docker 镜像 → 推送到 GHCR → SSH 登录 EC2 → 拉取并重启容器
-- **安全性**: 非 root 容器，通过环境变量管理密钥
+### 架构亮点
+- GitHub Actions 构建镜像并推送至 GHCR
+- EC2 拉取镜像并更新容器
+- Docker 健康检查保障进程可用性
 
-### **部署流程**
+### 部署流程
 ```mermaid
 sequenceDiagram
     participant Dev as 开发者
     participant GH as GitHub Actions
     participant GHCR as 容器镜像仓库
     participant EC2 as 生产服务器
-    
     Dev->>GH: git push main
-    GH->>GH: 运行代码检查和测试
-    GH->>GHCR: 构建并推送 Docker 镜像
+    GH->>GH: 运行代码检查与测试
+    GH->>GHCR: 构建并推送镜像
     GH->>EC2: SSH 连接
-    EC2->>GHCR: 拉取最新镜像
+    EC2->>GHCR: 拉取镜像
     EC2->>EC2: docker compose up -d
     EC2-->>Dev: 部署完成
 ```
-
-### **性能指标**
-- **冷启动时间**: ~30 秒（包含 MySQL 初始化）
-- **API 响应时间**: <50ms（缓存查询）
-- **爬虫吞吐量**: ~100 个商品/分钟（限速以避免被封禁）
-- **正常运行时间**: 99.5%+（通过健康检查监控）
 
 ---
 
 ## 开发指南
 
-### **运行测试**
+### 运行测试
 ```bash
-go test ./internal/pkg/queue/...
+go test ./...
 ```
 
-### **代码检查**
+### 代码检查
 ```bash
 golangci-lint run
 ```
 
-### **查看日志**
+### 查看日志
 ```bash
 docker logs goodshunter-api-1 -f
 docker logs goodshunter-crawler-1 -f
 ```
 
-### **停止服务**
+### 停止服务
 ```bash
 docker compose down
 ```
@@ -298,22 +323,22 @@ docker compose down
 
 | 决策 | 原因 |
 |----------|-----------|
-| **Go** | 更优秀的并发原语、更低的内存占用、原生 gRPC 支持 |
-| **gRPC** | 类型安全的契约、高效的二进制序列化，适合服务间调用 |
-| **MySQL** | 熟悉度高、满足当前规模需求、AWS RDS 支持更好 |
-| **Redis** | 丰富的数据结构（集合用于去重）、持久化选项 |
-| **Gin** | 成熟的生态系统、优秀的性能、丰富的中间件支持 |
-| **Rod** | 更简洁的 API、自动等待机制、更好的错误处理 |
+| **Go** | 高性能并发模型，适合 IO 密集型爬虫 |
+| **Redis Streams** | 低延迟、消费者组与可靠 ACK |
+| **Redis Lua** | 原子限流，多实例一致 |
+| **MySQL** | 事务一致性与成熟生态 |
+| **Gin** | 性能好，生态成熟 |
 
 ---
 
 ## 安全考虑
 
-- **JWT 密钥**: 通过环境变量轮换（非硬编码）
-- **密码哈希**: bcrypt，成本因子 10
-- **SQL 注入防护**: GORM 参数化查询
-- **HTTPS 强制**: 所有 HTTP 流量重定向至 HTTPS
-- **频率限制**: （计划中）防止爬虫端点滥用
+- **JWT 密钥**：通过环境变量轮换
+- **密码哈希**：bcrypt，成本因子 10
+- **SQL 注入防护**：GORM 参数化查询
+- **HTTPS 强制**：Nginx + Certbot
+- **访问控制**：邀请码机制与邮箱验证
+- **速率控制**：全局令牌桶限流
 
 ---
 

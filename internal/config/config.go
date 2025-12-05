@@ -37,6 +37,10 @@ type AppConfig struct {
 	WorkerPoolSize   int           `json:"worker_pool_size"`   // Worker Pool 大小（并发任务数）
 	QueueCapacity    int           `json:"queue_capacity"`     // 队列容量
 	JWTSecret        string        `json:"jwt_secret"`         // JWT 签名密钥
+	RateLimit        float64       `json:"rate_limit"`         // 限流速率（token/s）
+	RateBurst        float64       `json:"rate_burst"`         // 限流桶容量
+	QueueBatchSize   int           `json:"queue_batch_size"`   // 轮询批量入队大小
+	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
 
 	// Redis Streams 任务队列配置
 	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
@@ -177,6 +181,10 @@ func getDefaultConfig() *Config {
 			WorkerPoolSize:   50,
 			QueueCapacity:    1000,
 			JWTSecret:        "dev_secret_change_me",
+			RateLimit:        3,
+			RateBurst:        5,
+			QueueBatchSize:   100,
+			DedupWindow:      3600,
 
 			// Redis Streams 默认配置
 			EnableRedisQueue: false, // 默认关闭，渐进式升级
@@ -250,6 +258,18 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.QueueCapacity == 0 {
 		cfg.App.QueueCapacity = defaults.App.QueueCapacity
+	}
+	if cfg.App.RateLimit == 0 {
+		cfg.App.RateLimit = defaults.App.RateLimit
+	}
+	if cfg.App.RateBurst == 0 {
+		cfg.App.RateBurst = defaults.App.RateBurst
+	}
+	if cfg.App.QueueBatchSize == 0 {
+		cfg.App.QueueBatchSize = defaults.App.QueueBatchSize
+	}
+	if cfg.App.DedupWindow == 0 {
+		cfg.App.DedupWindow = defaults.App.DedupWindow
 	}
 	// Redis Streams 默认值
 	if cfg.App.TaskQueueStream == "" {
@@ -344,6 +364,26 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("APP_QUEUE_CAPACITY"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.App.QueueCapacity = i
+		}
+	}
+	if v := os.Getenv("APP_RATE_LIMIT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.App.RateLimit = f
+		}
+	}
+	if v := os.Getenv("APP_RATE_BURST"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.App.RateBurst = f
+		}
+	}
+	if v := os.Getenv("APP_QUEUE_BATCH_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.App.QueueBatchSize = i
+		}
+	}
+	if v := os.Getenv("APP_DEDUP_WINDOW"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.App.DedupWindow = i
 		}
 	}
 

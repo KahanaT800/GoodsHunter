@@ -81,6 +81,43 @@ var (
 		Name: "goodshunter_active_tasks",
 		Help: "Number of tasks currently being processed",
 	})
+
+	// RateLimitWaitDuration 限流等待时长
+	RateLimitWaitDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "goodshunter_ratelimit_wait_duration_seconds",
+		Help:    "Time spent waiting for rate limiter tokens",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
+	})
+
+	// RateLimitTimeoutTotal 限流等待超时总数
+	RateLimitTimeoutTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_ratelimit_timeout_total",
+		Help: "Total number of rate limit wait timeouts",
+	})
+
+	// TaskRetryTotal 任务重试总数
+	TaskRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_task_retry_total",
+		Help: "Total number of task retries",
+	}, []string{"reason"})
+
+	// TaskDLQTotal 死信任务总数
+	TaskDLQTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_dlq_total",
+		Help: "Total number of tasks moved to dead-letter queue",
+	})
+
+	// TaskAutoClaimTotal 自动回收的 Pending 消息总数
+	TaskAutoClaimTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_autoclaim_total",
+		Help: "Total number of pending messages auto-claimed",
+	})
+
+	// TaskDuplicatePreventedTotal 入口去重拦截次数
+	TaskDuplicatePreventedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_duplicate_prevented_total",
+		Help: "Total number of tasks prevented by ingress deduplication",
+	})
 )
 
 // HTTP API 相关指标
@@ -133,6 +170,18 @@ var (
 		Name: "goodshunter_crawler_errors_total",
 		Help: "Total number of crawler errors",
 	}, []string{"platform", "error_type"}) // error_type: timeout, parse_error, network_error
+
+	// CrawlerBrowserActive 当前活跃的浏览器页面数
+	CrawlerBrowserActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_browser_active",
+		Help: "Number of active crawler browser pages",
+	})
+
+	// CrawlerBrowserInstances 当前浏览器实例数量
+	CrawlerBrowserInstances = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_browser_instances",
+		Help: "Number of active crawler browser instances",
+	})
 )
 
 // 数据库相关指标（GORM 会自动暴露部分指标）

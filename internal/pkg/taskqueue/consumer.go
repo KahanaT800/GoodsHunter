@@ -2,9 +2,13 @@ package taskqueue
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"goodshunter/internal/pkg/metrics"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -13,12 +17,30 @@ import (
 //
 // 由 Scheduler 服务使用，从 Redis Streams 中读取任务消息并执行。
 type Consumer struct {
-	queue      *TaskQueue
-	logger     *slog.Logger
-	groupName  string // 消费者组名称
-	consumerID string // 消费者唯一标识
-	blockTime  time.Duration
-	batchSize  int64
+	queue            *TaskQueue
+	logger           *slog.Logger
+	groupName        string // 消费者组名称
+	consumerID       string // 消费者唯一标识
+	blockTime        time.Duration
+	batchSize        int64
+	pendingIdle      time.Duration
+	pendingStart     string
+	deadLetterStream string
+	maxRetry         int
+}
+
+// FailureAction indicates how a failed message is handled.
+type FailureAction string
+
+const (
+	FailureActionNone  FailureAction = "none"
+	FailureActionRetry FailureAction = "retry"
+	FailureActionDLQ   FailureAction = "dlq"
+)
+
+// GroupName 返回消费者组名称。
+func (c *Consumer) GroupName() string {
+	return c.groupName
 }
 
 // ConsumerOption 消费者配置选项。
@@ -38,6 +60,27 @@ func WithBatchSize(size int64) ConsumerOption {
 	}
 }
 
+// WithPendingIdle 设置 Pending 消息的最小空闲时间。
+func WithPendingIdle(d time.Duration) ConsumerOption {
+	return func(c *Consumer) {
+		c.pendingIdle = d
+	}
+}
+
+// WithDeadLetterStream 设置死信 Stream 名称。
+func WithDeadLetterStream(stream string) ConsumerOption {
+	return func(c *Consumer) {
+		c.deadLetterStream = stream
+	}
+}
+
+// WithMaxRetry 设置最大重试次数。
+func WithMaxRetry(maxRetry int) ConsumerOption {
+	return func(c *Consumer) {
+		c.maxRetry = maxRetry
+	}
+}
+
 // NewConsumer 创建一个新的任务消费者。
 //
 // 会自动创建消费者组（如果不存在）。
@@ -45,6 +88,7 @@ func WithBatchSize(size int64) ConsumerOption {
 // 参数:
 //   - rdb: Redis 客户端
 //   - logger: 日志记录器
+//   - streamName: Stream 名称
 //   - groupName: 消费者组名称
 //   - consumerID: 消费者唯一标识（可选，默认为 "consumer-1"）
 //   - opts: 可选配置
@@ -52,7 +96,7 @@ func WithBatchSize(size int64) ConsumerOption {
 // 返回值:
 //   - *Consumer: 消费者实例
 //   - error: 创建失败时返回错误
-func NewConsumer(rdb *redis.Client, logger *slog.Logger, groupName string, consumerID string, opts ...ConsumerOption) (*Consumer, error) {
+func NewConsumer(rdb *redis.Client, logger *slog.Logger, streamName string, groupName string, consumerID string, opts ...ConsumerOption) (*Consumer, error) {
 	if groupName == "" {
 		return nil, fmt.Errorf("group name is required")
 	}
@@ -61,13 +105,21 @@ func NewConsumer(rdb *redis.Client, logger *slog.Logger, groupName string, consu
 		consumerID = fmt.Sprintf("consumer-%d", time.Now().UnixNano())
 	}
 
+	if streamName == "" {
+		streamName = "goodshunter:task:queue"
+	}
+
 	c := &Consumer{
-		queue:      NewTaskQueue(rdb, logger, "goodshunter:task:queue"),
-		logger:     logger,
-		groupName:  groupName,
-		consumerID: consumerID,
-		blockTime:  1 * time.Second, // 默认阻塞1秒
-		batchSize:  10,              // 默认每次读取10条
+		queue:            NewTaskQueue(rdb, logger, streamName),
+		logger:           logger,
+		groupName:        groupName,
+		consumerID:       consumerID,
+		blockTime:        1 * time.Second, // 默认阻塞1秒
+		batchSize:        10,              // 默认每次读取10条
+		pendingIdle:      1 * time.Minute,
+		pendingStart:     "0-0",
+		deadLetterStream: streamName + ":dlq",
+		maxRetry:         3,
 	}
 
 	// 应用配置选项
@@ -104,8 +156,41 @@ type MessageWithID struct {
 //   - []*MessageWithID: 读取到的消息列表
 //   - error: 读取失败时返回错误
 func (c *Consumer) Read(ctx context.Context) ([]*MessageWithID, error) {
-	// 使用 XREADGROUP 读取消息
-	// ">" 表示读取未被消费的新消息
+	pending, err := c.readPending(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 {
+		return pending, nil
+	}
+
+	return c.readNew(ctx)
+}
+
+func (c *Consumer) readPending(ctx context.Context) ([]*MessageWithID, error) {
+	messages, nextStart, err := c.queue.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   c.queue.streamName,
+		Group:    c.groupName,
+		Consumer: c.consumerID,
+		MinIdle:  c.pendingIdle,
+		Start:    c.pendingStart,
+		Count:    c.batchSize,
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("xautoclaim failed: %w", err)
+	}
+	if nextStart != "" {
+		c.pendingStart = nextStart
+	}
+
+	if len(messages) > 0 {
+		metrics.TaskAutoClaimTotal.Add(float64(len(messages)))
+	}
+
+	return c.parseMessages(ctx, messages)
+}
+
+func (c *Consumer) readNew(ctx context.Context) ([]*MessageWithID, error) {
 	streams, err := c.queue.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    c.groupName,
 		Consumer: c.consumerID,
@@ -116,7 +201,6 @@ func (c *Consumer) Read(ctx context.Context) ([]*MessageWithID, error) {
 
 	if err != nil {
 		if err == redis.Nil {
-			// 没有新消息，返回空列表
 			return nil, nil
 		}
 		return nil, fmt.Errorf("xreadgroup failed: %w", err)
@@ -126,38 +210,50 @@ func (c *Consumer) Read(ctx context.Context) ([]*MessageWithID, error) {
 		return nil, nil
 	}
 
-	var messages []*MessageWithID
+	var messages []redis.XMessage
 	for _, stream := range streams {
-		for _, msg := range stream.Messages {
-			// 解析消息数据
-			data, ok := msg.Values["data"].(string)
-			if !ok {
-				c.logger.Warn("invalid message format",
-					slog.String("msg_id", msg.ID))
-				continue
-			}
+		messages = append(messages, stream.Messages...)
+	}
 
-			taskMsg, err := parseMessage(data)
-			if err != nil {
-				c.logger.Error("parse message failed",
-					slog.String("msg_id", msg.ID),
-					slog.String("error", err.Error()))
-				continue
-			}
+	return c.parseMessages(ctx, messages)
+}
 
-			messages = append(messages, &MessageWithID{
-				ID:      msg.ID,
-				Message: taskMsg,
-			})
+func (c *Consumer) parseMessages(ctx context.Context, messages []redis.XMessage) ([]*MessageWithID, error) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	parsed := make([]*MessageWithID, 0, len(messages))
+	for _, msg := range messages {
+		data, ok := msg.Values["data"].(string)
+		if !ok || data == "" {
+			c.logger.Warn("invalid message format",
+				slog.String("msg_id", msg.ID))
+			c.handlePoisonMessage(ctx, msg.ID, fmt.Sprintf("%v", msg.Values["data"]), "invalid message format")
+			continue
 		}
+
+		taskMsg, err := parseMessage(data)
+		if err != nil {
+			c.logger.Error("parse message failed",
+				slog.String("msg_id", msg.ID),
+				slog.String("error", err.Error()))
+			c.handlePoisonMessage(ctx, msg.ID, data, err.Error())
+			continue
+		}
+
+		parsed = append(parsed, &MessageWithID{
+			ID:      msg.ID,
+			Message: taskMsg,
+		})
 	}
 
-	if len(messages) > 0 {
+	if len(parsed) > 0 {
 		c.logger.Debug("messages read",
-			slog.Int("count", len(messages)))
+			slog.Int("count", len(parsed)))
 	}
 
-	return messages, nil
+	return parsed, nil
 }
 
 // Ack 确认消息已处理。
@@ -200,6 +296,55 @@ func (c *Consumer) AckBatch(ctx context.Context, msgIDs []string) error {
 		slog.Int("requested", len(msgIDs)))
 
 	return nil
+}
+
+// HandleFailure 根据重试次数进行重入队或放入死信队列。
+func (c *Consumer) HandleFailure(ctx context.Context, msg *MessageWithID, cause error) (FailureAction, error) {
+	if msg == nil || msg.Message == nil {
+		return FailureActionNone, fmt.Errorf("message is nil")
+	}
+
+	retry := msg.Message.Retry + 1
+	msg.Message.Retry = retry
+
+	if retry > c.maxRetry {
+		if err := c.publishDeadLetter(ctx, msg.ID, msg.Message, cause); err != nil {
+			return FailureActionDLQ, err
+		}
+		return FailureActionDLQ, c.Ack(ctx, msg.ID)
+	}
+
+	if err := c.queue.Publish(ctx, msg.Message); err != nil {
+		return FailureActionRetry, err
+	}
+
+	return FailureActionRetry, c.Ack(ctx, msg.ID)
+}
+
+func (c *Consumer) handlePoisonMessage(ctx context.Context, msgID string, payload string, reason string) {
+	if err := c.publishDeadLetter(ctx, msgID, payload, errors.New(reason)); err != nil {
+		c.logger.Error("publish dead letter failed", slog.String("msg_id", msgID), slog.String("error", err.Error()))
+	}
+	metrics.TaskDLQTotal.Inc()
+	if err := c.Ack(ctx, msgID); err != nil {
+		c.logger.Error("ack poison message failed", slog.String("msg_id", msgID), slog.String("error", err.Error()))
+	}
+}
+
+func (c *Consumer) publishDeadLetter(ctx context.Context, msgID string, payload interface{}, cause error) error {
+	raw := payload
+	if msg, ok := payload.(*TaskMessage); ok {
+		if data, err := json.Marshal(msg); err == nil {
+			raw = string(data)
+		}
+	}
+
+	return c.queue.publishRaw(ctx, c.deadLetterStream, map[string]interface{}{
+		"original_id": msgID,
+		"payload":     raw,
+		"reason":      cause.Error(),
+		"failed_at":   time.Now().UTC().Format(time.RFC3339Nano),
+	})
 }
 
 // Pending 获取待处理的消息数量。

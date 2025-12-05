@@ -8,6 +8,10 @@ app:
   max_items_per_task: 300
   worker_pool_size: 50
   queue_capacity: 1000
+  queue_batch_size: 100
+  dedup_window: 3600
+  rate_limit: 3
+  rate_burst: 5
 
 mysql:
   dsn: "root:your_password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local"

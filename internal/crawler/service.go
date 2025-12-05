@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -10,13 +11,16 @@ import (
 	"time"
 
 	"goodshunter/internal/config"
+	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/queue"
+	"goodshunter/internal/pkg/ratelimit"
 	"goodshunter/proto/pb"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -31,6 +35,8 @@ type Service struct {
 	pb.UnimplementedCrawlerServiceServer
 	browser       *rod.Browser
 	queue         *queue.Queue // Worker Pool 用于控制并发
+	rdb           *redis.Client
+	rateLimiter   *ratelimit.RateLimiter
 	logger        *slog.Logger
 	defaultUA     string
 	pageTimeout   time.Duration
@@ -53,6 +59,23 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 	browser, err := startBrowser(cfg, logger)
 	if err != nil {
 		return nil, err
+	}
+	metrics.CrawlerBrowserInstances.Inc()
+
+	var rdb *redis.Client
+	var limiter *ratelimit.RateLimiter
+	if cfg.App.RateLimit > 0 && cfg.App.RateBurst > 0 {
+		rdb = redis.NewClient(&redis.Options{
+			Addr:     cfg.Redis.Addr,
+			Password: cfg.Redis.Password,
+		})
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			return nil, fmt.Errorf("connect redis for rate limit: %w", err)
+		}
+		limiter = ratelimit.NewRedisRateLimiter(rdb, logger, "goodshunter:ratelimit:crawler", cfg.App.RateLimit, cfg.App.RateBurst)
+		logger.Info("rate limiter enabled",
+			slog.Float64("rate", cfg.App.RateLimit),
+			slog.Float64("burst", cfg.App.RateBurst))
 	}
 
 	// 创建 Worker Pool
@@ -77,6 +100,8 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 	return &Service{
 		browser:       browser,
 		queue:         q,
+		rdb:           rdb,
+		rateLimiter:   limiter,
 		logger:        logger,
 		defaultUA:     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 		pageTimeout:   30 * time.Second,
@@ -155,7 +180,16 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	start := time.Now()
-	s.logger.Info("fetching items", slog.String("task_id", taskID), slog.String("platform", req.GetPlatform().String()))
+	platform := strings.ToLower(req.GetPlatform().String())
+	s.logger.Info("fetching items", slog.String("task_id", taskID), slog.String("platform", platform))
+
+	recordMetrics := func(status string, err error) {
+		metrics.CrawlerRequestsTotal.WithLabelValues(platform, status).Inc()
+		metrics.CrawlerRequestDuration.WithLabelValues(platform).Observe(time.Since(start).Seconds())
+		if err != nil {
+			metrics.CrawlerErrorsTotal.WithLabelValues(platform, classifyCrawlerError(err)).Inc()
+		}
+	}
 
 	// 创建一个 channel 用于接收抓取结果
 	resultCh := make(chan *fetchResult, 1)
@@ -176,6 +210,7 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 	// 提交到 worker pool（阻塞式，直到队列有空间）
 	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
+		recordMetrics("failed", err)
 		return nil, fmt.Errorf("enqueue crawl job: %w", err)
 	}
 
@@ -188,10 +223,13 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 				slog.String("error", result.err.Error()),
 				slog.String("duration", time.Since(start).String()),
 			)
+			recordMetrics("failed", result.err)
 			return nil, result.err
 		}
+		recordMetrics("success", nil)
 		return result.response, nil
 	case <-ctx.Done():
+		recordMetrics("failed", ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -207,10 +245,21 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	taskID := req.GetTaskId()
 	start := time.Now()
 
+	if s.rateLimiter != nil {
+		if err := s.rateLimiter.Acquire(ctx); err != nil {
+			if errors.Is(err, ratelimit.ErrRateLimitTimeout) {
+				return nil, fmt.Errorf("rate limit wait timeout: %w", err)
+			}
+			return nil, fmt.Errorf("rate limit: %w", err)
+		}
+	}
+
 	// 构建 URL 并打开新页面。
 	url := BuildMercariURL(req)
 	page := stealth.MustPage(s.browser)
+	metrics.CrawlerBrowserActive.Inc()
 	defer func() {
+		metrics.CrawlerBrowserActive.Dec()
 		_ = page.Close()
 	}()
 
@@ -229,6 +278,10 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 			slog.String("title", info.Title),
 			slog.String("actual_url", info.URL),
 		)
+	}
+
+	if s.isBlockedPage(page) {
+		return nil, fmt.Errorf("blocked_page")
 	}
 
 	// 等待列表元素加载完成。
@@ -388,6 +441,19 @@ func (s *Service) isNoItemsPage(page *rod.Page) bool {
 	return isNoItemsText(text)
 }
 
+func (s *Service) isBlockedPage(page *rod.Page) bool {
+	pWithTimeout := page.Timeout(2 * time.Second)
+	body, err := pWithTimeout.Element("body")
+	if err != nil {
+		return false
+	}
+	text, err := body.Text()
+	if err != nil {
+		return false
+	}
+	return isBlockedText(text)
+}
+
 func isNoItemsText(text string) bool {
 	if text == "" {
 		return false
@@ -406,6 +472,46 @@ func isNoItemsText(text string) bool {
 		}
 	}
 	return false
+}
+
+func isBlockedText(text string) bool {
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	blockHints := []string{
+		"cloudflare",
+		"attention required",
+		"verify you are human",
+		"access denied",
+		"temporarily unavailable",
+	}
+	for _, hint := range blockHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyCrawlerError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timeout"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "navigate") || strings.Contains(msg, "net::") || strings.Contains(msg, "connection"):
+		return "network_error"
+	case strings.Contains(msg, "parse") || strings.Contains(msg, "extract"):
+		return "parse_error"
+	default:
+		return "unknown"
+	}
 }
 
 // extractItem 从单个 DOM 元素中提取商品信息。
@@ -498,13 +604,21 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 	}
 	itemURL = normalizeMercariURL(itemURL)
 
+	status := "on_sale"
+	if txt, err := el.Text(); err == nil {
+		lower := strings.ToLower(txt)
+		if strings.Contains(lower, "sold") || strings.Contains(txt, "売り切れ") {
+			status = "sold"
+		}
+	}
+
 	return &pb.Item{
 		SourceId: id,
 		Title:    titleStr,
 		Price:    int32(priceVal),
 		ImageUrl: imageURL,
 		ItemUrl:  itemURL,
-		Status:   "on_sale",
+		Status:   status,
 	}, nil
 }
 
@@ -581,6 +695,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	// 等待所有爬取任务完成
 	if err := s.queue.ShutdownWithTimeout(timeout); err != nil {
 		return fmt.Errorf("shutdown worker pool: %w", err)
+	}
+
+	if err := s.browser.Close(); err != nil {
+		s.logger.Error("close browser failed", slog.String("error", err.Error()))
+	} else {
+		metrics.CrawlerBrowserInstances.Dec()
+	}
+
+	if s.rdb != nil {
+		if err := s.rdb.Close(); err != nil {
+			s.logger.Warn("close redis failed", slog.String("error", err.Error()))
+		}
 	}
 
 	s.logger.Info("crawler worker pool shutdown completed")

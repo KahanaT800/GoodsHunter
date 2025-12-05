@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +15,9 @@ import (
 	"goodshunter/internal/api/middleware"
 	"goodshunter/internal/api/scheduler"
 	"goodshunter/internal/config"
+	"goodshunter/internal/crawler"
 	"goodshunter/internal/model"
+	"goodshunter/internal/pkg/dedup"
 	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/notify"
 	"goodshunter/internal/pkg/taskqueue"
@@ -33,15 +37,52 @@ import (
 //
 // 它持有数据库连接、Redis 客户端、爬虫 gRPC 客户端以及 Gin 路由引擎。
 type Server struct {
-	cfg          *config.Config
-	logger       *slog.Logger
-	db           *gorm.DB
-	rdb          *redis.Client
-	crawler      pb.CrawlerServiceClient
-	router       *gin.Engine
-	sched        *scheduler.Scheduler
-	auth         *auth.Handler
-	taskProducer *taskqueue.Producer // Redis Streams 任务生产者
+	cfg           *config.Config
+	logger        *slog.Logger
+	db            *gorm.DB
+	rdb           *redis.Client
+	crawler       pb.CrawlerServiceClient
+	router        *gin.Engine
+	sched         *scheduler.Scheduler
+	auth          *auth.Handler
+	taskProducer  *taskqueue.Producer // Redis Streams 任务生产者
+	deduper       Deduper
+	taskStore     TaskStore
+	taskScheduler TaskScheduler
+	taskPublisher TaskPublisher
+}
+
+type TaskStore interface {
+	CountTasks(ctx context.Context, userID int) (int64, error)
+	CreateTask(ctx context.Context, task *model.Task) error
+}
+
+type TaskPublisher interface {
+	SubmitTask(ctx context.Context, taskID uint, source string) error
+}
+
+type TaskScheduler interface {
+	StartTask(ctx context.Context, task *model.Task)
+}
+
+type Deduper interface {
+	IsDuplicate(ctx context.Context, url string) (bool, error)
+}
+
+type dbTaskStore struct {
+	db *gorm.DB
+}
+
+func (s dbTaskStore) CountTasks(ctx context.Context, userID int) (int64, error) {
+	var taskCount int64
+	if err := s.db.WithContext(ctx).Model(&model.Task{}).Where("user_id = ?", userID).Count(&taskCount).Error; err != nil {
+		return 0, err
+	}
+	return taskCount, nil
+}
+
+func (s dbTaskStore) CreateTask(ctx context.Context, task *model.Task) error {
+	return s.db.WithContext(ctx).Create(task).Error
 }
 
 // NewServer 初始化 API 服务器。
@@ -104,6 +145,9 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		cfg.App.WorkerPoolSize,   // Worker Pool 大小
 		cfg.App.QueueCapacity,    // 队列容量
 		cfg.App.EnableRedisQueue, // 是否启用 Redis Streams
+		cfg.App.TaskQueueStream,
+		cfg.App.TaskQueueGroup,
+		cfg.App.QueueBatchSize,
 	)
 
 	// 初始化任务生产者（如果启用 Redis Streams）
@@ -117,6 +161,8 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		logger.Info("redis queue disabled, using polling mode")
 	}
 
+	deduper := dedup.NewDeduplicator(rdb, time.Duration(cfg.App.DedupWindow)*time.Second)
+
 	// 初始化 Prometheus 指标
 	metrics.InitMetrics(cfg.App.EnableRedisQueue, cfg.App.WorkerPoolSize)
 
@@ -126,15 +172,19 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 	r.Use(middleware.RequestLogger(logger))
 
 	s := &Server{
-		cfg:          cfg,
-		logger:       logger,
-		db:           db,
-		rdb:          rdb,
-		crawler:      crawlerClient,
-		router:       r,
-		sched:        sched,
-		auth:         auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
-		taskProducer: taskProducer,
+		cfg:           cfg,
+		logger:        logger,
+		db:            db,
+		rdb:           rdb,
+		crawler:       crawlerClient,
+		router:        r,
+		sched:         sched,
+		auth:          auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
+		taskProducer:  taskProducer,
+		deduper:       deduper,
+		taskStore:     dbTaskStore{db: db},
+		taskScheduler: sched,
+		taskPublisher: taskProducer,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -150,13 +200,7 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 //
 //	error: 服务器运行出错时返回
 func (s *Server) Run() error {
-	// 在后台启动调度器（主消费者）
-	go s.sched.Run(context.Background())
-
-	// 如果启用了 Redis Streams，启动周期发布器
-	if s.cfg.App.EnableRedisQueue {
-		go s.sched.RunPeriodicPublisher(context.Background())
-	}
+	s.StartScheduler(context.Background())
 
 	s.logger.Info("api server listening", slog.String("addr", s.cfg.App.HTTPAddr))
 	return s.router.Run(s.cfg.App.HTTPAddr)
@@ -170,6 +214,10 @@ func (s *Server) Router() http.Handler {
 // StartScheduler 启动调度器。
 func (s *Server) StartScheduler(ctx context.Context) {
 	go s.sched.Run(ctx)
+	if s.cfg.App.EnableRedisQueue {
+		s.logger.Info("starting periodic publisher for redis queue")
+		go s.sched.RunPeriodicPublisher(ctx)
+	}
 }
 
 // Close 关闭数据库与缓存连接。
@@ -594,8 +642,8 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 	}
 	userID := getUserID(c)
 
-	var taskCount int64
-	if err := s.db.Model(&model.Task{}).Where("user_id = ?", userID).Count(&taskCount).Error; err != nil {
+	taskCount, err := s.taskStore.CountTasks(c.Request.Context(), userID)
+	if err != nil {
 		s.logger.Error("count tasks failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "count tasks failed"})
 		return
@@ -615,6 +663,19 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		return
 	}
 
+	dedupURL := buildDedupURL(req, sortBy, sortOrder)
+	if dedupURL != "" {
+		dup, err := s.deduper.IsDuplicate(c.Request.Context(), dedupURL)
+		if err != nil {
+			s.logger.Error("dedup check failed", slog.String("error", err.Error()), slog.String("url", dedupURL))
+		} else if dup {
+			s.logger.Info("task deduplicated", slog.String("url", dedupURL))
+			metrics.TaskDuplicatePreventedTotal.Inc()
+			c.JSON(http.StatusOK, gin.H{"status": "skipped_duplicate"})
+			return
+		}
+	}
+
 	status := req.Status
 	if status == "" {
 		status = "running"
@@ -631,7 +692,7 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		Status:    status,
 	}
 
-	if err := s.db.Create(&task).Error; err != nil {
+	if err := s.taskStore.CreateTask(c.Request.Context(), &task); err != nil {
 		s.logger.Error("create task failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create task failed"})
 		return
@@ -639,25 +700,25 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 
 	// 如果任务状态为 running，发布到队列
 	if task.Status == "running" {
-		if s.cfg.App.EnableRedisQueue && s.taskProducer != nil {
+		if s.cfg.App.EnableRedisQueue && s.taskPublisher != nil {
 			// 新模式：发布到 Redis Streams
-			if err := s.taskProducer.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
+			if err := s.taskPublisher.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
 				s.logger.Warn("publish task to redis failed, fallback to direct schedule",
 					slog.Uint64("task_id", uint64(task.ID)),
 					slog.String("error", err.Error()))
 				// 降级：如果 Redis 失败，使用原有方式
-				s.sched.StartTask(context.Background(), &task)
+				s.taskScheduler.StartTask(context.Background(), &task)
 			} else {
 				s.logger.Info("task submitted to redis queue",
 					slog.Uint64("task_id", uint64(task.ID)))
 			}
 		} else {
 			// 旧模式：直接启动调度器
-			s.sched.StartTask(context.Background(), &task)
+			s.taskScheduler.StartTask(context.Background(), &task)
 		}
 	}
 
-	c.JSON(http.StatusOK, createTaskResponse{ID: task.ID})
+	c.JSON(http.StatusCreated, createTaskResponse{ID: task.ID})
 }
 
 // mapSortString 将前端传递的排序字符串映射为 Protobuf 枚举值。
@@ -699,6 +760,44 @@ func mapSortAndOrder(s string) (int, int) {
 	}
 
 	return sortBy, sortOrder
+}
+
+func buildDedupURL(req createTaskRequest, sortBy, sortOrder int) string {
+	if req.Keyword == "" {
+		return ""
+	}
+
+	if req.Platform == int(pb.Platform_PLATFORM_MERCARI) {
+		fetchReq := &pb.FetchRequest{
+			Platform:   pb.Platform(req.Platform),
+			Keyword:    req.Keyword,
+			MinPrice:   req.MinPrice,
+			MaxPrice:   req.MaxPrice,
+			Sort:       pb.SortBy(sortBy),
+			Order:      pb.SortOrder(sortOrder),
+			OnlyOnSale: true,
+		}
+		return crawler.BuildMercariURL(fetchReq)
+	}
+
+	values := url.Values{}
+	values.Set("keyword", req.Keyword)
+	if req.MinPrice > 0 {
+		values.Set("min_price", strconv.FormatInt(int64(req.MinPrice), 10))
+	}
+	if req.MaxPrice > 0 {
+		values.Set("max_price", strconv.FormatInt(int64(req.MaxPrice), 10))
+	}
+	values.Set("sort_by", strconv.Itoa(sortBy))
+	values.Set("sort_order", strconv.Itoa(sortOrder))
+
+	u := url.URL{
+		Scheme:   "goodshunter",
+		Host:     fmt.Sprintf("platform-%d", req.Platform),
+		Path:     "/search",
+		RawQuery: values.Encode(),
+	}
+	return u.String()
 }
 
 // timelineItem 时间轴接口返回的商品结构。
