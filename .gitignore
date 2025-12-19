@@ -4,9 +4,7 @@ logs/*.pid
 
 # demo文件
 demo/
-
-# 说明文档
-docs/
+docs/archive/demo/
 
 # 配置文件（包含敏感信息）
 configs/config.json

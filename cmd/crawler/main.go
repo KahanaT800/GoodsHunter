@@ -91,7 +91,13 @@ func main() {
 	// 等待中断信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	restartCh := service.RestartSignal()
+	select {
+	case sig := <-sigCh:
+		appLogger.Info("received os signal", slog.String("signal", sig.String()))
+	case <-restartCh:
+		appLogger.Info("restart requested by service (max tasks reached)")
+	}
 
 	appLogger.Info("shutting down crawler service...")
 

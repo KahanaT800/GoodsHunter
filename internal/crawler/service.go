@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"goodshunter/internal/config"
@@ -24,8 +28,8 @@ import (
 )
 
 var (
-	priceRe = regexp.MustCompile(`[0-9]+`)
-	idRe    = regexp.MustCompile(`m[0-9]+`)
+	priceRe             = regexp.MustCompile(`[0-9]+`)
+	priceWithCurrencyRe = regexp.MustCompile(`[¥￥]\s*([0-9][0-9,]*)`)
 )
 
 // Service 实现爬虫 gRPC 服务，负责浏览器调度与页面解析。
@@ -33,14 +37,22 @@ var (
 // 它维护了一个 rod.Browser 实例，并使用 worker pool 控制并发抓取数量。
 type Service struct {
 	pb.UnimplementedCrawlerServiceServer
-	browser       *rod.Browser
-	queue         *queue.Queue // Worker Pool 用于控制并发
-	rdb           *redis.Client
-	rateLimiter   *ratelimit.RateLimiter
-	logger        *slog.Logger
-	defaultUA     string
-	pageTimeout   time.Duration
-	maxFetchCount int
+	browser        *rod.Browser
+	queue          *queue.Queue // Worker Pool 用于控制并发
+	rdb            *redis.Client
+	rateLimiter    *ratelimit.RateLimiter
+	logger         *slog.Logger
+	defaultUA      string
+	pageTimeout    time.Duration
+	maxFetchCount  int
+	cfg            *config.Config
+	proxyUntil     time.Time
+	currentIsProxy bool
+	mu             sync.RWMutex
+	forceProxyOnce uint32
+	taskCounter    atomic.Uint64
+	maxTasks       uint64
+	restartCh      chan struct{}
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -56,7 +68,7 @@ type Service struct {
 //	*Service: 初始化完成的服务实例
 //	error: 如果浏览器启动失败则返回错误
 func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Service, error) {
-	browser, err := startBrowser(cfg, logger)
+	browser, err := startBrowser(cfg, logger, false)
 	if err != nil {
 		return nil, err
 	}
@@ -97,16 +109,39 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		slog.Int("workers", workers),
 		slog.Int("capacity", capacity))
 
-	return &Service{
-		browser:       browser,
-		queue:         q,
-		rdb:           rdb,
-		rateLimiter:   limiter,
-		logger:        logger,
-		defaultUA:     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-		pageTimeout:   30 * time.Second,
-		maxFetchCount: cfg.Browser.MaxFetchCount,
-	}, nil
+	forceProxyOnce := uint32(0)
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("FORCE_PROXY_ONCE"))); v == "1" || v == "true" || v == "yes" {
+		forceProxyOnce = 1
+		logger.Warn("force proxy switch enabled for next crawl", slog.String("env", "FORCE_PROXY_ONCE"))
+	}
+
+	maxTasks := uint64(0)
+	if cfg.App.MaxTasks > 0 {
+		maxTasks = uint64(cfg.App.MaxTasks)
+	}
+
+	service := &Service{
+		browser:        browser,
+		queue:          q,
+		rdb:            rdb,
+		rateLimiter:    limiter,
+		logger:         logger,
+		defaultUA:      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+		pageTimeout:    30 * time.Second,
+		maxFetchCount:  cfg.Browser.MaxFetchCount,
+		cfg:            cfg,
+		currentIsProxy: false,
+		forceProxyOnce: forceProxyOnce,
+		maxTasks:       maxTasks,
+		restartCh:      make(chan struct{}, 1),
+	}
+	metrics.CrawlerProxyMode.Set(0)
+	return service, nil
+}
+
+// RestartSignal exposes the restart notification channel.
+func (s *Service) RestartSignal() <-chan struct{} {
+	return s.restartCh
 }
 
 // startBrowser 根据配置启动浏览器。
@@ -123,7 +158,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 //
 //	*rod.Browser: 连接好的浏览器实例
 //	error: 启动失败返回错误
-func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error) {
+func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.Browser, error) {
 	bin := cfg.Browser.BinPath
 	if bin == "" {
 		logger.Info("no browser binary specified, downloading default...")
@@ -138,10 +173,39 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 		Headless(cfg.Browser.Headless).
 		Bin(bin).
 		NoSandbox(true).
-		Set("remote-allow-origins", "*") // 解决某些环境下的 CORS 问题
+		Set("remote-allow-origins", "*")
 
-	if cfg.Browser.ProxyURL != "" {
-		l = l.Proxy(cfg.Browser.ProxyURL)
+	var proxyServer string
+	var proxyUser string
+	var proxyPass string
+
+	// 读取并设置 HTTP 代理
+	if useProxy {
+		if cfg.Browser.ProxyURL == "" {
+			return nil, fmt.Errorf("proxy enabled but no proxy url configured")
+		}
+		parsed, err := url.Parse(cfg.Browser.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy url: %w", err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("invalid proxy url: %s", cfg.Browser.ProxyURL)
+		}
+		proxyServer = fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+		if parsed.User != nil {
+			proxyUser = parsed.User.Username()
+			if pass, ok := parsed.User.Password(); ok {
+				proxyPass = pass
+			}
+		}
+		l = l.Proxy(proxyServer)
+		if proxyUser != "" {
+			logger.Info("using http proxy",
+				slog.String("server", proxyServer),
+				slog.String("auth_user", proxyUser))
+		} else {
+			logger.Info("using http proxy", slog.String("server", proxyServer))
+		}
 	}
 
 	url, err := l.Launch()
@@ -153,9 +217,90 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
+	if proxyUser != "" {
+		go browser.MustHandleAuth(proxyUser, proxyPass)()
+		logger.Info("proxy authentication handler registered")
+	}
 
-	logger.Info("browser started", slog.String("bin", bin))
+	mode := "direct"
+	if useProxy {
+		mode = "proxy"
+	}
+	logger.Info("browser started", slog.String("bin", bin), slog.String("mode", mode))
 	return browser, nil
+}
+
+func (s *Service) ensureBrowserState() error {
+	s.mu.RLock()
+	shouldUseProxy := time.Now().Before(s.proxyUntil)
+	currentIsProxy := s.currentIsProxy
+	s.mu.RUnlock()
+
+	if shouldUseProxy == currentIsProxy {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	shouldUseProxy = time.Now().Before(s.proxyUntil)
+	if shouldUseProxy == s.currentIsProxy {
+		return nil
+	}
+
+	if err := s.rotateBrowser(shouldUseProxy); err != nil {
+		return err
+	}
+	s.currentIsProxy = shouldUseProxy
+	mode := "direct"
+	if shouldUseProxy {
+		mode = "proxy"
+	}
+	metrics.CrawlerProxyMode.Set(boolToGauge(shouldUseProxy))
+	metrics.CrawlerProxySwitchTotal.WithLabelValues(mode).Inc()
+	if shouldUseProxy {
+		metrics.CrawlerProxySwitchToProxyTotal.Inc()
+	}
+	s.logger.Info("crawler mode switched", slog.String("mode", mode))
+	return nil
+}
+
+// rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
+func (s *Service) rotateBrowser(useProxy bool) error {
+	newBrowser, err := startBrowser(s.cfg, s.logger, useProxy)
+	if err != nil {
+		return err
+	}
+	oldBrowser := s.browser
+	s.browser = newBrowser
+	if oldBrowser != nil {
+		if err := oldBrowser.Close(); err != nil {
+			s.logger.Warn("close browser failed", slog.String("error", err.Error()))
+		}
+	}
+	return nil
+}
+
+func (s *Service) isUsingProxy() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentIsProxy
+}
+
+func (s *Service) activateProxyCooldown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until := time.Now().Add(s.cfg.App.ProxyCooldown)
+	if until.After(s.proxyUntil) {
+		s.proxyUntil = until
+	}
+}
+
+func boolToGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // FetchItems 处理抓取请求。
@@ -191,12 +336,27 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 		}
 	}
 
+	recordModeMetrics := func(resp *pb.FetchResponse, err error) {
+		mode := "direct"
+		if s.isUsingProxy() {
+			mode = "proxy"
+		}
+		status := "success"
+		if err != nil {
+			status = classifyCrawlStatus(err)
+		} else if resp != nil && len(resp.Items) == 0 {
+			status = "empty_result"
+		}
+		metrics.CrawlerRequestsByModeTotal.WithLabelValues(platform, status, mode).Inc()
+		metrics.CrawlerRequestDurationByMode.WithLabelValues(platform, mode).Observe(time.Since(start).Seconds())
+	}
+
 	// 创建一个 channel 用于接收抓取结果
 	resultCh := make(chan *fetchResult, 1)
 
 	// 创建 Job 函数
 	job := func(workerCtx context.Context) error {
-		response, err := s.executeCrawl(ctx, req)
+		response, err := s.doCrawl(ctx, req, 0)
 
 		// 将结果发送到 channel
 		select {
@@ -211,12 +371,27 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 	// 提交到 worker pool（阻塞式，直到队列有空间）
 	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
 		recordMetrics("failed", err)
+		recordModeMetrics(nil, err)
 		return nil, fmt.Errorf("enqueue crawl job: %w", err)
 	}
 
 	// 等待结果
 	select {
 	case result := <-resultCh:
+		if s.maxTasks > 0 {
+			newCount := s.taskCounter.Add(1)
+			metrics.CrawlerTasksProcessedCurrent.Set(float64(newCount))
+			if newCount >= s.maxTasks {
+				select {
+				case s.restartCh <- struct{}{}:
+					s.logger.Info("max tasks reached, signaling shutdown",
+						slog.Uint64("count", newCount),
+						slog.Uint64("limit", s.maxTasks))
+				default:
+				}
+			}
+		}
+
 		if result.err != nil {
 			s.logger.Error("crawl failed",
 				slog.String("task_id", taskID),
@@ -224,12 +399,15 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 				slog.String("duration", time.Since(start).String()),
 			)
 			recordMetrics("failed", result.err)
+			recordModeMetrics(result.response, result.err)
 			return nil, result.err
 		}
 		recordMetrics("success", nil)
+		recordModeMetrics(result.response, nil)
 		return result.response, nil
 	case <-ctx.Done():
 		recordMetrics("failed", ctx.Err())
+		recordModeMetrics(nil, ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -240,8 +418,36 @@ type fetchResult struct {
 	err      error
 }
 
-// executeCrawl 执行实际的爬取逻辑
-func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
+func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
+	if err := s.ensureBrowserState(); err != nil {
+		return nil, err
+	}
+
+	if attempt == 0 && !s.isUsingProxy() && atomic.CompareAndSwapUint32(&s.forceProxyOnce, 1, 0) {
+		s.logger.Warn("direct connection failed, activating proxy",
+			slog.String("reason", "forced"),
+			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
+		s.activateProxyCooldown()
+		return s.doCrawl(ctx, req, attempt+1)
+	}
+
+	response, err := s.crawlOnce(ctx, req)
+	if err == nil {
+		return response, nil
+	}
+
+	if attempt == 0 && !s.isUsingProxy() && shouldActivateProxy(err) {
+		s.logger.Warn("direct connection failed, activating proxy",
+			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
+		s.activateProxyCooldown()
+		return s.doCrawl(ctx, req, attempt+1)
+	}
+
+	return response, err
+}
+
+// crawlOnce 执行单次爬取逻辑（不包含自动切换与重试）。
+func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	start := time.Now()
 
@@ -254,9 +460,45 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		}
 	}
 
-	// 构建 URL 并打开新页面。
 	url := BuildMercariURL(req)
-	page := stealth.MustPage(s.browser)
+	s.mu.RLock()
+	browser := s.browser
+	s.mu.RUnlock()
+	if browser == nil {
+		return nil, fmt.Errorf("browser not initialized")
+	}
+	page := stealth.MustPage(browser)
+	// 定义增强版屏蔽列表
+	blockedURLs := []string{
+		// 1. 高带宽资源 (图片/字体/媒体) - 保持不变
+		"*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
+		"*.woff", "*.woff2", "*.ttf", "*.eot",
+		"*.mp4", "*.mp3",
+
+		// 2. 广告与追踪脚本 (新增了从日志里发现的!)
+		"*google-analytics*",
+		"*googletagmanager*",
+		"*doubleclick*",
+		"*criteo*",
+		"*facebook*",
+		"*twitter*",
+		"*appsflyer*",
+		"*smartnews*",
+		"*bing*",
+		"*yahoo*",
+		"*line-scdn*",
+		"*popin*",
+
+		// === [本次新增] ===
+		"*tiktok*",           // analytics.tiktok.com
+		"*sentry*",           // ingest.sentry.io (错误监控)
+		"*syndicatedsearch*", // Google 广告组件
+	}
+	if err := (proto.NetworkSetBlockedURLs{
+		Urls: blockedURLs,
+	}).Call(page); err != nil {
+		s.logger.Warn("set blocked urls failed", slog.String("error", err.Error()))
+	}
 	metrics.CrawlerBrowserActive.Inc()
 	defer func() {
 		metrics.CrawlerBrowserActive.Dec()
@@ -284,11 +526,10 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		return nil, fmt.Errorf("blocked_page")
 	}
 
-	// 等待列表元素加载完成。
-	// 使用 Race 同时等待商品列表或空状态标志，避免在无商品时死等直到超时
+	// 等待 [data-testid="item-cell"] 内部出现 <a> 标签，避免骨架屏阶段
 	_, err = page.Race().
-		Element(`[data-testid="item-cell"]`).Handle(func(e *rod.Element) error {
-		return nil // 找到商品
+		Element(`[data-testid="item-cell"] a`).Handle(func(e *rod.Element) error {
+		return nil
 	}).
 		Element(`.merEmptyState`).Handle(func(e *rod.Element) error {
 		return fmt.Errorf("no_items_state")
@@ -313,43 +554,32 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	}
 
 	// 滚动加载更多商品，直到达到 maxFetchCount 或无法加载更多
-	selector := `[data-testid="item-cell"]`
+	selector := `[data-testid="item-cell"]:has(a)`
 	limit := s.maxFetchCount
 	if limit <= 0 {
 		limit = 50 // 默认保底
 	}
 
-	lastCount := 0
 	timeout := time.After(s.pageTimeout) // 总超时控制
+	noGrowthAttempts := 0
+
+	countItems := func() (int, error) {
+		elements, err := page.Elements(selector)
+		if err != nil {
+			return 0, err
+		}
+		return len(elements), nil
+	}
 
 	// 滚动循环
 	for {
-		// 检查当前数量 (仅统计已加载图片的有效商品)
-		// 这一步至关重要：因为 DOM 可能预先存在空壳元素，如果只查 item-cell 会导致提前结束滚动，
-		// 从而导致后续提取时因图片未加载而失败。
-		loadedElements, err := page.Elements(selector + " img")
+		currentCount, err := countItems()
 		if err != nil {
 			break
 		}
-		currentCount := len(loadedElements)
 		if currentCount >= limit {
 			break
 		}
-
-		// 如果数量不再增加（且已经尝试过滚动），则停止
-		if currentCount == lastCount && currentCount > 0 {
-			// 可以增加一些重试次数或更智能的检测，这里简单处理：
-			// 如果没变，尝试再滚一次，如果还是没变就退出？
-			// 为了避免死循环，这里假设 rod 的 Wait 会处理好，
-			// 我们简单地：如果没变，等待短时间后再次检查，如果还是没变则退出。
-			time.Sleep(500 * time.Millisecond)
-			elements2, _ := page.Elements(selector)
-			if len(elements2) == lastCount {
-				break
-			}
-			currentCount = len(elements2)
-		}
-		lastCount = currentCount
 
 		// 滚动策略：逐步向下滚动，而不是直接到底部，确保 Lazy Load 触发
 		// 获取当前滚动高度
@@ -362,6 +592,19 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		default:
 			time.Sleep(500 * time.Millisecond) // 等待页面渲染
 		}
+
+		afterCount, err := countItems()
+		if err != nil {
+			break
+		}
+		if afterCount <= currentCount {
+			noGrowthAttempts++
+			if noGrowthAttempts >= 3 && currentCount > 0 {
+				break
+			}
+		} else {
+			noGrowthAttempts = 0
+		}
 	}
 
 ParseItems:
@@ -371,15 +614,10 @@ ParseItems:
 		return nil, fmt.Errorf("get elements: %w", err)
 	}
 	if len(elements) == 0 {
-		s.logger.Info("no items found",
-			slog.String("task_id", taskID),
-			slog.String("url", url),
-			slog.String("duration", time.Since(start).String()),
-		)
 		return &pb.FetchResponse{
 			Items:        []*pb.Item{},
 			TotalFound:   0,
-			ErrorMessage: "no_items",
+			ErrorMessage: "",
 		}, nil
 	}
 
@@ -412,8 +650,7 @@ ParseItems:
 		slog.Int("skipped", skipCount))
 	s.logger.Info("crawl completed",
 		slog.String("task_id", taskID),
-		slog.String("url", url),
-		slog.Int("elements", len(elements)),
+		slog.Int("count", len(items)),
 		slog.String("duration", time.Since(start).String()))
 	return &pb.FetchResponse{
 		Items:        items,
@@ -494,6 +731,25 @@ func isBlockedText(text string) bool {
 	return false
 }
 
+func shouldActivateProxy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "blocked_page") ||
+		strings.Contains(msg, "cloudflare") ||
+		strings.Contains(msg, "attention required") ||
+		strings.Contains(msg, "access denied") {
+		return true
+	}
+	if strings.Contains(msg, "net::") ||
+		strings.Contains(msg, "connection") ||
+		strings.Contains(msg, "navigate") {
+		return true
+	}
+	return false
+}
+
 func classifyCrawlerError(err error) string {
 	if err == nil {
 		return "unknown"
@@ -514,37 +770,24 @@ func classifyCrawlerError(err error) string {
 	}
 }
 
+func classifyCrawlStatus(err error) string {
+	if err == nil {
+		return "success"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "403") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "access denied") ||
+		strings.Contains(msg, "blocked_page") {
+		return "403_forbidden"
+	}
+	return "error"
+}
+
 // extractItem 从单个 DOM 元素中提取商品信息。
-//
-// 参数:
-//
-//	el: 代表单个商品的 DOM 元素
-//
-// 返回值:
-//
-//	*pb.Item: 提取出的商品结构体
-//	error: 解析失败返回错误
+// 这里的关键是：不依赖 <img> 标签的存在，因为资源屏蔽可能导致它被 DOM 移除。
 func extractItem(el *rod.Element) (*pb.Item, error) {
-	// 解析主图与标题。
-	img, err := el.Element("img")
-	if err != nil {
-		return nil, fmt.Errorf("img: %w", err)
-	}
-	title, err := img.Attribute("alt")
-	if err != nil {
-		return nil, fmt.Errorf("img alt: %w", err)
-	}
-	src, err := img.Attribute("src")
-	if err != nil {
-		return nil, fmt.Errorf("img src: %w", err)
-	}
-
-	titleStr := ""
-	if title != nil {
-		titleStr = strings.TrimSuffix(*title, "のサムネイル")
-	}
-
-	// 解析商品链接。
+	// 1. 提取链接 (<a>) - 这是核心，必须存在
 	link, err := el.Element("a")
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -555,17 +798,10 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 		itemURL = *href
 	}
 
-	// 从图片 URL 提取商品 ID（m\d+）。
+	// 2. 提取 ID (从链接中)
 	id := ""
-	if src != nil {
-		if m := idRe.FindString(*src); m != "" {
-			id = m
-		}
-	}
-
-	// 如果从图片无法提取 ID，尝试从链接提取
-	if id == "" && itemURL != "" {
-		// 普通商品: /item/m123456
+	if itemURL != "" {
+		// 逻辑：匹配 /item/m... 或 /shops/product/...
 		if strings.Contains(itemURL, "/item/") {
 			parts := strings.Split(itemURL, "/")
 			if len(parts) > 0 {
@@ -574,9 +810,7 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 					id = possibleID
 				}
 			}
-		}
-		// Mercari Shops 商品: /shops/product/XYZ
-		if strings.Contains(itemURL, "/shops/product/") {
+		} else if strings.Contains(itemURL, "/shops/product/") {
 			parts := strings.Split(itemURL, "/")
 			if len(parts) > 0 {
 				id = "shops_" + parts[len(parts)-1]
@@ -584,26 +818,41 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 		}
 	}
 
-	// 解析价格。
-	priceEl, err := el.Element(".merPrice")
-	if err != nil {
-		return nil, fmt.Errorf("price: %w", err)
-	}
-	priceTxt, err := priceEl.Text()
-	if err != nil {
-		return nil, fmt.Errorf("price text: %w", err)
-	}
-	priceVal, err := parsePrice(priceTxt)
-	if err != nil {
-		return nil, fmt.Errorf("parse price: %w", err)
+	// 3. 提取标题
+	// 策略：优先找 data-testid="thumbnail-item-name" (最稳)，找不到再尝试找 img alt (兼容旧版)
+	titleStr := ""
+	if titleEl, err := el.Element(`[data-testid="thumbnail-item-name"]`); err == nil {
+		titleStr, _ = titleEl.Text()
+	} else {
+		// 只有在找不到文本节点时，才尝试去找 img (此时 img 不存在也没关系，只是标题为空)
+		if img, err := el.Element("img"); err == nil {
+			if alt, _ := img.Attribute("alt"); alt != nil {
+				titleStr = strings.TrimSuffix(*alt, "のサムネイル")
+			}
+		}
 	}
 
+	// 4. 提取价格
+	priceVal, err := extractPriceHelper(el)
+	if err != nil {
+		return nil, fmt.Errorf("price not found or zero: %w", err)
+	}
+
+	// 5. 构造图片 URL (完全不依赖 img src)
 	imageURL := ""
-	if src != nil {
-		imageURL = *src
+	if id != "" && strings.HasPrefix(id, "m") {
+		// 标准 Mercari 图片规则
+		imageURL = fmt.Sprintf("https://static.mercdn.net/thumb/item/webp/%s_1.jpg", id)
 	}
-	itemURL = normalizeMercariURL(itemURL)
+	if imageURL == "" {
+		if img, err := el.Element("img"); err == nil {
+			if src, _ := img.Attribute("src"); src != nil {
+				imageURL = *src
+			}
+		}
+	}
 
+	// 6. 状态判断
 	status := "on_sale"
 	if txt, err := el.Text(); err == nil {
 		lower := strings.ToLower(txt)
@@ -611,6 +860,8 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 			status = "sold"
 		}
 	}
+
+	itemURL = normalizeMercariURL(itemURL)
 
 	return &pb.Item{
 		SourceId: id,
@@ -635,21 +886,73 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 //	int64: 解析后的数值
 //	error: 解析失败返回错误
 func parsePrice(txt string) (int64, error) {
+	if match := priceWithCurrencyRe.FindStringSubmatch(txt); len(match) > 1 {
+		candidate := strings.ReplaceAll(match[1], ",", "")
+		val, err := strconv.ParseInt(candidate, 10, 64)
+		if err == nil {
+			return val, nil
+		}
+	}
+
 	cleaned := strings.ReplaceAll(txt, "¥", "")
+	cleaned = strings.ReplaceAll(cleaned, "￥", "")
 	cleaned = strings.ReplaceAll(cleaned, ",", "")
 	cleaned = strings.TrimSpace(cleaned)
 	if cleaned == "" {
 		return 0, fmt.Errorf("empty price")
 	}
-	match := priceRe.FindString(cleaned)
-	if match == "" {
+	matches := priceRe.FindAllString(cleaned, -1)
+	if len(matches) == 0 {
 		return 0, fmt.Errorf("no digits")
 	}
-	val, err := strconv.ParseInt(match, 10, 64)
-	if err != nil {
-		return 0, err
+	var bestVal int64
+	bestLen := 0
+	found := false
+	for _, match := range matches {
+		val, err := strconv.ParseInt(match, 10, 64)
+		if err != nil {
+			continue
+		}
+		if !found || len(match) > bestLen || (len(match) == bestLen && val > bestVal) {
+			bestVal = val
+			bestLen = len(match)
+			found = true
+		}
 	}
-	return val, nil
+	if !found {
+		return 0, fmt.Errorf("no valid digits")
+	}
+	return bestVal, nil
+}
+
+// extractPriceHelper 用于从价格元素中提取纯数字
+// 输入: "1,999", "¥1,999", "¥ 200"
+// 输出: 1999, 200
+func extractPriceHelper(el *rod.Element) (int64, error) {
+	containerSelectors := []string{
+		".merPrice",
+		"span[class^='merPrice']",
+		"[data-testid='price']",
+	}
+	for _, sel := range containerSelectors {
+		container, err := el.Element(sel)
+		if err != nil {
+			continue
+		}
+		if numEl, err := container.Element("span[class^='number']"); err == nil {
+			if txt, err := numEl.Text(); err == nil && txt != "" {
+				if price, err := parsePrice(txt); err == nil {
+					return price, nil
+				}
+			}
+		}
+		if txt, err := container.Text(); err == nil && txt != "" {
+			if price, err := parsePrice(txt); err == nil {
+				return price, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("price element not found")
 }
 
 // normalizeMercariURL 将相对或协议省略的链接补全为完整的 Mercari URL。
@@ -697,10 +1000,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("shutdown worker pool: %w", err)
 	}
 
-	if err := s.browser.Close(); err != nil {
-		s.logger.Error("close browser failed", slog.String("error", err.Error()))
-	} else {
-		metrics.CrawlerBrowserInstances.Dec()
+	s.mu.Lock()
+	browser := s.browser
+	s.browser = nil
+	s.mu.Unlock()
+	if browser != nil {
+		if err := browser.Close(); err != nil {
+			s.logger.Error("close browser failed", slog.String("error", err.Error()))
+		} else {
+			metrics.CrawlerBrowserInstances.Dec()
+		}
 	}
 
 	if s.rdb != nil {

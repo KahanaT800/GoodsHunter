@@ -2,7 +2,6 @@ package crawler
 
 import (
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +19,16 @@ func TestParsePrice(t *testing.T) {
 	}
 }
 
+func TestParsePriceWithExtraNumbers(t *testing.T) {
+	val, err := parsePrice("6% OFF ¥950")
+	if err != nil {
+		t.Fatalf("parse price: %v", err)
+	}
+	if val != 950 {
+		t.Fatalf("expected 950, got %d", val)
+	}
+}
+
 func TestBlockedText(t *testing.T) {
 	html := "<html><body><h1>Attention Required!</h1><p>Cloudflare</p></body></html>"
 	if !isBlockedText(html) {
@@ -34,6 +43,7 @@ func TestExtractItemFromHTML(t *testing.T) {
     <div data-testid="item-cell">
       <a href="/item/m123456">detail</a>
       <img alt="Nike Shoes thumbnail" src="https://example.com/m123456.jpg"/>
+      <span data-testid="thumbnail-item-name">Nike Shoes</span>
       <div class="merPrice">¥ 1,200</div>
       <span>SOLD</span>
     </div>
@@ -63,13 +73,13 @@ func TestExtractItemFromHTML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extract item: %v", err)
 	}
-	if item.Title != "Nike Shoes thumbnail" {
+	if item.Title != "Nike Shoes" {
 		t.Fatalf("unexpected title: %s", item.Title)
 	}
 	if item.Price != 1200 {
 		t.Fatalf("unexpected price: %d", item.Price)
 	}
-	if !strings.Contains(item.ImageUrl, "m123456.jpg") {
+	if item.ImageUrl != "https://static.mercdn.net/thumb/item/webp/m123456_1.jpg" {
 		t.Fatalf("unexpected image url: %s", item.ImageUrl)
 	}
 	if item.Status != "sold" {

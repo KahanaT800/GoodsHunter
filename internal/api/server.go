@@ -67,6 +67,7 @@ type TaskScheduler interface {
 
 type Deduper interface {
 	IsDuplicate(ctx context.Context, url string) (bool, error)
+	Delete(ctx context.Context, url string) error
 }
 
 type dbTaskStore struct {
@@ -355,6 +356,20 @@ func (s *Server) handleDeleteTask(c *gin.Context) {
 		return
 	}
 
+	var dedupURL string
+	var task model.Task
+	if err := s.db.Select("keyword", "min_price", "max_price", "platform", "sort_by", "sort_order").
+		Where("id = ? AND user_id = ?", id, userID).
+		First(&task).Error; err == nil {
+		req := createTaskRequest{
+			Keyword:  task.Keyword,
+			MinPrice: task.MinPrice,
+			MaxPrice: task.MaxPrice,
+			Platform: task.Platform,
+		}
+		dedupURL = buildDedupURL(req, task.SortBy, task.SortOrder)
+	}
+
 	// 停止调度器
 	s.sched.StopTask(uint(taskIDUint))
 
@@ -394,6 +409,11 @@ func (s *Server) handleDeleteTask(c *gin.Context) {
 		s.logger.Error("delete task failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete task failed"})
 		return
+	}
+	if dedupURL != "" {
+		if err := s.deduper.Delete(c.Request.Context(), dedupURL); err != nil {
+			s.logger.Warn("dedup delete failed", slog.String("error", err.Error()), slog.String("url", dedupURL))
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"deleted": id})

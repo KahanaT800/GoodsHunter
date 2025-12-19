@@ -1,4 +1,4 @@
-.PHONY: all up down logs ps build clean test lint vet run run-api run-crawler dev stop-dev help
+.PHONY: all up down logs ps build build-image clean test lint vet run run-api run-crawler dev stop-dev tidy proto help
 
 # 默认目标：执行本地质量检查和编译
 all: lint test build
@@ -8,8 +8,6 @@ all: lint test build
 # ==============================================================================
 
 up:
-	@echo "Generating SSL certs..."
-	./scripts/gen_cert.sh
 	@echo "Starting services..."
 	docker compose --env-file .env up -d --build
 
@@ -97,6 +95,7 @@ help:
 	@echo "  down         Stop docker environment"
 	@echo "  logs         View docker logs"
 	@echo "  ps           List docker containers"
+	@echo "  build-image  Build docker images"
 	@echo ""
 	@echo "Local Development Targets:"
 	@echo "  build        Build binaries locally"
@@ -108,9 +107,8 @@ help:
 	@echo "  test         Run tests locally"
 	@echo "  lint         Run linter"
 	@echo "  vet          Run go vet"
+	@echo "  tidy         Tidy go.mod"
+	@echo "  proto        Generate gRPC code"
 	@echo ""
 	@echo "Other Targets:"
-	@echo "  proto        Generate gRPC code"
-	@echo "  tidy         Tidy go.mod"
 	@echo "  clean        Clean up docker volumes and binaries"
-

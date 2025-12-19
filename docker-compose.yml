@@ -33,17 +33,22 @@ services:
   crawler:
     image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-crawler:latest
     restart: always
+    stop_grace_period: 2m
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-:50051}
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
+      PROXY_COOLDOWN: ${PROXY_COOLDOWN:-10m}
+      MAX_TASKS: ${MAX_TASKS:-500}
+      FORCE_PROXY_ONCE: ${FORCE_PROXY_ONCE:-false}
       REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-goodshunter_redis}
       CRAWLER_METRICS_ADDR: ${CRAWLER_METRICS_ADDR:-:2112}
       CHROME_BIN: ${CHROME_BIN:-/usr/bin/chromium-browser}
       BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
+      HTTP_PROXY: ${HTTP_PROXY:-}
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
       BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-5}
       BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}

@@ -182,6 +182,43 @@ var (
 		Name: "goodshunter_crawler_browser_instances",
 		Help: "Number of active crawler browser instances",
 	})
+
+	// CrawlerProxyMode 当前代理模式（0=direct, 1=proxy）
+	CrawlerProxyMode = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_proxy_mode",
+		Help: "Crawler proxy mode (0=direct, 1=proxy)",
+	})
+
+	// CrawlerProxySwitchTotal 代理模式切换次数
+	CrawlerProxySwitchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_crawler_proxy_switch_total",
+		Help: "Total number of crawler proxy mode switches",
+	}, []string{"mode"})
+
+	// CrawlerRequestsByModeTotal 爬虫请求总数（带代理模式）
+	CrawlerRequestsByModeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_crawler_requests_by_mode_total",
+		Help: "Total number of crawler requests processed by mode",
+	}, []string{"platform", "status", "mode"})
+
+	// CrawlerRequestDurationByMode 爬虫请求耗时（带代理模式）
+	CrawlerRequestDurationByMode = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "goodshunter_crawler_request_duration_seconds_by_mode",
+		Help:    "Crawler request duration in seconds by mode",
+		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60},
+	}, []string{"platform", "mode"})
+
+	// CrawlerProxySwitchToProxyTotal 切换到代理模式次数
+	CrawlerProxySwitchToProxyTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_crawler_proxy_switch_to_proxy_total",
+		Help: "Total number of crawler switches to proxy mode",
+	})
+
+	// CrawlerTasksProcessedCurrent 当前生命周期内处理的任务数
+	CrawlerTasksProcessedCurrent = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_tasks_processed_current",
+		Help: "Current number of tasks processed in this crawler lifecycle",
+	})
 )
 
 // 数据库相关指标（GORM 会自动暴露部分指标）
