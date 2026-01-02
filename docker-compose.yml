@@ -34,10 +34,14 @@ services:
     image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-crawler:latest
     restart: always
     stop_grace_period: 2m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
-      APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-:50051}
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
       PROXY_COOLDOWN: ${PROXY_COOLDOWN:-10m}
@@ -50,7 +54,7 @@ services:
       BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
       HTTP_PROXY: ${HTTP_PROXY:-}
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
-      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-5}
+      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-3}
       BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}
     depends_on:
       mysql:
@@ -58,7 +62,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 50051"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2112"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -70,11 +74,15 @@ services:
   api:
     image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-api:latest
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       APP_HTTP_ADDR: ${APP_HTTP_ADDR:-:8080}
-      APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-crawler:50051}
       APP_SCHEDULE_INTERVAL: ${APP_SCHEDULE_INTERVAL:-5m}
       APP_NEW_ITEM_DURATION: ${APP_NEW_ITEM_DURATION:-1h}
       APP_MAX_TASKS_PER_USER: ${APP_MAX_TASKS_PER_USER:-3}
@@ -87,9 +95,6 @@ services:
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
       APP_GUEST_IDLE_TIMEOUT: ${APP_GUEST_IDLE_TIMEOUT:-10m}
       APP_GUEST_HEARTBEAT: ${APP_GUEST_HEARTBEAT:-5m}
-      APP_ENABLE_REDIS_QUEUE: ${APP_ENABLE_REDIS_QUEUE:-false}
-      APP_TASK_QUEUE_STREAM: ${APP_TASK_QUEUE_STREAM:-goodshunter:task:queue}
-      APP_TASK_QUEUE_GROUP: ${APP_TASK_QUEUE_GROUP:-scheduler_group}
       DB_HOST: ${DB_HOST:-mysql}
       DB_PORT: ${DB_PORT:-3306}
       DB_USER: ${DB_USER:-root}

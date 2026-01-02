@@ -27,7 +27,6 @@ type AppConfig struct {
 	Env              string        `json:"env"`                // 运行环境: local / prod
 	LogLevel         string        `json:"log_level"`          // 日志级别: debug / info / warn / error
 	HTTPAddr         string        `json:"http_addr"`          // API 服务监听地址
-	CrawlerGRPCAddr  string        `json:"crawler_grpc_addr"`  // 爬虫 gRPC 地址
 	ScheduleInterval time.Duration `json:"schedule_interval"`  // 调度间隔（如 "5m"）
 	NewItemDuration  time.Duration `json:"new_item_duration"`  // 新商品热度持续时间（如 "10m"）
 	GuestIdleTimeout time.Duration `json:"guest_idle_timeout"` // Guest 无操作超时（如 "10m"）
@@ -43,11 +42,6 @@ type AppConfig struct {
 	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
 	ProxyCooldown    time.Duration `json:"proxy_cooldown"`     // 直连失败后代理冷却时间
 	MaxTasks         int           `json:"max_tasks"`          // 重启前最大任务数
-
-	// Redis Streams 任务队列配置
-	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
-	TaskQueueStream  string `json:"task_queue_stream"`  // Redis Stream 名称
-	TaskQueueGroup   string `json:"task_queue_group"`   // Consumer Group 名称
 }
 
 // MySQLConfig MySQL 数据库配置。
@@ -173,7 +167,6 @@ func getDefaultConfig() *Config {
 			Env:              "local",
 			LogLevel:         "info",
 			HTTPAddr:         ":8081",
-			CrawlerGRPCAddr:  "localhost:50051",
 			ScheduleInterval: 5 * time.Minute,
 			NewItemDuration:  1 * time.Hour,
 			GuestIdleTimeout: 10 * time.Minute,
@@ -189,11 +182,6 @@ func getDefaultConfig() *Config {
 			DedupWindow:      3600,
 			ProxyCooldown:    10 * time.Minute,
 			MaxTasks:         500,
-
-			// Redis Streams 默认配置
-			EnableRedisQueue: false, // 默认关闭，渐进式升级
-			TaskQueueStream:  "goodshunter:task:queue",
-			TaskQueueGroup:   "scheduler_group",
 		},
 		MySQL: MySQLConfig{
 			DSN: "root:password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local",
@@ -206,7 +194,7 @@ func getDefaultConfig() *Config {
 			BinPath:        "",
 			ProxyURL:       "",
 			Headless:       true,
-			MaxConcurrency: 5,
+			MaxConcurrency: 3,
 			MaxFetchCount:  50,
 		},
 		Email: EmailConfig{
@@ -235,9 +223,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.HTTPAddr == "" {
 		cfg.App.HTTPAddr = defaults.App.HTTPAddr
-	}
-	if cfg.App.CrawlerGRPCAddr == "" {
-		cfg.App.CrawlerGRPCAddr = defaults.App.CrawlerGRPCAddr
 	}
 	if cfg.App.ScheduleInterval == 0 {
 		cfg.App.ScheduleInterval = defaults.App.ScheduleInterval
@@ -280,13 +265,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.MaxTasks == 0 {
 		cfg.App.MaxTasks = defaults.App.MaxTasks
-	}
-	// Redis Streams 默认值
-	if cfg.App.TaskQueueStream == "" {
-		cfg.App.TaskQueueStream = defaults.App.TaskQueueStream
-	}
-	if cfg.App.TaskQueueGroup == "" {
-		cfg.App.TaskQueueGroup = defaults.App.TaskQueueGroup
 	}
 	if cfg.Security.JWTSecret == "" {
 		if cfg.App.JWTSecret != "" {
@@ -332,9 +310,6 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("APP_HTTP_ADDR"); v != "" {
 		cfg.App.HTTPAddr = v
-	}
-	if v := os.Getenv("APP_CRAWLER_GRPC_ADDR"); v != "" {
-		cfg.App.CrawlerGRPCAddr = v
 	}
 	if v := os.Getenv("APP_SCHEDULE_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -405,17 +380,6 @@ func applyEnvOverrides(cfg *Config) {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.App.MaxTasks = i
 		}
-	}
-
-	// Redis Streams 环境变量
-	if v := os.Getenv("APP_ENABLE_REDIS_QUEUE"); v != "" {
-		cfg.App.EnableRedisQueue = v == "true" || v == "1"
-	}
-	if v := os.Getenv("APP_TASK_QUEUE_STREAM"); v != "" {
-		cfg.App.TaskQueueStream = v
-	}
-	if v := os.Getenv("APP_TASK_QUEUE_GROUP"); v != "" {
-		cfg.App.TaskQueueGroup = v
 	}
 
 	if v := viper.GetString("jwt_secret"); v != "" {

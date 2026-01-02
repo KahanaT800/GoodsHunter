@@ -14,6 +14,7 @@ import (
 	"goodshunter/internal/api"
 	"goodshunter/internal/config"
 	"goodshunter/internal/pkg/logger"
+	"goodshunter/internal/pkg/redisqueue"
 )
 
 // main 是 API 服务的入口函数。
@@ -32,7 +33,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := api.NewServer(ctx, cfg, appLogger)
+	redisQueue := redisqueue.NewClient(cfg.Redis.Addr, cfg.Redis.Password)
+	srv, err := api.NewServer(ctx, cfg, appLogger, redisQueue)
 	if err != nil {
 		appLogger.Error("init server failed", slog.String("error", err.Error()))
 		os.Exit(1)

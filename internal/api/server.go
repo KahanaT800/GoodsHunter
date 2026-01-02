@@ -20,14 +20,12 @@ import (
 	"goodshunter/internal/pkg/dedup"
 	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/notify"
-	"goodshunter/internal/pkg/taskqueue"
+	"goodshunter/internal/pkg/redisqueue"
 	"goodshunter/proto/pb"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormLogger "gorm.io/gorm/logger"
@@ -41,24 +39,17 @@ type Server struct {
 	logger        *slog.Logger
 	db            *gorm.DB
 	rdb           *redis.Client
-	crawler       pb.CrawlerServiceClient
 	router        *gin.Engine
 	sched         *scheduler.Scheduler
 	auth          *auth.Handler
-	taskProducer  *taskqueue.Producer // Redis Streams 任务生产者
 	deduper       Deduper
 	taskStore     TaskStore
 	taskScheduler TaskScheduler
-	taskPublisher TaskPublisher
 }
 
 type TaskStore interface {
 	CountTasks(ctx context.Context, userID int) (int64, error)
 	CreateTask(ctx context.Context, task *model.Task) error
-}
-
-type TaskPublisher interface {
-	SubmitTask(ctx context.Context, taskID uint, source string) error
 }
 
 type TaskScheduler interface {
@@ -104,7 +95,7 @@ func (s dbTaskStore) CreateTask(ctx context.Context, task *model.Task) error {
 //
 //	*Server: 初始化完成的服务器实例
 //	error: 初始化失败返回错误
-func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Server, error) {
+func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger, redisQueue *redisqueue.Client) (*Server, error) {
 	db, err := gorm.Open(mysql.Open(cfg.MySQL.DSN), &gorm.Config{
 		Logger: gormLogger.Default.LogMode(gormLogger.Silent), // 关闭GORM调试日志
 	})
@@ -124,12 +115,6 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		return nil, err
 	}
 
-	conn, err := grpc.NewClient(cfg.App.CrawlerGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	crawlerClient := pb.NewCrawlerServiceClient(conn)
-
 	emailNotifier := notify.NewEmailNotifier(&cfg.Email, logger)
 
 	// 创建调度器，使用配置中的 Worker Pool 参数
@@ -137,35 +122,20 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		db,
 		rdb,
 		logger,
-		crawlerClient,
+		redisQueue,
 		emailNotifier,
 		cfg.App.ScheduleInterval,
-		2*time.Minute,
 		cfg.App.NewItemDuration,
 		cfg.App.MaxItemsPerTask,
-		cfg.App.WorkerPoolSize,   // Worker Pool 大小
-		cfg.App.QueueCapacity,    // 队列容量
-		cfg.App.EnableRedisQueue, // 是否启用 Redis Streams
-		cfg.App.TaskQueueStream,
-		cfg.App.TaskQueueGroup,
+		cfg.App.WorkerPoolSize, // Worker Pool 大小
+		cfg.App.QueueCapacity,  // 队列容量
 		cfg.App.QueueBatchSize,
 	)
-
-	// 初始化任务生产者（如果启用 Redis Streams）
-	var taskProducer *taskqueue.Producer
-	if cfg.App.EnableRedisQueue {
-		taskProducer = taskqueue.NewProducer(rdb, logger, cfg.App.TaskQueueStream)
-		logger.Info("task producer initialized",
-			slog.String("stream", cfg.App.TaskQueueStream),
-			slog.Bool("enabled", true))
-	} else {
-		logger.Info("redis queue disabled, using polling mode")
-	}
 
 	deduper := dedup.NewDeduplicator(rdb, time.Duration(cfg.App.DedupWindow)*time.Second)
 
 	// 初始化 Prometheus 指标
-	metrics.InitMetrics(cfg.App.EnableRedisQueue, cfg.App.WorkerPoolSize)
+	metrics.InitMetrics(cfg.App.WorkerPoolSize)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -177,15 +147,12 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		logger:        logger,
 		db:            db,
 		rdb:           rdb,
-		crawler:       crawlerClient,
 		router:        r,
 		sched:         sched,
 		auth:          auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
-		taskProducer:  taskProducer,
 		deduper:       deduper,
 		taskStore:     dbTaskStore{db: db},
 		taskScheduler: sched,
-		taskPublisher: taskProducer,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -214,11 +181,28 @@ func (s *Server) Router() http.Handler {
 
 // StartScheduler 启动调度器。
 func (s *Server) StartScheduler(ctx context.Context) {
-	go s.sched.Run(ctx)
-	if s.cfg.App.EnableRedisQueue {
-		s.logger.Info("starting periodic publisher for redis queue")
-		go s.sched.RunPeriodicPublisher(ctx)
-	}
+	// 1. 保护任务分发器
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("PANIC in scheduler dispatcher", slog.Any("panic", r))
+				// 可选：在这里发送告警或尝试重启
+			}
+		}()
+		s.sched.DispatchTasks(ctx)
+	}()
+
+	// 2. 保护结果监听器
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("PANIC in result listener", slog.Any("panic", r))
+			}
+		}()
+		if err := s.sched.StartResultListener(ctx); err != nil {
+			s.logger.Error("result listener stopped", slog.String("error", err.Error()))
+		}
+	}()
 }
 
 // Close 关闭数据库与缓存连接。
@@ -307,6 +291,7 @@ type createTaskRequest struct {
 	Platform int    `json:"platform"`
 	Sort     string `json:"sort"` // 前端可能传字符串，如 "price"
 	Status   string `json:"status"`
+	Type     string `json:"type"` // monitor / oneshot
 }
 
 // createTaskResponse 创建任务的响应。
@@ -324,6 +309,7 @@ type taskResponse struct {
 	SortBy        int    `json:"sort_by"`
 	Status        string `json:"status"`
 	NotifyEnabled bool   `json:"notify_enabled"`
+	Type          string `json:"type" gorm:"column:task_type"`
 }
 
 type updateTaskStatusRequest struct {
@@ -511,7 +497,7 @@ func (s *Server) handleListTasks(c *gin.Context) {
 	tasks := []taskResponse{} // Initialize as empty slice to ensure JSON is [] not null
 	userID := getUserID(c)
 	if err := s.db.Model(&model.Task{}).
-		Select("id, user_id, keyword, min_price, max_price, platform, sort_by, status, notify_enabled").
+		Select("id, user_id, keyword, min_price, max_price, platform, sort_by, status, notify_enabled, task_type").
 		Where("user_id = ?", userID).
 		Order("id DESC").
 		Scan(&tasks).Error; err != nil {
@@ -700,6 +686,16 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 	if status == "" {
 		status = "running"
 	}
+	taskType := strings.ToLower(strings.TrimSpace(req.Type))
+	if taskType == "" {
+		taskType = string(model.TaskTypeMonitor)
+	}
+	switch taskType {
+	case string(model.TaskTypeMonitor), string(model.TaskTypeOneShot):
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid task type"})
+		return
+	}
 
 	task := model.Task{
 		UserID:    uint(userID),
@@ -710,6 +706,7 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		SortBy:    sortBy,
 		SortOrder: sortOrder,
 		Status:    status,
+		Type:      model.TaskType(taskType),
 	}
 
 	if err := s.taskStore.CreateTask(c.Request.Context(), &task); err != nil {
@@ -720,22 +717,7 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 
 	// 如果任务状态为 running，发布到队列
 	if task.Status == "running" {
-		if s.cfg.App.EnableRedisQueue && s.taskPublisher != nil {
-			// 新模式：发布到 Redis Streams
-			if err := s.taskPublisher.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
-				s.logger.Warn("publish task to redis failed, fallback to direct schedule",
-					slog.Uint64("task_id", uint64(task.ID)),
-					slog.String("error", err.Error()))
-				// 降级：如果 Redis 失败，使用原有方式
-				s.taskScheduler.StartTask(context.Background(), &task)
-			} else {
-				s.logger.Info("task submitted to redis queue",
-					slog.Uint64("task_id", uint64(task.ID)))
-			}
-		} else {
-			// 旧模式：直接启动调度器
-			s.taskScheduler.StartTask(context.Background(), &task)
-		}
+		s.taskScheduler.StartTask(context.Background(), &task)
 	}
 
 	c.JSON(http.StatusCreated, createTaskResponse{ID: task.ID})

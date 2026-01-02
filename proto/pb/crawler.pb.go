@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.21.12
-// source: crawler.proto
+// source: proto/crawler.proto
 
 package pb
 
@@ -55,11 +55,11 @@ func (x Platform) String() string {
 }
 
 func (Platform) Descriptor() protoreflect.EnumDescriptor {
-	return file_crawler_proto_enumTypes[0].Descriptor()
+	return file_proto_crawler_proto_enumTypes[0].Descriptor()
 }
 
 func (Platform) Type() protoreflect.EnumType {
-	return &file_crawler_proto_enumTypes[0]
+	return &file_proto_crawler_proto_enumTypes[0]
 }
 
 func (x Platform) Number() protoreflect.EnumNumber {
@@ -68,7 +68,7 @@ func (x Platform) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Platform.Descriptor instead.
 func (Platform) EnumDescriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{0}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{0}
 }
 
 // 排序字段。
@@ -108,11 +108,11 @@ func (x SortBy) String() string {
 }
 
 func (SortBy) Descriptor() protoreflect.EnumDescriptor {
-	return file_crawler_proto_enumTypes[1].Descriptor()
+	return file_proto_crawler_proto_enumTypes[1].Descriptor()
 }
 
 func (SortBy) Type() protoreflect.EnumType {
-	return &file_crawler_proto_enumTypes[1]
+	return &file_proto_crawler_proto_enumTypes[1]
 }
 
 func (x SortBy) Number() protoreflect.EnumNumber {
@@ -121,7 +121,7 @@ func (x SortBy) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SortBy.Descriptor instead.
 func (SortBy) EnumDescriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{1}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{1}
 }
 
 // 排序方向。
@@ -155,11 +155,11 @@ func (x SortOrder) String() string {
 }
 
 func (SortOrder) Descriptor() protoreflect.EnumDescriptor {
-	return file_crawler_proto_enumTypes[2].Descriptor()
+	return file_proto_crawler_proto_enumTypes[2].Descriptor()
 }
 
 func (SortOrder) Type() protoreflect.EnumType {
-	return &file_crawler_proto_enumTypes[2]
+	return &file_proto_crawler_proto_enumTypes[2]
 }
 
 func (x SortOrder) Number() protoreflect.EnumNumber {
@@ -168,7 +168,7 @@ func (x SortOrder) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SortOrder.Descriptor instead.
 func (SortOrder) EnumDescriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{2}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{2}
 }
 
 // 爬虫请求参数。
@@ -193,7 +193,7 @@ type FetchRequest struct {
 
 func (x *FetchRequest) Reset() {
 	*x = FetchRequest{}
-	mi := &file_crawler_proto_msgTypes[0]
+	mi := &file_proto_crawler_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -205,7 +205,7 @@ func (x *FetchRequest) String() string {
 func (*FetchRequest) ProtoMessage() {}
 
 func (x *FetchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_crawler_proto_msgTypes[0]
+	mi := &file_proto_crawler_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -218,7 +218,7 @@ func (x *FetchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchRequest.ProtoReflect.Descriptor instead.
 func (*FetchRequest) Descriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{0}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *FetchRequest) GetTaskId() string {
@@ -310,7 +310,7 @@ type Item struct {
 
 func (x *Item) Reset() {
 	*x = Item{}
-	mi := &file_crawler_proto_msgTypes[1]
+	mi := &file_proto_crawler_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -322,7 +322,7 @@ func (x *Item) String() string {
 func (*Item) ProtoMessage() {}
 
 func (x *Item) ProtoReflect() protoreflect.Message {
-	mi := &file_crawler_proto_msgTypes[1]
+	mi := &file_proto_crawler_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -335,7 +335,7 @@ func (x *Item) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Item.ProtoReflect.Descriptor instead.
 func (*Item) Descriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{1}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Item) GetSourceId() string {
@@ -400,13 +400,14 @@ type FetchResponse struct {
 	Items         []*Item                `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
 	TotalFound    int32                  `protobuf:"varint,2,opt,name=total_found,json=totalFound,proto3" json:"total_found,omitempty"`
 	ErrorMessage  string                 `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	TaskId        string                 `protobuf:"bytes,4,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FetchResponse) Reset() {
 	*x = FetchResponse{}
-	mi := &file_crawler_proto_msgTypes[2]
+	mi := &file_proto_crawler_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -418,7 +419,7 @@ func (x *FetchResponse) String() string {
 func (*FetchResponse) ProtoMessage() {}
 
 func (x *FetchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_crawler_proto_msgTypes[2]
+	mi := &file_proto_crawler_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -431,7 +432,7 @@ func (x *FetchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchResponse.ProtoReflect.Descriptor instead.
 func (*FetchResponse) Descriptor() ([]byte, []int) {
-	return file_crawler_proto_rawDescGZIP(), []int{2}
+	return file_proto_crawler_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *FetchResponse) GetItems() []*Item {
@@ -455,11 +456,18 @@ func (x *FetchResponse) GetErrorMessage() string {
 	return ""
 }
 
-var File_crawler_proto protoreflect.FileDescriptor
+func (x *FetchResponse) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
+}
 
-const file_crawler_proto_rawDesc = "" +
+var File_proto_crawler_proto protoreflect.FileDescriptor
+
+const file_proto_crawler_proto_rawDesc = "" +
 	"\n" +
-	"\rcrawler.proto\x12\acrawler\"\xdc\x02\n" +
+	"\x13proto/crawler.proto\x12\acrawler\"\xdc\x02\n" +
 	"\fFetchRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12-\n" +
 	"\bplatform\x18\x02 \x01(\x0e2\x11.crawler.PlatformR\bplatform\x12\x18\n" +
@@ -481,12 +489,13 @@ const file_crawler_proto_rawDesc = "" +
 	"\bitem_url\x18\x05 \x01(\tR\aitemUrl\x12-\n" +
 	"\bplatform\x18\x06 \x01(\x0e2\x11.crawler.PlatformR\bplatform\x12\x16\n" +
 	"\x06status\x18\a \x01(\tR\x06status\x12\x1a\n" +
-	"\bcurrency\x18\b \x01(\tR\bcurrency\"z\n" +
+	"\bcurrency\x18\b \x01(\tR\bcurrency\"\x93\x01\n" +
 	"\rFetchResponse\x12#\n" +
 	"\x05items\x18\x01 \x03(\v2\r.crawler.ItemR\x05items\x12\x1f\n" +
 	"\vtotal_found\x18\x02 \x01(\x05R\n" +
 	"totalFound\x12#\n" +
-	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage*V\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\x12\x17\n" +
+	"\atask_id\x18\x04 \x01(\tR\x06taskId*V\n" +
 	"\bPlatform\x12\x18\n" +
 	"\x14PLATFORM_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10PLATFORM_MERCARI\x10\x01\x12\x1a\n" +
@@ -498,26 +507,23 @@ const file_crawler_proto_rawDesc = "" +
 	"\x11SORT_BY_NUM_LIKES\x10\x03*4\n" +
 	"\tSortOrder\x12\x13\n" +
 	"\x0fSORT_ORDER_DESC\x10\x00\x12\x12\n" +
-	"\x0eSORT_ORDER_ASC\x10\x012O\n" +
-	"\x0eCrawlerService\x12=\n" +
-	"\n" +
-	"FetchItems\x12\x15.crawler.FetchRequest\x1a\x16.crawler.FetchResponse\"\x00B\x06Z\x04./pbb\x06proto3"
+	"\x0eSORT_ORDER_ASC\x10\x01B\x06Z\x04./pbb\x06proto3"
 
 var (
-	file_crawler_proto_rawDescOnce sync.Once
-	file_crawler_proto_rawDescData []byte
+	file_proto_crawler_proto_rawDescOnce sync.Once
+	file_proto_crawler_proto_rawDescData []byte
 )
 
-func file_crawler_proto_rawDescGZIP() []byte {
-	file_crawler_proto_rawDescOnce.Do(func() {
-		file_crawler_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_crawler_proto_rawDesc), len(file_crawler_proto_rawDesc)))
+func file_proto_crawler_proto_rawDescGZIP() []byte {
+	file_proto_crawler_proto_rawDescOnce.Do(func() {
+		file_proto_crawler_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_crawler_proto_rawDesc), len(file_proto_crawler_proto_rawDesc)))
 	})
-	return file_crawler_proto_rawDescData
+	return file_proto_crawler_proto_rawDescData
 }
 
-var file_crawler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_crawler_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
-var file_crawler_proto_goTypes = []any{
+var file_proto_crawler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_proto_crawler_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_proto_crawler_proto_goTypes = []any{
 	(Platform)(0),         // 0: crawler.Platform
 	(SortBy)(0),           // 1: crawler.SortBy
 	(SortOrder)(0),        // 2: crawler.SortOrder
@@ -525,42 +531,40 @@ var file_crawler_proto_goTypes = []any{
 	(*Item)(nil),          // 4: crawler.Item
 	(*FetchResponse)(nil), // 5: crawler.FetchResponse
 }
-var file_crawler_proto_depIdxs = []int32{
+var file_proto_crawler_proto_depIdxs = []int32{
 	0, // 0: crawler.FetchRequest.platform:type_name -> crawler.Platform
 	1, // 1: crawler.FetchRequest.sort:type_name -> crawler.SortBy
 	2, // 2: crawler.FetchRequest.order:type_name -> crawler.SortOrder
 	0, // 3: crawler.Item.platform:type_name -> crawler.Platform
 	4, // 4: crawler.FetchResponse.items:type_name -> crawler.Item
-	3, // 5: crawler.CrawlerService.FetchItems:input_type -> crawler.FetchRequest
-	5, // 6: crawler.CrawlerService.FetchItems:output_type -> crawler.FetchResponse
-	6, // [6:7] is the sub-list for method output_type
-	5, // [5:6] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
 	5, // [5:5] is the sub-list for extension type_name
 	5, // [5:5] is the sub-list for extension extendee
 	0, // [0:5] is the sub-list for field type_name
 }
 
-func init() { file_crawler_proto_init() }
-func file_crawler_proto_init() {
-	if File_crawler_proto != nil {
+func init() { file_proto_crawler_proto_init() }
+func file_proto_crawler_proto_init() {
+	if File_proto_crawler_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_crawler_proto_rawDesc), len(file_crawler_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_crawler_proto_rawDesc), len(file_proto_crawler_proto_rawDesc)),
 			NumEnums:      3,
 			NumMessages:   3,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   0,
 		},
-		GoTypes:           file_crawler_proto_goTypes,
-		DependencyIndexes: file_crawler_proto_depIdxs,
-		EnumInfos:         file_crawler_proto_enumTypes,
-		MessageInfos:      file_crawler_proto_msgTypes,
+		GoTypes:           file_proto_crawler_proto_goTypes,
+		DependencyIndexes: file_proto_crawler_proto_depIdxs,
+		EnumInfos:         file_proto_crawler_proto_enumTypes,
+		MessageInfos:      file_proto_crawler_proto_msgTypes,
 	}.Build()
-	File_crawler_proto = out.File
-	file_crawler_proto_goTypes = nil
-	file_crawler_proto_depIdxs = nil
+	File_proto_crawler_proto = out.File
+	file_proto_crawler_proto_goTypes = nil
+	file_proto_crawler_proto_depIdxs = nil
 }

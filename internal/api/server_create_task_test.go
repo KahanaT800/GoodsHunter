@@ -34,16 +34,6 @@ func (m *mockTaskStore) CreateTask(ctx context.Context, task *model.Task) error 
 	return m.createTaskFunc(ctx, task)
 }
 
-type mockPublisher struct {
-	submitFunc func(ctx context.Context, taskID uint, source string) error
-	calls      int
-}
-
-func (m *mockPublisher) SubmitTask(ctx context.Context, taskID uint, source string) error {
-	m.calls++
-	return m.submitFunc(ctx, taskID, source)
-}
-
 type mockScheduler struct {
 	startCalls int
 }
@@ -72,7 +62,7 @@ func (m *mockDeduper) Delete(ctx context.Context, url string) error {
 
 func TestCreateTask_Normal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	metrics.InitMetrics(false, 1)
+	metrics.InitMetrics(1)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	store := &mockTaskStore{
@@ -82,15 +72,13 @@ func TestCreateTask_Normal(t *testing.T) {
 			return nil
 		},
 	}
-	pub := &mockPublisher{submitFunc: func(ctx context.Context, taskID uint, source string) error { return nil }}
 	sched := &mockScheduler{}
 	deduper := &mockDeduper{dupFunc: func(ctx context.Context, url string) (bool, error) { return false, nil }}
 
 	s := &Server{
-		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3, EnableRedisQueue: true}},
+		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3}},
 		logger:        logger,
 		taskStore:     store,
-		taskPublisher: pub,
 		taskScheduler: sched,
 		deduper:       deduper,
 	}
@@ -123,29 +111,27 @@ func TestCreateTask_Normal(t *testing.T) {
 	if store.createCalls != 1 {
 		t.Fatalf("expected create task to be called")
 	}
-	if pub.calls != 1 {
-		t.Fatalf("expected publish to be called")
+	if sched.startCalls != 1 {
+		t.Fatalf("expected scheduler to be called")
 	}
 }
 
 func TestCreateTask_Deduplicated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	metrics.InitMetrics(false, 1)
+	metrics.InitMetrics(1)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	store := &mockTaskStore{
 		countTasksFunc: func(ctx context.Context, userID int) (int64, error) { return 0, nil },
 		createTaskFunc: func(ctx context.Context, task *model.Task) error { return nil },
 	}
-	pub := &mockPublisher{submitFunc: func(ctx context.Context, taskID uint, source string) error { return nil }}
 	sched := &mockScheduler{}
 	deduper := &mockDeduper{dupFunc: func(ctx context.Context, url string) (bool, error) { return true, nil }}
 
 	s := &Server{
-		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3, EnableRedisQueue: true}},
+		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3}},
 		logger:        logger,
 		taskStore:     store,
-		taskPublisher: pub,
 		taskScheduler: sched,
 		deduper:       deduper,
 	}
@@ -173,8 +159,8 @@ func TestCreateTask_Deduplicated(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if store.createCalls != 0 || pub.calls != 0 {
-		t.Fatalf("expected no create/publish on dedup")
+	if store.createCalls != 0 || sched.startCalls != 0 {
+		t.Fatalf("expected no create/schedule on dedup")
 	}
 	if !bytes.Contains(w.Body.Bytes(), []byte("skipped_duplicate")) {
 		t.Fatalf("expected skipped_duplicate in response body")
@@ -183,22 +169,20 @@ func TestCreateTask_Deduplicated(t *testing.T) {
 
 func TestCreateTask_InvalidBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	metrics.InitMetrics(false, 1)
+	metrics.InitMetrics(1)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	store := &mockTaskStore{
 		countTasksFunc: func(ctx context.Context, userID int) (int64, error) { return 0, nil },
 		createTaskFunc: func(ctx context.Context, task *model.Task) error { return nil },
 	}
-	pub := &mockPublisher{submitFunc: func(ctx context.Context, taskID uint, source string) error { return nil }}
 	sched := &mockScheduler{}
 	deduper := &mockDeduper{dupFunc: func(ctx context.Context, url string) (bool, error) { return false, nil }}
 
 	s := &Server{
-		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3, EnableRedisQueue: true}},
+		cfg:           &config.Config{App: config.AppConfig{MaxTasksPerUser: 3}},
 		logger:        logger,
 		taskStore:     store,
-		taskPublisher: pub,
 		taskScheduler: sched,
 		deduper:       deduper,
 	}

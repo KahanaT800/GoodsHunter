@@ -4,12 +4,6 @@ package crawler;
 
 option go_package = "./pb";
 
-// 支持多平台的爬虫服务接口。
-service CrawlerService {
-  // 进行商品抓取。
-  rpc FetchItems(FetchRequest) returns (FetchResponse) {}
-}
-
 // 平台枚举。
 enum Platform {
   PLATFORM_UNSPECIFIED = 0;
@@ -70,4 +64,5 @@ message FetchResponse {
   repeated Item items = 1;
   int32 total_found = 2;
   string error_message = 3;
+  string task_id = 4;
 }

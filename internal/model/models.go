@@ -23,13 +23,22 @@ type Task struct {
 	SortBy    int `gorm:"not null"`  // 排序方式 (对应 Proto SortBy 枚举的整型值)
 	SortOrder int `gorm:"default:0"` // 排序方向 (0: Desc, 1: Asc, 对应 Proto SortOrder)
 
-	Status        string     `gorm:"default:running"` // 任务状态: "running" (运行中) / "stopped" (已停止)
+	Type          TaskType   `gorm:"column:task_type;type:varchar(20);default:monitor"` // 任务类型: monitor / oneshot
+	Status        string     `gorm:"default:running"`                                   // 任务状态: "running" (运行中) / "stopped" (已停止)
 	LastRunAt     *time.Time // 上次执行抓取的时间
 	NotifyEnabled bool       `gorm:"default:true"` // 是否开启通知（新品/降价）
 	BaselineAt    *time.Time // 基准数据建立时间（首次抓取完成）
 
 	Items []Item `gorm:"many2many:task_items"` // 关联的商品列表
 }
+
+// TaskType 定义任务执行类型。
+type TaskType string
+
+const (
+	TaskTypeMonitor TaskType = "monitor"
+	TaskTypeOneShot TaskType = "oneshot"
+)
 
 // Item 表示从电商平台抓取到的商品信息。
 //

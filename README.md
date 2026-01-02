@@ -9,98 +9,123 @@
 [![Live Demo](https://img.shields.io/badge/Demo-Online-success)](https://goods-hunter.com)
 
 > **面向生产环境的分布式爬虫系统，聚焦高可靠与可观测**
-
-**在线演示**: [https://goods-hunter.com](https://goods-hunter.com)
-
-## 应用预览
-
-**访客界面**
-![GoodsHunter 访客界面](image/guestpage.png)
-
-**系统监控仪表盘**
-![系统监控仪表盘](image/grafana_sys.png)
-
-**业务监控仪表盘**
-![业务监控仪表盘](image/grafana_crawler.png)
-
 ---
 
 ## 项目概述
 
-GoodsHunter 是一个**高性能网络爬虫**系统，专为监控电商平台（如 Mercari）中符合用户搜索条件的新商品而设计。当前版本已升级为可分布式部署的高可靠架构：
+GoodsHunter 是一个**高性能分布式网络爬虫**系统，专为监控电商平台（如 Mercari）中符合用户搜索条件的新商品而设计。系统采用**纯异步的 Producer-Consumer 架构**，实现了 API 与爬虫节点的完全解耦，支持弹性伸缩与故障自愈。
 
-- **Redis Streams 消费模型**：生产者-消费者模式，支持阻塞消费与背压
+- **Redis List 队列模型**：基于 `LPUSH`/`BRPOP` 的高效任务分发与结果回传
+- **弹性伸缩**：支持一键水平扩展 Worker 节点，线性提升抓取能力
+- **故障自愈**：基于任务计数的容器自动重启策略，彻底解决内存泄漏与僵死问题
 - **分布式限流**：Redis Lua 原子令牌桶，多实例共享配额
-- **全局去重**：API 入口侧 URL 去重，减少无效任务入库
-- **可靠性机制**：ACK、重试、死信队列（DLQ）
-- **批量调度**：DB 轮询采用 Cursor 分页 + 批量限制，避免阻塞
-- **可观测性**：Prometheus + Grafana 监控关键指标
+- **可观测性**：Prometheus + Grafana 实时监控队列积压、吞吐量与健康度
+
+## 应用预览
+
+**Web服务**: [https://goods-hunter.com](https://goods-hunter.com)
+
+**访客界面**
+![GoodsHunter 访客界面](image/guestpage.png)
+
+**[系统监控仪表盘](https://lycmuna.grafana.net/goto/ff9tttyk3c6psf?orgId=1)**
+
+![系统监控仪表盘](image/grafana_sys.png)
+
+**[业务监控仪表盘](https://lycmuna.grafana.net/goto/ff9ttron77j7ka?orgId=1)**
+
+![业务监控仪表盘](image/grafana_crawler.png)
 
 ---
 
 ## 系统架构
 
+GoodsHunter 为基于 **Redis List** 的分布式爬虫系统，采用 **Producer-Consumer** 模型以支持水平扩展与高吞吐量。
+
 ```mermaid
 graph TB
     User[用户] -->|HTTPS| Nginx[Nginx + SSL]
-    Nginx -->|API| API[API 服务<br/>Ingress Dedup]
-    API -->|写入| MySQL[(MySQL)]
-    API -->|发布任务| Stream[(Redis Streams)]
-    Stream -->|消费| Scheduler[Scheduler<br/>Batch Pull]
-    Scheduler -->|阻塞入队| Worker[Worker Pool]
-    Worker -->|限流| Limiter[Rate Limiter<br/>Redis Lua]
-    Worker -->|gRPC| Crawler[爬虫服务]
-    Crawler -->|抓取| Target[目标网站]
-    Crawler -->|落库| MySQL
-    API -->|指标| Prom[Prometheus]
-    Crawler -->|指标| Prom
+    Nginx -->|API| API[API 服务]
+    
+    subgraph Scheduler [调度器 (API)]
+        API -->|1. 定期扫描| DB[(MySQL)]
+        API -->|2. LPUSH| TaskQueue[(Redis List<br/>goodshunter:queue:tasks)]
+    end
+    
+    subgraph WorkerScale [水平扩展 Worker]
+        Crawler1[Crawler 节点 1]
+        Crawler2[Crawler 节点 2]
+        Crawler3[Crawler 节点 ...]
+    end
+    
+    TaskQueue -->|3. BRPOP (Blocking)| WorkerScale
+    WorkerScale -->|4. Execute| Target[目标网站]
+    WorkerScale -->|5. LPUSH| ResultQueue[(Redis List<br/>goodshunter:queue:results)]
+    
+    subgraph Processor [结果处理 (API)]
+        ResultQueue -->|6. BRPOP| API
+        API -->|7. Update| DB
+    end
+
+    WorkerScale -->|Metrics| Prom[Prometheus]
+    API -->|Metrics| Prom
     Prom -->|可视化| Grafana[Grafana]
 ```
 
+### 架构特性
+*   **完全解耦 (Decoupling)**:
+API 不再感知 Crawler 的存在，仅通过 Redis 交换数据。移除了 gRPC 通信，降低了网络拓扑复杂度与攻击面。
+*   **水平扩展 (Horizontal Scaling)**:
+Crawler 节点无状态。可以通过 docker-compose scale crawler=N 轻松启动 N 个实例并行抓取，吞吐量线性增长。
+*   **自愈能力 (Self-Healing)**:
+引入 MAX_TASKS 策略。Crawler 在处理完指定数量的任务后自动优雅退出，依赖 Docker 的 restart: always 机制重启。这彻底解决了 Headless Chrome 长期运行导致的内存泄漏和僵尸进程问题。
+*   **双向队列 (Two-Way Queues)**:
+    *   **Task Queue**: `goodshunter:queue:tasks`
+    *   **Result Queue**: `goodshunter:queue:results`
+*   **Producer-Consumer 模型**:
+    *   **Producer**: API Server 中的 Scheduler 定期扫描数据库，将待抓取任务推入 Redis。
+    *   **Consumer**: 多个 Crawler 实例通过阻塞读取 (`BRPOP`) 抢占任务，实现负载均衡。
+
 ### 核心组件
 
-| 服务 | 技术栈 | 职责 |
-|---------|-----------|----------------|
-| **API 服务器** | Go + Gin | 任务创建、入口去重、API 网关 |
-| **Scheduler** | Go | Redis Streams 消费、ACK/Retry/DLQ、批量拉取 |
-| **爬虫服务** | Go + Rod | 无头浏览器自动化、HTML 解析 |
-| **限流器** | Redis Lua | 全局令牌桶，跨实例协调 |
-| **数据库** | MySQL 8.0 | 用户、任务和商品持久化 |
-| **缓存/队列** | Redis 7 | 去重状态、Streams 队列、限流协作 |
-| **网关** | Nginx + Let's Encrypt | HTTPS 终端、静态文件服务、反向代理 |
+| 服务 | 技术栈 | 职责 | 关键配置 |
+|---------|---|---|---|
+| **API / Scheduler** | Go + Gin | 生产任务、消费结果、API 网关 | `APP_SCHEDULE_INTERVAL` |
+| **Crawler / Worker** | Go + Rod | 消费任务、执行抓取、回传结果 | `MAX_TASKS`, `BROWSER_MAX_CONCURRENCY` |
+| **Redis** | Redis | 任务与结果的双向队列 buf | `REDIS_ADDR` |
+| **MySQL** | MySQL | 持久化存储 (用户、任务、商品) | `DB_HOST` |
+| **Prometheus/Grafana** | Prom/Grafana | 队列深度(积压)、QPS、容器健康度监控 | - |
 
 ---
 
 ## 核心特性
 
-### 可靠的任务调度
-- Redis Streams 生产者-消费者模型
-- ACK 仅在 Worker 成功处理后执行
-- Pending 回收与 Auto-Claim，防止任务丢失
-- 失败重试与 DLQ，拒绝静默失败
+### 高效任务调度
+- 异步优先：所有抓取请求通过 Redis 缓冲，API 响应毫秒级
+
+- 智能重试：支持 ACK 机制（逻辑层），失败任务自动重回队列或进入死信
+
+- 持续监控：任务执行后自动恢复 Active 状态，确保持续周期性监控
 
 ### 分布式限流
-- Redis Lua 原子令牌桶，跨实例共享配额
-- 阻塞等待 + 微小抖动，避免惊群效应
-- `APP_RATE_LIMIT` / `APP_RATE_BURST` 可配置
+- 全局限流：Redis Lua 令牌桶，防止触发目标网站反爬
+- 前置去重：入队前进行 URL Hash 校验，避免无效任务消耗 Worker 资源
 
-### 全局去重
-- API 入口侧 URL Hash 去重
-- 重复任务在入库与入队前被拦截
-- 降低无效爬取与资源浪费
+### 稳健的爬虫节点
+- 自杀式重启：主动释放资源的生命周期管理，保持环境纯净
 
-### 批量调度与背压
-- DB 轮询使用 Cursor 分页，默认批量 `APP_QUEUE_BATCH_SIZE=100`
-- Worker Pool 阻塞入队，避免“满即丢”
+- 智能代理切换：优先直连，失败自动熔断切换代理，并具备冷却机制
+
+- 优雅停机：接收信号后停止拉取新任务，但保证在途任务执行完毕
 
 ---
 
 ## 技术栈
 
 ### 后端
-- **语言**: Go 1.24
+- **语言**: Go
 - **Web 框架**: Gin
-- **RPC**: gRPC + Protocol Buffers
+- **序列化**: Protocol Buffers
 - **ORM**: GORM
 - **浏览器自动化**: Rod
 
@@ -112,7 +137,7 @@ graph TB
 
 ### 数据与队列
 - **MySQL**: 持久化存储
-- **Redis**: 去重、Streams 队列、限流协作
+- **Redis**: 去重、任务队列、限流协作
 
 ### 可观测性
 - **Prometheus**: 指标采集
@@ -124,29 +149,22 @@ graph TB
 
 ### 指标端点
 - **API**: `http://<host>:8080/metrics`
-- **Crawler**: `http://<host>:2112/metrics`（可通过 `CRAWLER_METRICS_ADDR` 覆盖）
+- **Crawler**: `http://<host>:2112/metrics`
 
-### 核心指标（Grafana）
-- `goodshunter_ratelimit_wait_duration_seconds`：限流等待耗时
-- `goodshunter_task_dlq_total`：进入死信队列的任务数
-- `goodshunter_task_duplicate_prevented_total`：入口去重拦截数
+### 核心关注 (Grafana)
+- **Queue Depth (队列积压)**:
+    - 关键指标: `crawler_queue_depth{queue_name="tasks"}`
+    - 含义: Redis List 中等待被消费的任务数。如果持续升高，说明需要扩容 Crawler。
+- **Throughput (吞吐量)**: 
+    - 关键指标: `crawler_task_throughput`
+    - 含义: 全局每分钟处理的任务数。
+- **Crawler Health**:
+    - 关键指标: `goodshunter_worker_pool_active`
+    - 含义: 当前活跃工作的浏览器实例总数。
 
 ### Grafana Cloud（可选）
 ```bash
 docker compose --profile monitoring-cloud up -d alloy
-```
-
----
-
-## Redis Streams 模式（可选）
-
-默认使用数据库轮询调度任务；启用 Redis Streams 后，任务通过队列分发，实现更低延迟与多实例水平扩展。
-
-启用方式（`.env`）：
-```bash
-APP_ENABLE_REDIS_QUEUE=true
-APP_TASK_QUEUE_STREAM=goodshunter:task:queue
-APP_TASK_QUEUE_GROUP=scheduler_group
 ```
 
 ---
@@ -175,7 +193,13 @@ cp .env.example .env
 
 ### 3. 启动服务
 ```bash
-docker compose up -d
+docker compose up -d --build
+```
+
+**加速抓取 (水平扩展)**:
+启动 3 个爬虫节点以加速任务处理：
+```bash
+docker compose up -d --scale crawler=3
 ```
 
 ### 4. 访问应用
@@ -190,13 +214,12 @@ docker compose up -d
 
 以下配置直接影响系统吞吐与稳定性（详见 `.env.example`）：
 
-- `APP_SCHEDULE_INTERVAL`：轮询调度间隔
-- `APP_WORKER_POOL_SIZE`：Worker Pool 并发数
+- `APP_SCHEDULE_INTERVAL`：API 扫描数据库生成任务的间隔
+- `MAX_TASKS`：**Self-Healing**: 单个 Crawler 实例处理多少任务后重启 (防止内存泄漏)
+- `REDIS_ADDR`：Redis 连接地址，用于任务队列与结果回传
 - `APP_QUEUE_CAPACITY`：内存队列容量
-- `APP_QUEUE_BATCH_SIZE`：批量拉取大小
 - `APP_RATE_LIMIT` / `APP_RATE_BURST`：全局限流速率与桶容量
-- `APP_DEDUP_WINDOW`：URL 去重窗口（秒）
-- `APP_ENABLE_REDIS_QUEUE`：是否启用 Streams 模式
+- `BROWSER_MAX_CONCURRENCY`: 单个 Crawler 实例的并发页面数
 
 ---
 
@@ -234,7 +257,7 @@ GoodsHunter/
 │       ├── dedup/           # 全局去重组件
 │       ├── ratelimit/       # 分布式限流器
 │       ├── metrics/         # Prometheus 指标
-│       └── taskqueue/       # Redis Streams 消费封装
+│       └── redisqueue/      # Redis List 队列封装
 ├── build/
 │   ├── api/Dockerfile
 │   └── crawler/Dockerfile
@@ -280,11 +303,6 @@ GET /healthz
 
 ## 生产环境部署
 
-### 架构亮点
-- GitHub Actions 构建镜像并推送至 GHCR
-- EC2 拉取镜像并更新容器
-- Docker 健康检查保障进程可用性
-
 ### 部署流程
 ```mermaid
 sequenceDiagram
@@ -303,37 +321,12 @@ sequenceDiagram
 
 ---
 
-## 开发指南
-
-### 运行测试
-```bash
-go test ./...
-```
-
-### 代码检查
-```bash
-golangci-lint run
-```
-
-### 查看日志
-```bash
-docker logs goodshunter-api-1 -f
-docker logs goodshunter-crawler-1 -f
-```
-
-### 停止服务
-```bash
-docker compose down
-```
-
----
-
 ## 技术决策与权衡
 
 | 决策 | 原因 |
 |----------|-----------|
 | **Go** | 高性能并发模型，适合 IO 密集型爬虫 |
-| **Redis Streams** | 低延迟、消费者组与可靠 ACK |
+| **Redis List** | 简单高效的队列原语，支持原子操作 |
 | **Redis Lua** | 原子限流，多实例一致 |
 | **MySQL** | 事务一致性与成熟生态 |
 | **Gin** | 性能好，生态成熟 |

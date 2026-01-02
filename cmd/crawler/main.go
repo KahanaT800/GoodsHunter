@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,10 +13,9 @@ import (
 	"goodshunter/internal/config"
 	crawler "goodshunter/internal/crawler"
 	"goodshunter/internal/pkg/logger"
-	"goodshunter/proto/pb"
+	"goodshunter/internal/pkg/redisqueue"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
 )
 
 // main 是爬虫服务的入口函数。
@@ -26,7 +24,7 @@ import (
 // 1. 加载配置
 // 2. 初始化日志记录器
 // 3. 启动爬虫服务实例
-// 4. 启动 gRPC 服务器并监听端口
+// 4. 启动 Redis Worker 与 Metrics 服务
 // 5. 优雅关闭
 func main() {
 	cfg, err := config.Load()
@@ -45,31 +43,29 @@ func main() {
 			slog.Float64("throughput_capacity", maxConcurrent))
 	}
 
-	service, err := crawler.NewService(ctx, cfg, appLogger)
+	redisQueue := redisqueue.NewClient(cfg.Redis.Addr, cfg.Redis.Password)
+	service, err := crawler.NewService(ctx, cfg, appLogger, redisQueue)
 	if err != nil {
 		appLogger.Error("init crawler service failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	addr := ":50051"
-	if v := os.Getenv("CRAWLER_GRPC_ADDR"); v != "" {
-		addr = v
-	}
-
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		appLogger.Error("listen failed", slog.String("addr", addr), slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	server := grpc.NewServer()
-	pb.RegisterCrawlerServiceServer(server, service)
-
-	// 启动 gRPC 服务器（非阻塞）
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	go func() {
-		appLogger.Info("crawler gRPC server started", slog.String("addr", addr))
-		if err := server.Serve(lis); err != nil {
-			appLogger.Error("server stopped with error", slog.String("error", err.Error()))
+		// 添加保险丝
+		defer func() {
+			if r := recover(); r != nil {
+				appLogger.Error("PANIC in redis worker loop", slog.Any("panic", r))
+				// 注意：这里 Panic 后循环就结束了，Worker 实际上停止了。
+				// 在生产环境中，你可能希望它能自动重启，或者让主进程退出触发 Docker 重启。
+				// 记录日志后，通知主进程退出，让 Docker 负责重启，保持状态干净。
+				os.Exit(1)
+			}
+		}()
+
+		appLogger.Info("starting redis worker loop")
+		if err := service.StartWorker(workerCtx); err != nil && err != context.Canceled {
+			appLogger.Error("redis worker loop stopped", slog.String("error", err.Error()))
 		}
 	}()
 
@@ -102,9 +98,8 @@ func main() {
 	appLogger.Info("shutting down crawler service...")
 
 	// 优雅关闭
-	// 1. 停止接收新请求
-	server.GracefulStop()
-	appLogger.Info("gRPC server stopped")
+	// 1. 停止拉取新任务
+	stopWorkers()
 
 	// 2. 关闭 worker pool（等待所有任务完成）
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

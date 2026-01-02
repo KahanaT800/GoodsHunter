@@ -18,6 +18,7 @@ import (
 	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/queue"
 	"goodshunter/internal/pkg/ratelimit"
+	"goodshunter/internal/pkg/redisqueue"
 	"goodshunter/proto/pb"
 
 	"github.com/go-rod/rod"
@@ -32,11 +33,10 @@ var (
 	priceWithCurrencyRe = regexp.MustCompile(`[¥￥]\s*([0-9][0-9,]*)`)
 )
 
-// Service 实现爬虫 gRPC 服务，负责浏览器调度与页面解析。
+// Service 负责浏览器调度与页面解析。
 //
 // 它维护了一个 rod.Browser 实例，并使用 worker pool 控制并发抓取数量。
 type Service struct {
-	pb.UnimplementedCrawlerServiceServer
 	browser        *rod.Browser
 	queue          *queue.Queue // Worker Pool 用于控制并发
 	rdb            *redis.Client
@@ -53,6 +53,7 @@ type Service struct {
 	taskCounter    atomic.Uint64
 	maxTasks       uint64
 	restartCh      chan struct{}
+	redisQueue     *redisqueue.Client
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -67,7 +68,7 @@ type Service struct {
 //
 //	*Service: 初始化完成的服务实例
 //	error: 如果浏览器启动失败则返回错误
-func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Service, error) {
+func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, redisQueue *redisqueue.Client) (*Service, error) {
 	browser, err := startBrowser(cfg, logger, false)
 	if err != nil {
 		return nil, err
@@ -127,13 +128,14 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		rateLimiter:    limiter,
 		logger:         logger,
 		defaultUA:      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-		pageTimeout:    30 * time.Second,
+		pageTimeout:    60 * time.Second,
 		maxFetchCount:  cfg.Browser.MaxFetchCount,
 		cfg:            cfg,
 		currentIsProxy: false,
 		forceProxyOnce: forceProxyOnce,
 		maxTasks:       maxTasks,
 		restartCh:      make(chan struct{}, 1),
+		redisQueue:     redisQueue,
 	}
 	metrics.CrawlerProxyMode.Set(0)
 	return service, nil
@@ -142,6 +144,81 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 // RestartSignal exposes the restart notification channel.
 func (s *Service) RestartSignal() <-chan struct{} {
 	return s.restartCh
+}
+
+// StartWorker runs a Redis task consumption loop until ctx is canceled.
+func (s *Service) StartWorker(ctx context.Context) error {
+	if s.redisQueue == nil {
+		return errors.New("redis queue client is not initialized")
+	}
+
+	concurrencyLimit := s.queue.Cap() + 10       // 并发任务数设置略高于 Worker Pool 容量
+	sem := make(chan struct{}, concurrencyLimit) // 信号量通道
+	s.logger.Info("crawler worker started", slog.Int("concurrency_limit", concurrencyLimit))
+
+	for {
+		// 1. 在拉取任务前先申请令牌，如果处理不过来，就暂停拉取 Redis
+		select {
+		// 获取令牌
+		case sem <- struct{}{}:
+			// 成功获取令牌，继续
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// 2. 拉取任务
+		task, err := s.redisQueue.PopTask(ctx, 2*time.Second)
+		if err != nil {
+			<-sem // 拉取失败, 释放令牌
+			if errors.Is(err, redisqueue.ErrNoTask) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.logger.Info("worker loop stopped")
+				return err
+			}
+			s.logger.Error("pop redis task failed", slog.String("error", err.Error()))
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		// 3. 处理任务（在独立 goroutine 中）
+		go func(t *pb.FetchRequest) {
+			defer func() {
+				<-sem // 任务处理完成，释放令牌
+			}()
+
+			// 为每个任务设置独立的上下文
+			taskCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+
+			// FetchItems 内部会通过 worker pool 进一步控制浏览器并发
+			resp, err := s.FetchItems(taskCtx, t)
+			if err != nil {
+				s.logger.Warn("crawl task failed",
+					slog.String("task_id", t.GetTaskId()),
+					slog.String("error", err.Error()))
+				// 即使失败也构造一个包含 TaskId 的响应以便追踪
+				if resp == nil {
+					resp = &pb.FetchResponse{ErrorMessage: err.Error(), TaskId: t.GetTaskId()}
+				}
+			}
+			// 推送结果到 Redis
+			if resp != nil {
+				if resp.TaskId == "" {
+					resp.TaskId = t.GetTaskId()
+				}
+				// 异步回传结果
+				pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer pushCancel()
+
+				if pushErr := s.redisQueue.PushResult(pushCtx, resp); pushErr != nil {
+					s.logger.Error("push redis result failed", slog.String("error", pushErr.Error()))
+				}
+			}
+		}(task)
+	}
 }
 
 // startBrowser 根据配置启动浏览器。
@@ -169,10 +246,17 @@ func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.
 		bin = path
 	}
 
+	// 针对 Docker/EC2 环境的 Flag 优化
 	l := launcher.New().
 		Headless(cfg.Browser.Headless).
 		Bin(bin).
 		NoSandbox(true).
+		// 禁用 /dev/shm，防止容器内内存崩溃
+		Set("disable-dev-shm-usage", "true").
+		// 禁用 GPU，服务器环境不需要，节省资源
+		Set("disable-gpu", "true").
+		// 禁用软件光栅化器，进一步减少计算开销
+		Set("disable-software-rasterizer", "true").
 		Set("remote-allow-origins", "*")
 
 	var proxyServer string
@@ -378,6 +462,9 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 	// 等待结果
 	select {
 	case result := <-resultCh:
+		if result.response != nil {
+			result.response.TaskId = taskID
+		}
 		if s.maxTasks > 0 {
 			newCount := s.taskCounter.Add(1)
 			metrics.CrawlerTasksProcessedCurrent.Set(float64(newCount))

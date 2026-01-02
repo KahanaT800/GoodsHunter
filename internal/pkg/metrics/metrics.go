@@ -6,25 +6,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Redis Queue 相关指标
+// Redis List Queue 相关指标
 var (
-	// RedisQueueLength Redis Stream 当前队列长度
-	RedisQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "goodshunter_redis_queue_length",
-		Help: "Current length of Redis Streams task queue",
-	})
+	// CrawlerQueueDepth Redis List 队列深度
+	CrawlerQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "crawler_queue_depth",
+		Help: "Current Redis List queue depth",
+	}, []string{"queue_name"}) // queue_name: tasks, results
 
-	// RedisQueuePending Consumer Group 待处理消息数量
-	RedisQueuePending = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "goodshunter_redis_queue_pending",
-		Help: "Number of pending messages in consumer group",
-	})
-
-	// RedisQueueLag 消费延迟（队列最新消息 ID 与消费者读取位置的差距）
-	RedisQueueLag = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "goodshunter_redis_queue_lag",
-		Help: "Consumer lag in Redis Streams (difference between latest and consumed message ID)",
-	})
+	// CrawlerTaskThroughput 任务吞吐
+	CrawlerTaskThroughput = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "crawler_task_throughput",
+		Help: "Crawler task throughput for Redis List",
+	}, []string{"direction", "status"}) // direction: in, out; status: pushed, popped
 )
 
 // Worker Pool 相关指标
@@ -245,10 +239,10 @@ var (
 
 // 系统指标
 var (
-	// SchedulerMode 调度器当前模式（0=polling, 1=redis_streams）
+	// SchedulerMode 调度器当前模式（0=db_polling, 1=redis_list）
 	SchedulerMode = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "goodshunter_scheduler_mode",
-		Help: "Scheduler mode (0=db_polling, 1=redis_streams)",
+		Help: "Scheduler mode (0=db_polling, 1=redis_list)",
 	})
 
 	// ServiceUptime 服务启动时间（Unix timestamp）
@@ -259,12 +253,7 @@ var (
 )
 
 // InitMetrics 初始化指标（设置静态值）
-func InitMetrics(enableRedis bool, workerCapacity int) {
-	if enableRedis {
-		SchedulerMode.Set(1)
-	} else {
-		SchedulerMode.Set(0)
-	}
-
+func InitMetrics(workerCapacity int) {
+	SchedulerMode.Set(1)
 	WorkerPoolCapacity.Set(float64(workerCapacity))
 }
