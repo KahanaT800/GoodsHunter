@@ -1,0 +1,139 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-goodshunter_root}
+      MYSQL_DATABASE: goodshunter
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - goodshunter-net
+
+  redis:
+    image: redis:7
+    restart: always
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-goodshunter_redis}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-goodshunter_redis}", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - goodshunter-net
+
+  crawler:
+    image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-crawler:latest
+    restart: always
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-:50051}
+      CHROME_BIN: ${CHROME_BIN:-/usr/bin/chromium-browser}
+      BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
+      BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
+      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-5}
+      BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 50051"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - goodshunter-net
+
+  api:
+    image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-api:latest
+    restart: always
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      APP_HTTP_ADDR: ${APP_HTTP_ADDR:-:8080}
+      APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-crawler:50051}
+      APP_SCHEDULE_INTERVAL: ${APP_SCHEDULE_INTERVAL:-5m}
+      APP_NEW_ITEM_DURATION: ${APP_NEW_ITEM_DURATION:-1h}
+      APP_MAX_TASKS_PER_USER: ${APP_MAX_TASKS_PER_USER:-3}
+      APP_MAX_ITEMS_PER_TASK: ${APP_MAX_ITEMS_PER_TASK:-300}
+      APP_WORKER_POOL_SIZE: ${APP_WORKER_POOL_SIZE:-50}
+      APP_QUEUE_CAPACITY: ${APP_QUEUE_CAPACITY:-1000}
+      APP_GUEST_IDLE_TIMEOUT: ${APP_GUEST_IDLE_TIMEOUT:-10m}
+      APP_GUEST_HEARTBEAT: ${APP_GUEST_HEARTBEAT:-5m}
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-goodshunter_root}
+      DB_NAME: ${DB_NAME:-goodshunter}
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-goodshunter_redis}
+      JWT_SECRET: ${JWT_SECRET:-change_me}
+      INVITE_CODE: ${INVITE_CODE:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      crawler:
+        condition: service_healthy
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - goodshunter-net
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./web:/var/www/html:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    command: '/bin/sh -c ''while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g "daemon off;"'''
+    depends_on:
+      - api
+    networks:
+      - goodshunter-net
+
+  certbot:
+    image: certbot/certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  goodshunter-net:
+    driver: bridge

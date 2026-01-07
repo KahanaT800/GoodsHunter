@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GoodsHunter</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="logo">GoodsHunter</div>
+        <div class="header-right">
+          <div class="user-meta">
+            <div class="user-email">{{ userEmail || '未登录' }}</div>
+            <span v-if="isGuest" class="visitor-badge">Visitor Mode (ReadOnly)</span>
+          </div>
+          <button class="user-btn" @click="showAuth = true">{{ userBadge }}</button>
+        </div>
+      </header>
+
+      <div v-if="!token" class="auth-mask">
+        <div class="auth-panel">
+          <div class="auth-tabs">
+            <button class="auth-tab" :class="{ active: authTab === 'login' }" @click="authTab = 'login'">
+              登录
+            </button>
+            <button class="auth-tab" :class="{ active: authTab === 'register' }" @click="authTab = 'register'">
+              注册
+            </button>
+          </div>
+
+          <div v-if="authTab === 'login'" class="auth-body">
+            <label>邮箱</label>
+            <input v-model="authForm.email" placeholder="user@example.com" />
+            <label>密码</label>
+            <input type="password" v-model="authForm.password" />
+            <div class="muted">密码至少 6 位</div>
+            <button class="btn-primary" @click="login" :disabled="loading.auth">登录</button>
+          </div>
+
+          <div v-else class="auth-body">
+            <label>邮箱</label>
+            <input v-model="authForm.email" placeholder="user@example.com" />
+            <label>密码</label>
+            <input type="password" v-model="authForm.password" />
+            <div class="muted">密码至少 6 位</div>
+            <label>邀请码</label>
+            <input v-model="authForm.invite_code" placeholder="Invite Code" />
+            <button class="btn-primary" @click="register" :disabled="loading.auth">注册并发送验证码</button>
+            <label style="margin-top: 12px;">验证码</label>
+            <input v-model="verifyCode" placeholder="6 位验证码" />
+            <button class="btn-outline" @click="verifyEmail" :disabled="loading.auth">验证邮箱</button>
+            <button class="btn-outline" style="margin-top:8px;" @click="resendCode" :disabled="loading.auth || resendCountdown > 0">
+              {{ resendCountdown > 0 ? `重发(${resendCountdown}s)` : '重发验证码' }}
+            </button>
+          </div>
+
+          <button class="guest-btn" @click="guestLogin" :disabled="loading.auth">无需注册，立即体验</button>
+        </div>
+      </div>
+      <div class="container">
+        <div class="panel">
+        <h2>任务管理</h2>
+        <div>
+          <label>关键词</label>
+          <input v-model="form.keyword" placeholder="例如 初音ミク フィギュア" />
+          <label>平台</label>
+          <select v-model.number="form.platform">
+            <option :value="1">Mercari</option>
+          </select>
+          <label>最低价 (JPY)</label>
+          <input type="number" v-model.number="form.min_price" />
+          <label>最高价 (JPY)</label>
+          <input type="number" v-model.number="form.max_price" />
+          <label>排序方式</label>
+          <select v-model="form.sort">
+            <option value="created_time|desc">按最新上架</option>
+            <option value="price|asc">按价格降序</option>
+            <option value="price|desc">按价格升序</option>
+          </select>
+              <button class="btn-primary" @click="createTask" :disabled="loading.create || tasks.length >= maxTasksPerUser">
+                {{ loading.create ? '提交中...' : '新建任务' }}
+              </button>
+        </div>
+        <div style="margin-top:16px;">
+          <h2>任务列表</h2>
+          <div v-if="tasks.length === 0" class="muted">暂无任务</div>
+          <div
+            v-for="t in tasks"
+            :key="t.id"
+            class="task-card"
+            :class="{ selected: t.id === selectedTaskId }"
+            @click="selectTask(t)"
+          >
+            <div class="task-header">
+              <div>
+                <div><strong>{{ t.keyword }}</strong></div>
+                <div class="muted">{{ priceRange(t) }}</div>
+              </div>
+              <div class="status" :class="t.status">{{ t.status }}</div>
+            </div>
+            <div class="actions">
+              <div class="notify-toggle" @click.stop>
+                <span class="toggle-label">通知</span>
+                <label class="switch">
+                  <input type="checkbox" :checked="t.notify_enabled" @change="toggleNotify(t)" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <button class="btn-outline" @click.stop="toggleTask(t)" :disabled="loading.toggle">
+                {{ t.status === 'running' ? '停止' : '启动' }}
+              </button>
+              <button class="btn-danger" @click.stop="deleteTask(t)" :disabled="loading.delete">删除</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>在售商品</h2>
+        <div v-if="!selectedTaskId" class="muted">请先选择一个任务</div>
+        <div v-else-if="items.length === 0" class="muted">
+          暂无商品数据<br/>
+          <small style="font-size: 11px; opacity: 0.7;">任务启动后将立即开始爬取</small>
+        </div>
+        <div v-else class="timeline">
+          <div class="item-card" v-for="item in items" :key="item.id">
+            <img :src="item.image_url || fallbackImage" :alt="item.title" />
+            <div class="item-body">
+              <div class="price">
+                ¥{{ item.price }}
+                <span v-if="isNewItem(item)" class="badge-new">NEW</span>
+              </div>
+              <div>{{ item.title }}</div>
+              <div class="muted">ID: {{ item.source_id }}</div>
+              <a class="link" :href="item.item_url" target="_blank" rel="noopener">前往商品</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="showAuth" class="modal-mask" @click.self="showAuth = false">
+        <div class="modal">
+          <div v-if="token">
+            <div class="muted" style="margin-bottom:12px;">已登录</div>
+            <button class="btn-outline" @click="logout">退出登录</button>
+            <button class="btn-danger" style="margin-top:8px;" @click="deleteAccount">注销账号</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="confirmModal.show" class="modal-mask" @click.self="confirmCancel">
+        <div class="modal confirm-modal">
+          <h3 class="modal-title">{{ confirmModal.title }}</h3>
+          <p class="modal-desc">{{ confirmModal.message }}</p>
+          <div class="modal-actions">
+            <button class="btn-outline" @click="confirmCancel">取消</button>
+            <button class="btn-danger" @click="confirmOk">确定</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="toast.show" class="toast" :class="toast.type">{{ toast.message }}</div>
+      <div v-if="notifyToast.show" class="notify-toast">
+        <div class="notify-title">GoodsHunter 通知</div>
+        <div class="notify-body">{{ notifyToast.message }}</div>
+      </div>
+    </div>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

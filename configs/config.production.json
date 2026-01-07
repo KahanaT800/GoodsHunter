@@ -1,0 +1,32 @@
+{
+  "app": {
+    "env": "production",
+    "log_level": "warn",
+    "http_addr": ":8080",
+    "crawler_grpc_addr": "crawler:50051",
+    "schedule_interval": "5m",
+    "worker_pool_size": 100,
+    "queue_capacity": 2000
+  },
+  "mysql": {
+    "dsn": "root:your_production_password@tcp(mysql:3306)/goodshunter?parseTime=true&loc=Local"
+  },
+  "redis": {
+    "addr": "redis:6379",
+    "password": "your_production_redis_password"
+  },
+  "browser": {
+    "bin_path": "/usr/bin/chromium",
+    "proxy_url": "",
+    "headless": true,
+    "max_concurrency": 10
+  },
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "your_production_email@gmail.com",
+    "smtp_pass": "your_production_app_password",
+    "from_email": "your_production_email@gmail.com",
+    "to_email": "your_recipient@example.com"
+  }
+}
