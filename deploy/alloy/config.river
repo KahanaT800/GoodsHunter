@@ -57,6 +57,31 @@ discovery.docker "containers" {
   host = "unix:///var/run/docker.sock"
 }
 
+discovery.relabel "container_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_image"]
+    target_label  = "image"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "docker"
+  }
+}
+
 loki.write "grafana_cloud" {
   endpoint {
     url = env("GRAFANA_CLOUD_LOKI_URL")
@@ -69,6 +94,6 @@ loki.write "grafana_cloud" {
 
 loki.source.docker "containers" {
   host = "unix:///var/run/docker.sock"
-  targets = discovery.docker.containers.targets
+  targets = discovery.relabel.container_logs.output
   forward_to = [loki.write.grafana_cloud.receiver]
 }
