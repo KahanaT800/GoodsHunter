@@ -5,11 +5,10 @@ logging {
 prometheus.remote_write "grafana_cloud" {
   endpoint {
     url = env("GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL")
-  }
-
-  basic_auth {
-    username = env("GRAFANA_CLOUD_PROM_USERNAME")
-    password = env("GRAFANA_CLOUD_PROM_API_KEY")
+    basic_auth {
+      username = env("GRAFANA_CLOUD_PROM_USERNAME")
+      password = env("GRAFANA_CLOUD_PROM_API_KEY")
+    }
   }
 }
 
@@ -54,18 +53,21 @@ prometheus.scrape "node_exporter" {
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
 
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
 loki.write "grafana_cloud" {
   endpoint {
     url = env("GRAFANA_CLOUD_LOKI_URL")
-  }
-
-  basic_auth {
-    username = env("GRAFANA_CLOUD_LOKI_USERNAME")
-    password = env("GRAFANA_CLOUD_LOKI_API_KEY")
+    basic_auth {
+      username = env("GRAFANA_CLOUD_LOKI_USERNAME")
+      password = env("GRAFANA_CLOUD_LOKI_API_KEY")
+    }
   }
 }
 
 loki.source.docker "containers" {
-  host = "unix:///var/run/docker.sock"
+  targets = discovery.docker.containers.targets
   forward_to = [loki.write.grafana_cloud.receiver]
 }
