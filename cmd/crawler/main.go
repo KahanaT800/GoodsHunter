@@ -5,6 +5,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"goodshunter/internal/pkg/logger"
 	"goodshunter/proto/pb"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 )
 
@@ -63,6 +65,21 @@ func main() {
 		}
 	}()
 
+	metricsAddr := ":2112"
+	if v := os.Getenv("CRAWLER_METRICS_ADDR"); v != "" {
+		metricsAddr = v
+	}
+	metricsServer := &http.Server{
+		Addr:    metricsAddr,
+		Handler: promhttp.Handler(),
+	}
+	go func() {
+		appLogger.Info("crawler metrics server started", slog.String("addr", metricsAddr))
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			appLogger.Error("metrics server stopped with error", slog.String("error", err.Error()))
+		}
+	}()
+
 	// 等待中断信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -78,6 +95,10 @@ func main() {
 	// 2. 关闭 worker pool（等待所有任务完成）
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		appLogger.Error("metrics shutdown error", slog.String("error", err.Error()))
+	}
 
 	if err := service.Shutdown(shutdownCtx); err != nil {
 		appLogger.Error("worker pool shutdown error", slog.String("error", err.Error()))

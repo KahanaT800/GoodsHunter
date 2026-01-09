@@ -62,6 +62,8 @@ func (q *TaskQueue) Publish(ctx context.Context, msg *TaskMessage) error {
 	// 发布到 Redis Streams
 	args := &redis.XAddArgs{
 		Stream: q.streamName,
+		MaxLen: 10000,
+		Approx: true,
 		Values: map[string]interface{}{
 			"data": string(data),
 		},

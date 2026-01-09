@@ -29,6 +29,15 @@ prometheus.scrape "redis_exporter" {
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
 
+prometheus.scrape "goodshunter_crawler" {
+  targets = [
+    {"__address__" = "crawler:2112"},
+  ]
+  metrics_path = "/metrics"
+  scrape_interval = "10s"
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
 prometheus.scrape "mysql_exporter" {
   targets = [
     {"__address__" = "mysql-exporter:9104"},

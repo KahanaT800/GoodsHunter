@@ -133,6 +133,18 @@ var (
 		Name: "goodshunter_crawler_errors_total",
 		Help: "Total number of crawler errors",
 	}, []string{"platform", "error_type"}) // error_type: timeout, parse_error, network_error
+
+	// CrawlerBrowserActive 当前活跃的浏览器页面数
+	CrawlerBrowserActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_browser_active",
+		Help: "Number of active crawler browser pages",
+	})
+
+	// CrawlerBrowserInstances 当前浏览器实例数量
+	CrawlerBrowserInstances = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_crawler_browser_instances",
+		Help: "Number of active crawler browser instances",
+	})
 )
 
 // 数据库相关指标（GORM 会自动暴露部分指标）

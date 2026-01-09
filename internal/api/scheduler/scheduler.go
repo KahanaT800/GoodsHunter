@@ -259,6 +259,24 @@ func (s *Scheduler) reportRedisMetrics(ctx context.Context) {
 	if err == nil {
 		metrics.RedisQueuePending.Set(float64(pending))
 	}
+
+	groups, err := s.rdb.XInfoGroups(ctx, s.streamName).Result()
+	if err != nil {
+		return
+	}
+
+	groupName := s.taskConsumer.GroupName()
+	for _, group := range groups {
+		if group.Name != groupName {
+			continue
+		}
+		if group.Lag < 0 {
+			metrics.RedisQueueLag.Set(0)
+		} else {
+			metrics.RedisQueueLag.Set(float64(group.Lag))
+		}
+		return
+	}
 }
 
 // handleTaskMessage 处理从 Redis 接收到的任务消息。

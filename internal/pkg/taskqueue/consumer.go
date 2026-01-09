@@ -21,6 +21,11 @@ type Consumer struct {
 	batchSize  int64
 }
 
+// GroupName 返回消费者组名称。
+func (c *Consumer) GroupName() string {
+	return c.groupName
+}
+
 // ConsumerOption 消费者配置选项。
 type ConsumerOption func(*Consumer)
 

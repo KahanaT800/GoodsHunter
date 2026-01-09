@@ -153,6 +153,17 @@ func (q *Queue) executeJob(ctx context.Context, job Job, workerID int) {
 	metrics.TaskProcessingDuration.WithLabelValues("execute").Observe(duration)
 }
 
+func wrapJobWithWait(job Job, enqueuedAt time.Time) Job {
+	if job == nil {
+		return nil
+	}
+	return func(ctx context.Context) error {
+		wait := time.Since(enqueuedAt).Seconds()
+		metrics.TaskQueueWaitTime.Observe(wait)
+		return job(ctx)
+	}
+}
+
 // Enqueue 将任务放入队列，若队列已满则返回 false（非阻塞）。
 func (q *Queue) Enqueue(job Job) bool {
 	if job == nil {
@@ -165,6 +176,7 @@ func (q *Queue) Enqueue(job Job) bool {
 		return false
 	}
 
+	job = wrapJobWithWait(job, time.Now())
 	select {
 	case q.jobs <- job:
 		q.stats.TotalEnqueued.Add(1)
@@ -191,6 +203,7 @@ func (q *Queue) EnqueueBlocking(ctx context.Context, job Job) error {
 		return fmt.Errorf("queue is closed")
 	}
 
+	job = wrapJobWithWait(job, time.Now())
 	select {
 	case q.jobs <- job:
 		q.stats.TotalEnqueued.Add(1)

@@ -37,6 +37,7 @@ services:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-:50051}
+      CRAWLER_METRICS_ADDR: ${CRAWLER_METRICS_ADDR:-:2112}
       CHROME_BIN: ${CHROME_BIN:-/usr/bin/chromium-browser}
       BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
@@ -52,6 +53,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    expose:
+      - "2112"
     networks:
       - goodshunter-net
 

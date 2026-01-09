@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"goodshunter/internal/config"
+	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/queue"
 	"goodshunter/proto/pb"
 
@@ -54,6 +56,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 	if err != nil {
 		return nil, err
 	}
+	metrics.CrawlerBrowserInstances.Inc()
 
 	// 创建 Worker Pool
 	// workers 数量使用浏览器的最大并发数
@@ -155,7 +158,16 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	start := time.Now()
-	s.logger.Info("fetching items", slog.String("task_id", taskID), slog.String("platform", req.GetPlatform().String()))
+	platform := strings.ToLower(req.GetPlatform().String())
+	s.logger.Info("fetching items", slog.String("task_id", taskID), slog.String("platform", platform))
+
+	recordMetrics := func(status string, err error) {
+		metrics.CrawlerRequestsTotal.WithLabelValues(platform, status).Inc()
+		metrics.CrawlerRequestDuration.WithLabelValues(platform).Observe(time.Since(start).Seconds())
+		if err != nil {
+			metrics.CrawlerErrorsTotal.WithLabelValues(platform, classifyCrawlerError(err)).Inc()
+		}
+	}
 
 	// 创建一个 channel 用于接收抓取结果
 	resultCh := make(chan *fetchResult, 1)
@@ -176,6 +188,7 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 	// 提交到 worker pool（阻塞式，直到队列有空间）
 	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
+		recordMetrics("failed", err)
 		return nil, fmt.Errorf("enqueue crawl job: %w", err)
 	}
 
@@ -188,10 +201,13 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 				slog.String("error", result.err.Error()),
 				slog.String("duration", time.Since(start).String()),
 			)
+			recordMetrics("failed", result.err)
 			return nil, result.err
 		}
+		recordMetrics("success", nil)
 		return result.response, nil
 	case <-ctx.Done():
+		recordMetrics("failed", ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -210,7 +226,9 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	// 构建 URL 并打开新页面。
 	url := BuildMercariURL(req)
 	page := stealth.MustPage(s.browser)
+	metrics.CrawlerBrowserActive.Inc()
 	defer func() {
+		metrics.CrawlerBrowserActive.Dec()
 		_ = page.Close()
 	}()
 
@@ -408,6 +426,26 @@ func isNoItemsText(text string) bool {
 	return false
 }
 
+func classifyCrawlerError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timeout"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "navigate") || strings.Contains(msg, "net::") || strings.Contains(msg, "connection"):
+		return "network_error"
+	case strings.Contains(msg, "parse") || strings.Contains(msg, "extract"):
+		return "parse_error"
+	default:
+		return "unknown"
+	}
+}
+
 // extractItem 从单个 DOM 元素中提取商品信息。
 //
 // 参数:
@@ -581,6 +619,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	// 等待所有爬取任务完成
 	if err := s.queue.ShutdownWithTimeout(timeout); err != nil {
 		return fmt.Errorf("shutdown worker pool: %w", err)
+	}
+
+	if err := s.browser.Close(); err != nil {
+		s.logger.Error("close browser failed", slog.String("error", err.Error()))
+	} else {
+		metrics.CrawlerBrowserInstances.Dec()
 	}
 
 	s.logger.Info("crawler worker pool shutdown completed")
