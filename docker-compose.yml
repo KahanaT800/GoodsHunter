@@ -189,7 +189,7 @@ services:
       - goodshunter-net
 
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
     restart: always
     profiles: ["monitoring-cloud"]
     privileged: true
