@@ -232,12 +232,31 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	}
 
 	// 等待列表元素加载完成。
-	// 使用 Element 而不是 MustElement 以避免 panic
-	if _, err := page.Element(`[data-testid="item-cell"]`); err != nil {
-		time.Sleep(2 * time.Second)
-		if _, retryErr := page.Element(`[data-testid="item-cell"]`); retryErr != nil {
-			return nil, fmt.Errorf("wait for items: %w", err)
+	// 使用 Race 同时等待商品列表或空状态标志，避免在无商品时死等直到超时
+	_, err = page.Race().
+		Element(`[data-testid="item-cell"]`).Handle(func(e *rod.Element) error {
+		return nil // 找到商品
+	}).
+		Element(`.merEmptyState`).Handle(func(e *rod.Element) error {
+		return fmt.Errorf("no_items_state")
+	}).
+		Do()
+
+	if err != nil {
+		// 如果检测到空状态，或者 Race 超时/失败后通过文本再次确认（作为兜底）
+		if err.Error() == "no_items_state" || s.isNoItemsPage(page) {
+			s.logger.Info("no items found",
+				slog.String("task_id", taskID),
+				slog.String("url", url),
+				slog.String("duration", time.Since(start).String()),
+			)
+			return &pb.FetchResponse{
+				Items:        []*pb.Item{},
+				TotalFound:   0,
+				ErrorMessage: "no_items",
+			}, nil
 		}
+		return nil, fmt.Errorf("wait for items: %w", err)
 	}
 
 	// 滚动加载更多商品，直到达到 maxFetchCount 或无法加载更多
@@ -298,6 +317,18 @@ ParseItems:
 	if err != nil {
 		return nil, fmt.Errorf("get elements: %w", err)
 	}
+	if len(elements) == 0 {
+		s.logger.Info("no items found",
+			slog.String("task_id", taskID),
+			slog.String("url", url),
+			slog.String("duration", time.Since(start).String()),
+		)
+		return &pb.FetchResponse{
+			Items:        []*pb.Item{},
+			TotalFound:   0,
+			ErrorMessage: "no_items",
+		}, nil
+	}
 
 	// 提取商品信息。
 	items := make([]*pb.Item, 0, limit)
@@ -336,6 +367,45 @@ ParseItems:
 		TotalFound:   int32(len(items)),
 		ErrorMessage: "",
 	}, nil
+}
+
+func (s *Service) isNoItemsPage(page *rod.Page) bool {
+	// 使用 Elements 而不是 Element，避免在元素不存在时阻塞等待超时
+	if elems, err := page.Elements(".merEmptyState"); err == nil && len(elems) > 0 {
+		return true
+	}
+
+	// 使用带超时的 Page 克隆进行文本检查，避免卡顿
+	pWithTimeout := page.Timeout(2 * time.Second)
+	body, err := pWithTimeout.Element("body")
+	if err != nil {
+		return false
+	}
+	text, err := body.Text()
+	if err != nil {
+		return false
+	}
+	return isNoItemsText(text)
+}
+
+func isNoItemsText(text string) bool {
+	if text == "" {
+		return false
+	}
+	noItemsHints := []string{
+		"出品された商品がありません",
+		"該当する商品はありません",
+		"検索結果はありません",
+		"商品が見つかりません",
+		"見つかりませんでした",
+		"検索結果がありません",
+	}
+	for _, hint := range noItemsHints {
+		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractItem 从单个 DOM 元素中提取商品信息。

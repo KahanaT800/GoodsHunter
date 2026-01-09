@@ -109,10 +109,23 @@
                   <span class="slider"></span>
                 </label>
               </div>
+              <button class="btn-outline" @click.stop="startEditTask(t)" :disabled="loading.edit">
+                编辑
+              </button>
               <button class="btn-outline" @click.stop="toggleTask(t)" :disabled="loading.toggle">
                 {{ t.status === 'running' ? '停止' : '启动' }}
               </button>
               <button class="btn-danger" @click.stop="deleteTask(t)" :disabled="loading.delete">删除</button>
+            </div>
+            <div v-if="editingTaskId === t.id" class="task-edit" @click.stop>
+              <div class="muted" style="margin-bottom:6px;">调整价格区间</div>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input type="number" v-model.number="editForm.min_price" placeholder="最低价" style="width:120px;" />
+                <span class="muted">-</span>
+                <input type="number" v-model.number="editForm.max_price" placeholder="最高价" style="width:120px;" />
+                <button class="btn-primary" @click.stop="saveEditTask(t)" :disabled="loading.edit">保存</button>
+                <button class="btn-outline" @click.stop="cancelEditTask">取消</button>
+              </div>
             </div>
           </div>
         </div>
@@ -121,8 +134,12 @@
         <h2>在售商品</h2>
         <div v-if="!selectedTaskId" class="muted">请先选择一个任务</div>
         <div v-else-if="items.length === 0" class="muted">
-          暂无商品数据<br/>
-          <small style="font-size: 11px; opacity: 0.7;">任务启动后将立即开始爬取</small>
+          <span v-if="timelineStatus === 'no_items'">当前条件暂无在售商品</span>
+          <span v-else-if="timelineStatus === 'failed'">抓取商品失败，请稍后再试</span>
+          <span v-else>暂无商品数据</span>
+          <br/>
+          <small v-if="timelineMessage" style="font-size: 11px; opacity: 0.7;">{{ timelineMessage }}</small>
+          <small v-else style="font-size: 11px; opacity: 0.7;">任务启动后将立即开始爬取</small>
         </div>
         <div v-else class="timeline">
           <div class="item-card" v-for="item in items" :key="item.id">
@@ -168,6 +185,6 @@
       </div>
     </div>
 
-    <script src="/assets/app.js"></script>
+    <script src="/assets/app.js?v=20260108-fixed"></script>
   </body>
 </html>

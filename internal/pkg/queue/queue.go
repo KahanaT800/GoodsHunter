@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"goodshunter/internal/pkg/metrics"
 )
 
 // Job 表示一个可执行的异步任务。
@@ -114,18 +116,26 @@ func (q *Queue) executeJob(ctx context.Context, job Job, workerID int) {
 	defer func() {
 		if r := recover(); r != nil {
 			q.stats.TotalPanics.Add(1)
+			metrics.TasksProcessedTotal.WithLabelValues("panic").Inc()
 			q.logger.Error("job panic recovered",
 				slog.Int("worker_id", workerID),
 				slog.Any("panic", r),
 				slog.String("stack", string(debug.Stack())))
 		}
+		// 更新活跃任务数
+		metrics.ActiveTasks.Dec()
 	}()
+
+	// 增加活跃任务数
+	metrics.ActiveTasks.Inc()
+	start := time.Now()
 
 	err := job(ctx)
 	q.stats.TotalProcessed.Add(1)
 
 	if err != nil {
 		q.stats.TotalFailed.Add(1)
+		metrics.TasksProcessedTotal.WithLabelValues("failed").Inc()
 		q.logger.Warn("job failed",
 			slog.Int("worker_id", workerID),
 			slog.String("error", err.Error()))
@@ -135,7 +145,12 @@ func (q *Queue) executeJob(ctx context.Context, job Job, workerID int) {
 		}
 	} else {
 		q.stats.TotalSucceeded.Add(1)
+		metrics.TasksProcessedTotal.WithLabelValues("success").Inc()
 	}
+
+	// 记录处理耗时
+	duration := time.Since(start).Seconds()
+	metrics.TaskProcessingDuration.WithLabelValues("execute").Observe(duration)
 }
 
 // Enqueue 将任务放入队列，若队列已满则返回 false（非阻塞）。
@@ -146,15 +161,19 @@ func (q *Queue) Enqueue(job Job) bool {
 
 	if q.closed.Load() {
 		q.logger.Warn("queue is closed, reject job")
+		metrics.TasksProcessedTotal.WithLabelValues("dropped").Inc()
 		return false
 	}
 
 	select {
 	case q.jobs <- job:
 		q.stats.TotalEnqueued.Add(1)
+		// 更新待处理任务数
+		metrics.WorkerPoolPending.Set(float64(len(q.jobs)))
 		return true
 	default:
 		q.stats.TotalDropped.Add(1)
+		metrics.TasksProcessedTotal.WithLabelValues("dropped").Inc()
 		q.logger.Warn("queue full, drop job",
 			slog.Int("capacity", cap(q.jobs)),
 			slog.Int("pending", len(q.jobs)))

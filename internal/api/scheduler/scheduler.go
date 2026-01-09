@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"goodshunter/internal/model"
+	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/notify"
 	"goodshunter/internal/pkg/queue"
+	"goodshunter/internal/pkg/taskqueue"
 	"goodshunter/proto/pb"
 
 	"github.com/redis/go-redis/v9"
@@ -34,6 +36,12 @@ type Scheduler struct {
 	maxItemsPerTask int
 	queue           *queue.Queue
 	notifier        notify.Notifier
+
+	// Redis Streams 支持
+	enableRedis  bool                // 是否启用 Redis Streams
+	taskConsumer *taskqueue.Consumer // 任务消费者
+	taskProducer *taskqueue.Producer // 任务生产者（用于周期发布）
+	streamName   string              // Redis Stream 名称
 }
 
 // NewScheduler 创建一个新的调度器实例。
@@ -50,11 +58,12 @@ type Scheduler struct {
 //	maxItems: 每个任务保留的最大商品数
 //	workers: Worker Pool 大小（并发任务数，0 表示使用默认值 50）
 //	capacity: 队列容量（0 表示使用默认值 1000）
+//	enableRedis: 是否启用 Redis Streams 模式
 //
 // 返回值:
 //
 //	*Scheduler: 调度器实例
-func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int) *Scheduler {
+func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, enableRedis bool) *Scheduler {
 	// 使用默认值（如果参数为 0）
 	if workers <= 0 {
 		workers = 50 // 默认 50 个并发 worker
@@ -74,6 +83,22 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 			slog.String("error", err.Error()))
 	})
 
+	// 初始化 Redis Streams 消费者（如果启用）
+	var taskConsumer *taskqueue.Consumer
+	var taskProducer *taskqueue.Producer
+	if enableRedis {
+		consumer, err := taskqueue.NewConsumer(rdb, logger, "scheduler_group", "")
+		if err != nil {
+			logger.Error("failed to create task consumer, fallback to polling mode",
+				slog.String("error", err.Error()))
+			enableRedis = false
+		} else {
+			taskConsumer = consumer
+			taskProducer = taskqueue.NewProducer(rdb, logger)
+			logger.Info("redis streams consumer initialized")
+		}
+	}
+
 	return &Scheduler{
 		db:              db,
 		rdb:             rdb,
@@ -85,6 +110,10 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 		maxItemsPerTask: maxItems,
 		queue:           q,
 		notifier:        notifier,
+		enableRedis:     enableRedis,
+		taskConsumer:    taskConsumer,
+		taskProducer:    taskProducer,
+		streamName:      "goodshunter:task:queue",
 	}
 }
 
@@ -98,12 +127,88 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 //	ctx: 用于控制停止的上下文
 func (s *Scheduler) Run(ctx context.Context) {
 	s.logger.Info("scheduler started",
+		slog.String("mode", s.getMode()),
 		slog.String("interval", s.interval.String()),
 		slog.Int("workers", s.queue.Cap()/20),
 		slog.Int("queue_capacity", s.queue.Cap()))
 
 	// 启动 Worker Pool
 	s.queue.Start(ctx)
+
+	// 根据配置选择运行模式
+	if s.enableRedis && s.taskConsumer != nil {
+		s.runRedisMode(ctx)
+	} else {
+		s.runPollingMode(ctx)
+	}
+}
+
+// getMode 获取当前运行模式
+func (s *Scheduler) getMode() string {
+	if s.enableRedis {
+		return "redis_streams"
+	}
+	return "db_polling"
+}
+
+// runRedisMode 从 Redis Streams 消费任务。
+func (s *Scheduler) runRedisMode(ctx context.Context) {
+	s.logger.Info("scheduler running in Redis Streams mode")
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	statsTicker := time.NewTicker(1 * time.Minute)
+	defer statsTicker.Stop()
+
+	// 定期上报 Redis 队列指标
+	metricsTicker := time.NewTicker(5 * time.Second)
+	defer metricsTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("scheduler stopping")
+			if err := s.queue.ShutdownWithTimeout(30 * time.Second); err != nil {
+				s.logger.Error("queue shutdown timeout", slog.String("error", err.Error()))
+			}
+			s.logger.Info("scheduler stopped")
+			return
+
+		case <-metricsTicker.C:
+			// 上报 Redis 队列指标
+			s.reportRedisMetrics(ctx)
+
+		case <-ticker.C:
+			// 从 Redis Streams 读取任务
+			messages, err := s.taskConsumer.Read(ctx)
+			if err != nil {
+				s.logger.Error("read from redis failed", slog.String("error", err.Error()))
+				continue
+			}
+
+			if len(messages) > 0 {
+				s.logger.Info("received messages from redis",
+					slog.Int("count", len(messages)))
+
+				for _, msg := range messages {
+					start := time.Now()
+					s.handleTaskMessage(ctx, msg)
+					// 记录任务处理时长
+					duration := time.Since(start).Seconds()
+					metrics.TaskProcessingDuration.WithLabelValues(msg.Message.Action).Observe(duration)
+				}
+			}
+
+		case <-statsTicker.C:
+			s.printQueueStats()
+		}
+	}
+}
+
+// runPollingMode 轮询数据库模式（原有逻辑）。
+func (s *Scheduler) runPollingMode(ctx context.Context) {
+	s.logger.Info("scheduler running in DB polling mode")
 
 	// 首次立即调度一次
 	s.enqueueRunningTasks()
@@ -135,6 +240,150 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.printQueueStats()
 		}
 	}
+}
+
+// reportRedisMetrics 上报 Redis Streams 队列指标到 Prometheus。
+func (s *Scheduler) reportRedisMetrics(ctx context.Context) {
+	if s.taskConsumer == nil {
+		return
+	}
+
+	// 获取队列长度（通过 Redis 命令）
+	length, err := s.rdb.XLen(ctx, s.streamName).Result()
+	if err == nil {
+		metrics.RedisQueueLength.Set(float64(length))
+	}
+
+	// 获取待处理消息数量
+	pending, err := s.taskConsumer.Pending(ctx)
+	if err == nil {
+		metrics.RedisQueuePending.Set(float64(pending))
+	}
+}
+
+// handleTaskMessage 处理从 Redis 接收到的任务消息。
+func (s *Scheduler) handleTaskMessage(ctx context.Context, msg *taskqueue.MessageWithID) {
+	if msg == nil || msg.Message == nil {
+		return
+	}
+
+	taskMsg := msg.Message
+
+	s.logger.Info("processing task message",
+		slog.Uint64("task_id", uint64(taskMsg.TaskID)),
+		slog.String("action", taskMsg.Action),
+		slog.String("source", taskMsg.Source))
+
+	switch taskMsg.Action {
+	case "execute":
+		// 提交到内存队列执行
+		s.enqueueTaskID(taskMsg.TaskID)
+
+		// 确认消息已处理
+		if err := s.taskConsumer.Ack(ctx, msg.ID); err != nil {
+			s.logger.Error("ack message failed",
+				slog.String("msg_id", msg.ID),
+				slog.String("error", err.Error()))
+		}
+
+	case "stop":
+		// 未来可以实现停止逻辑
+		s.logger.Info("stop task message received",
+			slog.Uint64("task_id", uint64(taskMsg.TaskID)))
+		if err := s.taskConsumer.Ack(ctx, msg.ID); err != nil {
+			s.logger.Error("ack message failed",
+				slog.String("msg_id", msg.ID),
+				slog.String("error", err.Error()))
+		}
+
+	default:
+		s.logger.Warn("unknown action",
+			slog.String("action", taskMsg.Action))
+		if err := s.taskConsumer.Ack(ctx, msg.ID); err != nil {
+			s.logger.Error("ack message failed",
+				slog.String("msg_id", msg.ID),
+				slog.String("error", err.Error()))
+		}
+	}
+}
+
+// RunPeriodicPublisher 启动周期性任务发布器。
+//
+// 定期检查数据库中需要执行的任务，并发布到 Redis Streams。
+// 确保任务能够持续周期性执行（24小时监控）。
+//
+// 参数:
+//
+//	ctx: 用于控制停止的上下文
+func (s *Scheduler) RunPeriodicPublisher(ctx context.Context) {
+	if !s.enableRedis || s.taskProducer == nil {
+		s.logger.Warn("periodic publisher disabled (redis mode not enabled)")
+		return
+	}
+
+	s.logger.Info("periodic publisher started",
+		slog.String("interval", s.interval.String()))
+
+	// 首次立即发布一次
+	s.publishPeriodicTasks(ctx)
+
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("periodic publisher stopping")
+			return
+
+		case <-ticker.C:
+			s.publishPeriodicTasks(ctx)
+		}
+	}
+}
+
+// publishPeriodicTasks 发布需要周期执行的任务。
+func (s *Scheduler) publishPeriodicTasks(ctx context.Context) {
+	var tasks []model.Task
+
+	// 查询需要执行的任务：
+	// 1. status = 'running'
+	// 2. last_run_at IS NULL (从未执行过) 或者
+	//    last_run_at < NOW() - interval (距离上次执行超过间隔时间)
+	threshold := time.Now().Add(-s.interval)
+
+	err := s.db.Where("status = ?", "running").
+		Where("last_run_at IS NULL OR last_run_at < ?", threshold).
+		Find(&tasks).Error
+
+	if err != nil {
+		s.logger.Error("query periodic tasks failed",
+			slog.String("error", err.Error()))
+		return
+	}
+
+	if len(tasks) == 0 {
+		s.logger.Debug("no tasks need periodic execution")
+		return
+	}
+
+	s.logger.Info("publishing periodic tasks",
+		slog.Int("count", len(tasks)))
+
+	successCount := 0
+	for _, task := range tasks {
+		if err := s.taskProducer.SubmitTask(ctx, task.ID, "periodic"); err != nil {
+			s.logger.Error("publish periodic task failed",
+				slog.Uint64("task_id", uint64(task.ID)),
+				slog.String("error", err.Error()))
+		} else {
+			successCount++
+		}
+	}
+
+	s.logger.Info("periodic tasks published",
+		slog.Int("success", successCount),
+		slog.Int("total", len(tasks)))
 }
 
 // StartTask 将任务放入队列，等待 worker 执行。
@@ -212,6 +461,7 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 
 	resp, err := s.client.FetchItems(ctx, req)
 	if err != nil {
+		s.setTaskCrawlStatus(ctx, task.ID, "failed", err.Error())
 		s.logger.Error("fetch items failed",
 			slog.String("task_id", req.TaskId),
 			slog.String("error", err.Error()),
@@ -219,6 +469,17 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 		)
 		return
 	}
+
+	status := "success"
+	message := ""
+	if resp != nil && resp.GetErrorMessage() == "no_items" && len(resp.GetItems()) == 0 {
+		status = "no_items"
+		message = "no items found"
+	} else if len(resp.GetItems()) == 0 {
+		status = "no_items"
+		message = "no items found"
+	}
+	s.setTaskCrawlStatus(ctx, task.ID, status, message)
 
 	firstRun := task.BaselineAt == nil || task.BaselineAt.IsZero()
 	notifyAllowed := !firstRun && task.NotifyEnabled
@@ -253,8 +514,15 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 	updates := map[string]interface{}{
 		"last_run_at": now,
 	}
+	// 首次运行（无论是抓到商品还是 no_items）都设置 baseline_at
+	// 这样后续出现新商品时才能正确标记为 is_new
 	if firstRun {
 		updates["baseline_at"] = now
+		s.logger.Info("baseline_at set for task",
+			slog.Uint64("task_id", uint64(task.ID)),
+			slog.String("status", status),
+			slog.Int("items_count", len(resp.Items)),
+		)
 	}
 	if err := s.db.Model(&model.Task{}).Where("id = ?", task.ID).Updates(updates).Error; err != nil {
 		s.logger.Warn("update run timestamps failed", slog.String("task_id", req.TaskId), slog.String("error", err.Error()))
@@ -262,9 +530,31 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) {
 
 	s.logger.Info("task run completed",
 		slog.Uint64("task_id", uint64(task.ID)),
+		slog.String("result", status),
 		slog.Int("items", len(resp.Items)),
 		slog.String("duration", time.Since(start).String()),
 	)
+}
+
+func (s *Scheduler) setTaskCrawlStatus(ctx context.Context, taskID uint, status, message string) {
+	if status == "" {
+		return
+	}
+	key := "task:crawl_status:" + intToString(taskID)
+	msgKey := "task:crawl_message:" + intToString(taskID)
+	ttl := 24 * time.Hour
+	if err := s.rdb.Set(ctx, key, status, ttl).Err(); err != nil {
+		s.logger.Warn("set crawl status failed", slog.String("task_id", intToString(taskID)), slog.String("error", err.Error()))
+	}
+	if message != "" {
+		if err := s.rdb.Set(ctx, msgKey, message, ttl).Err(); err != nil {
+			s.logger.Warn("set crawl message failed", slog.String("task_id", intToString(taskID)), slog.String("error", err.Error()))
+		}
+	} else {
+		if err := s.rdb.Del(ctx, msgKey).Err(); err != nil && err != redis.Nil {
+			s.logger.Warn("delete crawl message failed", slog.String("task_id", intToString(taskID)), slog.String("error", err.Error()))
+		}
+	}
 }
 
 // processItems 处理抓取到的商品列表（核心去重与优化逻辑）。

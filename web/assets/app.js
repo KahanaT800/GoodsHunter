@@ -5,11 +5,13 @@
         setup() {
           const tasks = ref([])
           const items = ref([]) // 商品目录
+          const timelineStatus = ref('')
+          const timelineMessage = ref('')
           const selectedTaskId = ref(null)
           const token = ref(localStorage.getItem('token') || '')
           const userEmail = ref(localStorage.getItem('user_email') || '')
           const userRole = ref(localStorage.getItem('user_role') || '')
-          const loading = ref({ create: false, toggle: false, delete: false, auth: false })
+          const loading = ref({ create: false, toggle: false, delete: false, edit: false, auth: false })
           const authForm = ref({ email: '', password: '', invite_code: '' })
           const authTab = ref('login')
           const showAuth = ref(false)
@@ -31,6 +33,8 @@
             sort: 'created_time|desc',
             platform: 1,
           })
+          const editingTaskId = ref(null)
+          const editForm = ref({ min_price: 0, max_price: 0 })
           const fallbackImage = 'https://via.placeholder.com/300x180.png?text=GoodsHunter'
 
           const apiUrl = (path) => `${apiBase}${path}`
@@ -267,8 +271,8 @@
               showToast('演示模式无权操作', 'error')
               return
             }
-            if (tasks.value.length >= 3) {
-              showToast('每个账号最多只能创建 3 个任务', 'error')
+            if (tasks.value.length >= maxTasksPerUser.value) {
+              showToast(`每个账号最多只能创建 ${maxTasksPerUser.value} 个任务`, 'error')
               return
             }
             loading.value.create = true
@@ -292,6 +296,62 @@
               showToast(e.message, 'error')
             } finally {
               loading.value.create = false
+            }
+          }
+
+          const startEditTask = (task) => {
+            console.log('startEditTask called', task.id)
+            if (isGuest.value) {
+              showToast('演示模式无权操作', 'error')
+              return
+            }
+            editingTaskId.value = task.id
+            editForm.value = {
+              min_price: Number(task.min_price || 0),
+              max_price: Number(task.max_price || 0),
+            }
+          }
+
+          const cancelEditTask = () => {
+            editingTaskId.value = null
+          }
+
+          const saveEditTask = async (task) => {
+            console.log('saveEditTask', task.id, editForm.value)
+            if (isGuest.value) {
+              showToast('演示模式无权操作', 'error')
+              return
+            }
+            const minPrice = Number(editForm.value.min_price || 0)
+            const maxPrice = Number(editForm.value.max_price || 0)
+            if (minPrice < 0 || maxPrice < 0) {
+              showToast('价格不能为负数', 'error')
+              return
+            }
+            if (minPrice && maxPrice && minPrice > maxPrice) {
+              showToast('最低价不能大于最高价', 'error')
+              return
+            }
+            loading.value.edit = true
+            try {
+              const payload = {
+                min_price: minPrice,
+                max_price: maxPrice,
+              }
+              const res = await fetch(apiUrl(`/tasks/${task.id}`), {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify(payload),
+              })
+              if (!res.ok) throw new Error('更新任务失败')
+              task.min_price = minPrice
+              task.max_price = maxPrice
+              editingTaskId.value = null
+              showToast('任务已更新')
+            } catch (e) {
+              showToast(e.message, 'error')
+            } finally {
+              loading.value.edit = false
             }
           }
 
@@ -356,10 +416,14 @@
           const fetchTimeline = async () => {
             if (!token.value) {
               items.value = []
+              timelineStatus.value = ''
+              timelineMessage.value = ''
               return
             }
             if (!selectedTaskId.value) {
               items.value = []
+              timelineStatus.value = ''
+              timelineMessage.value = ''
               return
             }
             try {
@@ -373,6 +437,8 @@
                 const data = await res.json()
                 const incoming = data.items || []
                 items.value = incoming
+                timelineStatus.value = data.status || ''
+                timelineMessage.value = data.message || ''
 
                 // 检测新商品并弹窗提醒 (对所有用户生效)
                 const fresh = incoming.find((item) => {
@@ -393,6 +459,8 @@
               }
             } catch (e) {
               console.error(e)
+              timelineStatus.value = 'failed'
+              timelineMessage.value = 'load timeline failed'
             }
           }
 
@@ -438,7 +506,11 @@
           return {
             tasks,
             items,
+            timelineStatus,
+            timelineMessage,
             form,
+            editingTaskId,
+            editForm,
             loading,
             selectedTaskId,
             maxTasksPerUser,
@@ -456,6 +528,9 @@
             toast,
             notifyToast,
             createTask,
+            startEditTask,
+            cancelEditTask,
+            saveEditTask,
             toggleTask,
             deleteTask,
             selectTask,
