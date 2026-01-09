@@ -150,13 +150,7 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 //
 //	error: 服务器运行出错时返回
 func (s *Server) Run() error {
-	// 在后台启动调度器（主消费者）
-	go s.sched.Run(context.Background())
-
-	// 如果启用了 Redis Streams，启动周期发布器
-	if s.cfg.App.EnableRedisQueue {
-		go s.sched.RunPeriodicPublisher(context.Background())
-	}
+	s.StartScheduler(context.Background())
 
 	s.logger.Info("api server listening", slog.String("addr", s.cfg.App.HTTPAddr))
 	return s.router.Run(s.cfg.App.HTTPAddr)
@@ -170,6 +164,10 @@ func (s *Server) Router() http.Handler {
 // StartScheduler 启动调度器。
 func (s *Server) StartScheduler(ctx context.Context) {
 	go s.sched.Run(ctx)
+	if s.cfg.App.EnableRedisQueue {
+		s.logger.Info("starting periodic publisher for redis queue")
+		go s.sched.RunPeriodicPublisher(ctx)
+	}
 }
 
 // Close 关闭数据库与缓存连接。
