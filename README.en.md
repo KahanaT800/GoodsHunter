@@ -25,7 +25,7 @@ GoodsHunter is a **high-performance web crawler** system designed to monitor e-c
 - **Horizontally Scalable**: Architecture supports expansion to distributed deployment (multi-instance + load balancing)
 - **Task Scheduling System**: Automated polling with configurable intervals and deduplication
 - **Real-time Notifications**: Email alerts for new items and price changes
-- **Stateful Caching**: Redis-based incremental crawling to minimize redundant requests
+- **Stateful Cache + Distributed Queue**: Redis dedup state + Redis Streams task queue
 - **Production Deployment**: Fully automated CI/CD pipeline with Docker, HTTPS, and cloud hosting
 
 Built from scratch to demonstrate **production-ready full-stack backend capabilities**. The architecture is designed with future distributed scaling in mind.
@@ -41,7 +41,7 @@ graph TB
     
     API -->|gRPC| Crawler[Crawler Service<br/>Port 50051]
     API -->|Read/Write| MySQL[(MySQL 8.0<br/>Users, Tasks, Items)]
-    API -->|Cache| Redis[(Redis 7<br/>Dedup State)]
+    API -->|Cache/Queue| Redis[(Redis 7<br/>Dedup + Streams)]
     
     Crawler -->|Cache Check| Redis
     Crawler -->|Headless Browser| Target[Target Websites<br/>Mercari]
@@ -65,7 +65,7 @@ graph TB
 | **API Server** | Go + Gin Framework | User authentication (JWT), RESTful API, task scheduling |
 | **Crawler Service** | Go + Rod | Headless browser automation, HTML parsing, gRPC server |
 | **Database** | MySQL 8.0 | Persistent storage for users, tasks, and crawled items |
-| **Cache Layer** | Redis 7 | Deduplication tracking, price change detection |
+| **Cache Layer** | Redis 7 | Dedup tracking, price change detection, task queue |
 | **Gateway** | Nginx + Let's Encrypt | HTTPS termination, static file serving, reverse proxy |
 | **CI/CD** | GitHub Actions | Automated testing, Docker image builds, EC2 deployment |
 
@@ -80,6 +80,7 @@ graph TB
 
 ### Intelligent Deduplication
 - **Redis-based fingerprinting**: Tracks seen items to avoid duplicate notifications
+- **Redis Streams queue**: Distributed scheduling with multi-instance consumers
 - **Price change detection**: Alerts users when monitored items drop in price
 - **Incremental crawling**: Only fetches new data since last run
 
@@ -113,8 +114,8 @@ graph TB
 
 ### **Data Layer**
 - **Primary Database**: MySQL 8.0 (relational data with ACID guarantees)
-- **Cache Store**: Redis 7 (high-speed key-value store for dedup logic)
-- **Message Queue**: Custom in-memory queue (for crawler task distribution)
+- **Cache Store**: Redis 7 (dedup, state, and queues)
+- **Message Queue**: Redis Streams + in-memory queue (switchable)
 
 ### **DevOps**
 - **Version Control**: Git + GitHub
@@ -196,7 +197,7 @@ GoodsHunter/
 │   ├── ci.yml              # Linting and testing
 │   └── deploy.yml          # Automated deployment
 ├── docker-compose.yml       # Local development orchestration
-└── init-letsencrypt.sh     # HTTPS certificate automation script
+└── scripts/init-letsencrypt.sh     # HTTPS certificate automation script
 ```
 
 ---
