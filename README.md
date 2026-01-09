@@ -13,7 +13,14 @@
 
 ## 应用预览
 
+**访客界面**
 ![GoodsHunter 访客界面](image/guestpage.png)
+
+**系统监控仪表盘**
+![系统监控仪表盘](image/grafana_sys.png)
+
+**爬虫监控仪表盘**
+![爬虫监控仪表盘](image/grafana_crawler.png)
 
 ---
 
@@ -80,7 +87,7 @@ graph TB
 
 ### 智能去重
 - **基于 Redis 的指纹识别**: 追踪已见商品，避免重复通知
-- **Redis Streams 队列**: 支持分布式调度与多实例消费
+- **Redis Streams 队列**: 支持分布式调度与多实例消费（可开关）
 - **价格变动检测**: 监控商品降价时自动提醒用户
 - **增量爬取**: 仅抓取上次运行后的新增数据
 
@@ -99,7 +106,7 @@ graph TB
 ## 技术栈
 
 ### **后端**
-- **语言**: Go 1.25（选择原因：强大的并发原语和高性能）
+- **语言**: Go 1.24（选择原因：强大的并发原语和高性能）
 - **Web 框架**: Gin（高性能 HTTP 框架，丰富的中间件生态）
 - **RPC**: gRPC + Protocol Buffers（用于服务间通信）
 - **ORM**: GORM（数据库抽象层，支持迁移）
@@ -122,6 +129,32 @@ graph TB
 - **容器镜像仓库**: GitHub Container Registry (GHCR)
 - **监控**: Docker 健康检查 + 结构化日志（slog）+ Grafana Cloud（日志与指标）
 - **配置管理**: 基于环境变量的配置（12-factor 应用方法论）
+
+---
+
+## 监控与可观测性
+
+### 指标端点
+- **API**: `http://<host>:8080/metrics`
+- **Crawler**: `http://<host>:2112/metrics`（可通过 `CRAWLER_METRICS_ADDR` 覆盖）
+
+### Grafana Cloud（可选）
+```bash
+docker compose --profile monitoring-cloud up -d alloy
+```
+
+---
+
+## Redis Streams 模式（可选）
+
+默认使用数据库轮询调度任务；启用 Redis Streams 后，任务会通过队列分发，实现更低延迟与多实例水平扩展。
+
+启用方式（`.env`）：
+```bash
+APP_ENABLE_REDIS_QUEUE=true
+APP_TASK_QUEUE_STREAM=goodshunter:task:queue
+APP_TASK_QUEUE_GROUP=scheduler_group
+```
 
 ---
 
@@ -155,6 +188,8 @@ docker compose up -d
 ### **4. 访问应用**
 - **Web 界面**: http://localhost
 - **API 健康检查**: http://localhost/healthz
+- **API 指标**: http://localhost/metrics
+- **Crawler 指标**: http://localhost:2112/metrics
 
 ### **5. 注册和登录**
 ```bash
