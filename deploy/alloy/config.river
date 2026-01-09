@@ -68,6 +68,7 @@ loki.write "grafana_cloud" {
 }
 
 loki.source.docker "containers" {
+  host = "unix:///var/run/docker.sock"
   targets = discovery.docker.containers.targets
   forward_to = [loki.write.grafana_cloud.receiver]
 }
