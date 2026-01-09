@@ -104,6 +104,8 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		cfg.App.WorkerPoolSize,   // Worker Pool 大小
 		cfg.App.QueueCapacity,    // 队列容量
 		cfg.App.EnableRedisQueue, // 是否启用 Redis Streams
+		cfg.App.TaskQueueStream,
+		cfg.App.TaskQueueGroup,
 	)
 
 	// 初始化任务生产者（如果启用 Redis Streams）

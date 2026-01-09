@@ -81,6 +81,24 @@ var (
 		Name: "goodshunter_active_tasks",
 		Help: "Number of tasks currently being processed",
 	})
+
+	// TaskRetryTotal 任务重试总数
+	TaskRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "goodshunter_task_retry_total",
+		Help: "Total number of task retries",
+	}, []string{"reason"})
+
+	// TaskDLQTotal 死信任务总数
+	TaskDLQTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_dlq_total",
+		Help: "Total number of tasks moved to dead-letter queue",
+	})
+
+	// TaskAutoClaimTotal 自动回收的 Pending 消息总数
+	TaskAutoClaimTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_autoclaim_total",
+		Help: "Total number of pending messages auto-claimed",
+	})
 )
 
 // HTTP API 相关指标

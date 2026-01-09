@@ -31,6 +31,7 @@ err := producer.SubmitTask(ctx, taskID, "user_create")
 consumer, err := taskqueue.NewConsumer(
     redisClient, 
     logger, 
+    "goodshunter:task:queue",
     "scheduler_group",
     "consumer-1",
 )
@@ -41,7 +42,7 @@ for _, msg := range messages {
     // Process task
     handleTask(msg.Message.TaskID)
     
-    // Acknowledge
+    // Acknowledge after successful processing
     consumer.Ack(ctx, msg.ID)
 }
 ```

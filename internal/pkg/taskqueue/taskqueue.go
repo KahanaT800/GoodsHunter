@@ -53,20 +53,22 @@ func (q *TaskQueue) Publish(ctx context.Context, msg *TaskMessage) error {
 		return fmt.Errorf("message is nil")
 	}
 
-	// 序列化消息为 JSON
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
 
-	// 发布到 Redis Streams
+	return q.publishRaw(ctx, q.streamName, map[string]interface{}{
+		"data": string(data),
+	})
+}
+
+func (q *TaskQueue) publishRaw(ctx context.Context, stream string, values map[string]interface{}) error {
 	args := &redis.XAddArgs{
-		Stream: q.streamName,
-		MaxLen: 10000,
-		Approx: true,
-		Values: map[string]interface{}{
-			"data": string(data),
-		},
+		Stream: stream,
+		MaxLen: 100000,
+		Approx: false,
+		Values: values,
 	}
 
 	msgID, err := q.rdb.XAdd(ctx, args).Result()
@@ -75,11 +77,9 @@ func (q *TaskQueue) Publish(ctx context.Context, msg *TaskMessage) error {
 	}
 
 	q.logger.Debug("task message published",
-		slog.String("stream", q.streamName),
+		slog.String("stream", stream),
 		slog.String("msg_id", msgID),
-		slog.Uint64("task_id", uint64(msg.TaskID)),
-		slog.String("action", msg.Action),
-		slog.String("source", msg.Source))
+		slog.Any("fields", values))
 
 	return nil
 }
