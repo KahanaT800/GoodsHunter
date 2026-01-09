@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   mysql:
     image: mysql:8.0
@@ -73,6 +71,9 @@ services:
       APP_QUEUE_CAPACITY: ${APP_QUEUE_CAPACITY:-1000}
       APP_GUEST_IDLE_TIMEOUT: ${APP_GUEST_IDLE_TIMEOUT:-10m}
       APP_GUEST_HEARTBEAT: ${APP_GUEST_HEARTBEAT:-5m}
+      APP_ENABLE_REDIS_QUEUE: ${APP_ENABLE_REDIS_QUEUE:-false}
+      APP_TASK_QUEUE_STREAM: ${APP_TASK_QUEUE_STREAM:-goodshunter:task:queue}
+      APP_TASK_QUEUE_GROUP: ${APP_TASK_QUEUE_GROUP:-scheduler_group}
       DB_HOST: ${DB_HOST:-mysql}
       DB_PORT: ${DB_PORT:-3306}
       DB_USER: ${DB_USER:-root}
@@ -125,10 +126,95 @@ services:
   certbot:
     image: certbot/certbot
     restart: unless-stopped
+    profiles: ["ssl"]  # 仅在需要 Let's Encrypt SSL 时启用
     volumes:
       - ./certbot/conf:/etc/letsencrypt
       - ./certbot/www:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    restart: always
+    profiles: ["monitoring-cloud"]  # Grafana Cloud 采集
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-goodshunter_redis}
+    networks:
+      - goodshunter-net
+  
+  mysql-exporter:
+    image: prom/mysqld-exporter:v0.15.1  # 固定版本，避免 breaking changes
+    restart: always
+    profiles: ["monitoring-cloud"]  # Grafana Cloud 采集
+    command:
+      - '--mysqld.username=exporter'
+      - '--mysqld.address=mysql:3306'
+    environment:
+      - MYSQLD_EXPORTER_PASSWORD=${MYSQL_EXPORTER_PASSWORD:-exporter_password_123}
+    networks:
+      - goodshunter-net
+
+  # ============================================
+  # Grafana Cloud Monitoring (轻量化)
+  #
+  # 使用 Grafana Alloy 采集指标/日志并推送到 Grafana Cloud
+  # ============================================
+  alloy:
+    image: grafana/alloy:latest
+    restart: always
+    profiles: ["monitoring-cloud"]
+    command:
+      - run
+      - /etc/alloy/config.river
+    environment:
+      - GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL=${GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL}
+      - GRAFANA_CLOUD_PROM_USERNAME=${GRAFANA_CLOUD_PROM_USERNAME}
+      - GRAFANA_CLOUD_PROM_API_KEY=${GRAFANA_CLOUD_PROM_API_KEY}
+      - GRAFANA_CLOUD_LOKI_URL=${GRAFANA_CLOUD_LOKI_URL}
+      - GRAFANA_CLOUD_LOKI_USERNAME=${GRAFANA_CLOUD_LOKI_USERNAME}
+      - GRAFANA_CLOUD_LOKI_API_KEY=${GRAFANA_CLOUD_LOKI_API_KEY}
+    volumes:
+      - ./deploy/alloy/config.river:/etc/alloy/config.river:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    depends_on:
+      - api
+      - redis-exporter
+      - mysql-exporter
+      - cadvisor
+      - node-exporter
+    networks:
+      - goodshunter-net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: always
+    profiles: ["monitoring-cloud"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - goodshunter-net
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    restart: always
+    profiles: ["monitoring-cloud"]
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/host/root'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    networks:
+      - goodshunter-net
 
 volumes:
   mysql_data:
