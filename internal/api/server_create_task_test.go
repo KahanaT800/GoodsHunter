@@ -53,13 +53,21 @@ func (m *mockScheduler) StartTask(ctx context.Context, task *model.Task) {
 }
 
 type mockDeduper struct {
-	dupFunc func(ctx context.Context, url string) (bool, error)
-	calls   int
+	dupFunc    func(ctx context.Context, url string) (bool, error)
+	deleteFunc func(ctx context.Context, url string) error
+	calls      int
 }
 
 func (m *mockDeduper) IsDuplicate(ctx context.Context, url string) (bool, error) {
 	m.calls++
 	return m.dupFunc(ctx, url)
+}
+
+func (m *mockDeduper) Delete(ctx context.Context, url string) error {
+	if m.deleteFunc != nil {
+		return m.deleteFunc(ctx, url)
+	}
+	return nil
 }
 
 func TestCreateTask_Normal(t *testing.T) {

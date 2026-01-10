@@ -39,6 +39,17 @@ func (d *Deduplicator) IsDuplicate(ctx context.Context, url string) (bool, error
 	return !ok, nil
 }
 
+func (d *Deduplicator) Delete(ctx context.Context, url string) error {
+	if d == nil || d.rdb == nil || url == "" {
+		return nil
+	}
+	key := keyPrefix + hashURL(url)
+	if err := d.rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("dedup del: %w", err)
+	}
+	return nil
+}
+
 func hashURL(url string) string {
 	sum := sha256.Sum256([]byte(url))
 	return hex.EncodeToString(sum[:])
