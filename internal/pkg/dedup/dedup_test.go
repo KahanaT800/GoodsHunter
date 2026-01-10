@@ -17,7 +17,11 @@ func TestDeduplicator_IsDuplicate(t *testing.T) {
 	defer s.Close()
 
 	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
-	defer rdb.Close()
+	t.Cleanup(func() {
+		if err := rdb.Close(); err != nil {
+			t.Fatalf("close redis: %v", err)
+		}
+	})
 
 	d := NewDeduplicator(rdb, time.Minute)
 	ctx := context.Background()
