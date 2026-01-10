@@ -685,20 +685,34 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 //	error: 解析失败返回错误
 func parsePrice(txt string) (int64, error) {
 	cleaned := strings.ReplaceAll(txt, "¥", "")
+	cleaned = strings.ReplaceAll(cleaned, "￥", "")
 	cleaned = strings.ReplaceAll(cleaned, ",", "")
 	cleaned = strings.TrimSpace(cleaned)
 	if cleaned == "" {
 		return 0, fmt.Errorf("empty price")
 	}
-	match := priceRe.FindString(cleaned)
-	if match == "" {
+	matches := priceRe.FindAllString(cleaned, -1)
+	if len(matches) == 0 {
 		return 0, fmt.Errorf("no digits")
 	}
-	val, err := strconv.ParseInt(match, 10, 64)
-	if err != nil {
-		return 0, err
+	var bestVal int64
+	bestLen := 0
+	found := false
+	for _, match := range matches {
+		val, err := strconv.ParseInt(match, 10, 64)
+		if err != nil {
+			continue
+		}
+		if !found || len(match) > bestLen || (len(match) == bestLen && val > bestVal) {
+			bestVal = val
+			bestLen = len(match)
+			found = true
+		}
 	}
-	return val, nil
+	if !found {
+		return 0, fmt.Errorf("no valid digits")
+	}
+	return bestVal, nil
 }
 
 // normalizeMercariURL 将相对或协议省略的链接补全为完整的 Mercari URL。

@@ -19,6 +19,16 @@ func TestParsePrice(t *testing.T) {
 	}
 }
 
+func TestParsePriceWithExtraNumbers(t *testing.T) {
+	val, err := parsePrice("6% OFF ¥950")
+	if err != nil {
+		t.Fatalf("parse price: %v", err)
+	}
+	if val != 950 {
+		t.Fatalf("expected 950, got %d", val)
+	}
+}
+
 func TestBlockedText(t *testing.T) {
 	html := "<html><body><h1>Attention Required!</h1><p>Cloudflare</p></body></html>"
 	if !isBlockedText(html) {
