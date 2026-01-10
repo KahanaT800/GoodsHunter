@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	KeyTaskQueue   = "goodshunter:queue:tasks"
-	KeyResultQueue = "goodshunter:queue:results"
+	KeyTaskQueue           = "goodshunter:queue:tasks"
+	KeyTaskProcessingQueue = "goodshunter:queue:tasks:processing"
+	KeyResultQueue         = "goodshunter:queue:results"
 )
 
 var (
@@ -71,19 +72,16 @@ func (c *Client) PopTask(ctx context.Context, timeout time.Duration) (*pb.FetchR
 	if c == nil || c.rdb == nil {
 		return nil, errors.New("redis client is not initialized")
 	}
-	result, err := c.rdb.BRPop(ctx, timeout, KeyTaskQueue).Result()
-	if err == redis.Nil {
+	result, err := c.rdb.BRPopLPush(ctx, KeyTaskQueue, KeyTaskProcessingQueue, timeout).Result()
+	if errors.Is(err, redis.Nil) {
 		return nil, ErrNoTask
 	}
 	if err != nil {
-		return nil, fmt.Errorf("brpop task: %w", err)
-	}
-	if len(result) < 2 {
-		return nil, fmt.Errorf("invalid brpop response: %v", result)
+		return nil, fmt.Errorf("brpoplpush task: %w", err)
 	}
 
 	var req pb.FetchRequest
-	if err := protojson.Unmarshal([]byte(result[1]), &req); err != nil {
+	if err := protojson.Unmarshal([]byte(result), &req); err != nil {
 		return nil, fmt.Errorf("unmarshal task: %w", err)
 	}
 	metrics.CrawlerTaskThroughput.WithLabelValues("out", "popped").Inc()
@@ -114,7 +112,7 @@ func (c *Client) PopResult(ctx context.Context, timeout time.Duration) (*pb.Fetc
 		return nil, errors.New("redis client is not initialized")
 	}
 	result, err := c.rdb.BRPop(ctx, timeout, KeyResultQueue).Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return nil, ErrNoResult
 	}
 	if err != nil {
@@ -131,6 +129,24 @@ func (c *Client) PopResult(ctx context.Context, timeout time.Duration) (*pb.Fetc
 	return &resp, nil
 }
 
+// AckTask removes a processed task from the processing queue.
+func (c *Client) AckTask(ctx context.Context, task *pb.FetchRequest) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	if c == nil || c.rdb == nil {
+		return errors.New("redis client is not initialized")
+	}
+	data, err := protojson.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("marshal task: %w", err)
+	}
+	if err := c.rdb.LRem(ctx, KeyTaskProcessingQueue, 1, string(data)).Err(); err != nil {
+		return fmt.Errorf("ack task failed: %w", err)
+	}
+	return nil
+}
+
 // QueueDepth returns the current length of task and result queues.
 func (c *Client) QueueDepth(ctx context.Context) (int64, int64, error) {
 	if c == nil || c.rdb == nil {
@@ -145,4 +161,44 @@ func (c *Client) QueueDepth(ctx context.Context) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("llen results: %w", err)
 	}
 	return tasks, results, nil
+}
+
+// RescueStuckTasks scans processing queue and requeues tasks that exceed timeout.
+func (c *Client) RescueStuckTasks(ctx context.Context, timeout time.Duration) (int, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client is not initialized")
+	}
+	tasksRaw, err := c.rdb.LRange(ctx, KeyTaskProcessingQueue, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("lrange processing: %w", err)
+	}
+	if len(tasksRaw) == 0 {
+		return 0, nil
+	}
+
+	now := time.Now().Unix()
+	threshold := int64(timeout.Seconds())
+	rescued := 0
+
+	for _, raw := range tasksRaw {
+		var task pb.FetchRequest
+		if err := protojson.Unmarshal([]byte(raw), &task); err != nil {
+			continue
+		}
+		if task.GetCreatedAt() == 0 {
+			continue
+		}
+		if now-task.GetCreatedAt() <= threshold {
+			continue
+		}
+
+		pipe := c.rdb.TxPipeline()
+		pipe.LRem(ctx, KeyTaskProcessingQueue, 1, raw)
+		pipe.LPush(ctx, KeyTaskQueue, raw)
+		if _, execErr := pipe.Exec(ctx); execErr == nil {
+			rescued++
+		}
+	}
+
+	return rescued, nil
 }

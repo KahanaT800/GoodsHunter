@@ -19,7 +19,18 @@ services:
   redis:
     image: redis:7
     restart: always
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-goodshunter_redis}"]
+    command:
+      [
+        "redis-server",
+        "--bind",
+        "0.0.0.0",
+        "--protected-mode",
+        "no",
+        "--requirepass",
+        "${REDIS_PASSWORD:-goodshunter_redis}"
+      ]
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -44,6 +55,7 @@ services:
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
+      WORKER_ID: ${WORKER_ID:-master-01}
       PROXY_COOLDOWN: ${PROXY_COOLDOWN:-10m}
       MAX_TASKS: ${MAX_TASKS:-500}
       FORCE_PROXY_ONCE: ${FORCE_PROXY_ONCE:-false}
@@ -68,6 +80,8 @@ services:
       retries: 5
     expose:
       - "2112"
+    tmpfs:
+      - /tmp/rod:size=256m,uid=1000,gid=1000,mode=1777
     networks:
       - goodshunter-net
 
@@ -194,6 +208,8 @@ services:
       - GRAFANA_CLOUD_LOKI_URL=${GRAFANA_CLOUD_LOKI_URL}
       - GRAFANA_CLOUD_LOKI_USERNAME=${GRAFANA_CLOUD_LOKI_USERNAME}
       - GRAFANA_CLOUD_LOKI_API_KEY=${GRAFANA_CLOUD_LOKI_API_KEY}
+      - HOSTNAME=${HOSTNAME}
+      - WORKER_ID=${WORKER_ID}
     volumes:
       - ./deploy/alloy/config.river:/etc/alloy/config.river:ro
       - /var/run/docker.sock:/var/run/docker.sock

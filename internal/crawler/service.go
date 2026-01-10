@@ -33,27 +33,34 @@ var (
 	priceWithCurrencyRe = regexp.MustCompile(`[¥￥]\s*([0-9][0-9,]*)`)
 )
 
+const (
+	rateLimitKey     = "goodshunter:ratelimit:global"
+	proxyCooldownKey = "goodshunter:proxy:cooldown"
+	proxyCacheTTL    = 5 * time.Second
+)
+
 // Service 负责浏览器调度与页面解析。
 //
 // 它维护了一个 rod.Browser 实例，并使用 worker pool 控制并发抓取数量。
 type Service struct {
-	browser        *rod.Browser
-	queue          *queue.Queue // Worker Pool 用于控制并发
-	rdb            *redis.Client
-	rateLimiter    *ratelimit.RateLimiter
-	logger         *slog.Logger
-	defaultUA      string
-	pageTimeout    time.Duration
-	maxFetchCount  int
-	cfg            *config.Config
-	proxyUntil     time.Time
-	currentIsProxy bool
-	mu             sync.RWMutex
-	forceProxyOnce uint32
-	taskCounter    atomic.Uint64
-	maxTasks       uint64
-	restartCh      chan struct{}
-	redisQueue     *redisqueue.Client
+	browser         *rod.Browser
+	queue           *queue.Queue // Worker Pool 用于控制并发
+	rdb             *redis.Client
+	rateLimiter     *ratelimit.RateLimiter
+	logger          *slog.Logger
+	defaultUA       string
+	pageTimeout     time.Duration
+	maxFetchCount   int
+	cfg             *config.Config
+	currentIsProxy  bool
+	proxyCache      bool
+	proxyCacheUntil time.Time
+	mu              sync.RWMutex
+	forceProxyOnce  uint32
+	taskCounter     atomic.Uint64
+	maxTasks        uint64
+	restartCh       chan struct{}
+	redisQueue      *redisqueue.Client
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -75,17 +82,17 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 	}
 	metrics.CrawlerBrowserInstances.Inc()
 
-	var rdb *redis.Client
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+	})
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("connect redis: %w", err)
+	}
+
 	var limiter *ratelimit.RateLimiter
 	if cfg.App.RateLimit > 0 && cfg.App.RateBurst > 0 {
-		rdb = redis.NewClient(&redis.Options{
-			Addr:     cfg.Redis.Addr,
-			Password: cfg.Redis.Password,
-		})
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			return nil, fmt.Errorf("connect redis for rate limit: %w", err)
-		}
-		limiter = ratelimit.NewRedisRateLimiter(rdb, logger, "goodshunter:ratelimit:crawler", cfg.App.RateLimit, cfg.App.RateBurst)
+		limiter = ratelimit.NewRedisRateLimiter(rdb)
 		logger.Info("rate limiter enabled",
 			slog.Float64("rate", cfg.App.RateLimit),
 			slog.Float64("burst", cfg.App.RateBurst))
@@ -121,6 +128,11 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		maxTasks = uint64(cfg.App.MaxTasks)
 	}
 
+	pageTimeout := cfg.Browser.PageTimeout
+	if pageTimeout <= 0 {
+		pageTimeout = 60 * time.Second
+	}
+
 	service := &Service{
 		browser:        browser,
 		queue:          q,
@@ -128,7 +140,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		rateLimiter:    limiter,
 		logger:         logger,
 		defaultUA:      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-		pageTimeout:    60 * time.Second,
+		pageTimeout:    pageTimeout,
 		maxFetchCount:  cfg.Browser.MaxFetchCount,
 		cfg:            cfg,
 		currentIsProxy: false,
@@ -152,9 +164,14 @@ func (s *Service) StartWorker(ctx context.Context) error {
 		return errors.New("redis queue client is not initialized")
 	}
 
-	concurrencyLimit := s.queue.Cap() + 10       // 并发任务数设置略高于 Worker Pool 容量
-	sem := make(chan struct{}, concurrencyLimit) // 信号量通道
-	s.logger.Info("crawler worker started", slog.Int("concurrency_limit", concurrencyLimit))
+	concurrencyLimit := s.cfg.Browser.MaxConcurrency + 2 // 限制拉取速率，避免内存队列阻塞
+	if concurrencyLimit < 1 {
+		concurrencyLimit = 1
+	}
+	sem := make(chan struct{}, concurrencyLimit)
+	s.logger.Info("crawler worker started",
+		slog.Int("concurrency_limit", concurrencyLimit),
+		slog.Int("browser_max_concurrency", s.cfg.Browser.MaxConcurrency))
 
 	for {
 		// 1. 在拉取任务前先申请令牌，如果处理不过来，就暂停拉取 Redis
@@ -217,6 +234,16 @@ func (s *Service) StartWorker(ctx context.Context) error {
 					s.logger.Error("push redis result failed", slog.String("error", pushErr.Error()))
 				}
 			}
+
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ackCancel()
+			if ackErr := s.redisQueue.AckTask(ackCtx, t); ackErr != nil {
+				s.logger.Error("failed to ack task",
+					slog.String("task_id", t.GetTaskId()),
+					slog.String("error", ackErr.Error()))
+			} else {
+				s.logger.Debug("task acked", slog.String("task_id", t.GetTaskId()))
+			}
 		}(task)
 	}
 }
@@ -257,7 +284,12 @@ func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.
 		Set("disable-gpu", "true").
 		// 禁用软件光栅化器，进一步减少计算开销
 		Set("disable-software-rasterizer", "true").
-		Set("remote-allow-origins", "*")
+		Set("remote-allow-origins", "*").
+		// 缓存与内存优化，减少磁盘写入压力
+		Set("disk-cache-size", "1").
+		Set("media-cache-size", "1").
+		Set("disable-application-cache", "true").
+		Set("js-flags", "--max_old_space_size=512")
 
 	var proxyServer string
 	var proxyUser string
@@ -314,9 +346,12 @@ func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.
 	return browser, nil
 }
 
-func (s *Service) ensureBrowserState() error {
+func (s *Service) ensureBrowserState(ctx context.Context) error {
+	shouldUseProxy, err := s.getProxyState(ctx)
+	if err != nil {
+		return err
+	}
 	s.mu.RLock()
-	shouldUseProxy := time.Now().Before(s.proxyUntil)
 	currentIsProxy := s.currentIsProxy
 	s.mu.RUnlock()
 
@@ -327,7 +362,10 @@ func (s *Service) ensureBrowserState() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	shouldUseProxy = time.Now().Before(s.proxyUntil)
+	shouldUseProxy, err = s.getProxyState(ctx)
+	if err != nil {
+		return err
+	}
 	if shouldUseProxy == s.currentIsProxy {
 		return nil
 	}
@@ -347,6 +385,25 @@ func (s *Service) ensureBrowserState() error {
 	}
 	s.logger.Info("crawler mode switched", slog.String("mode", mode))
 	return nil
+}
+
+func (s *Service) logPageTimeout(phase string, taskID string, url string, page *rod.Page, err error) {
+	readyState := "unknown"
+	if page != nil {
+		if v, evalErr := page.Eval("document.readyState"); evalErr == nil {
+			if state := v.Value.String(); state != "" {
+				readyState = state
+			}
+		}
+	}
+
+	s.logger.Warn("page timeout",
+		slog.String("phase", phase),
+		slog.String("task_id", taskID),
+		slog.String("url", url),
+		slog.Duration("timeout", s.pageTimeout),
+		slog.String("ready_state", readyState),
+		slog.String("error", err.Error()))
 }
 
 // rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
@@ -371,13 +428,49 @@ func (s *Service) isUsingProxy() bool {
 	return s.currentIsProxy
 }
 
-func (s *Service) activateProxyCooldown() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	until := time.Now().Add(s.cfg.App.ProxyCooldown)
-	if until.After(s.proxyUntil) {
-		s.proxyUntil = until
+func (s *Service) getProxyState(ctx context.Context) (bool, error) {
+	now := time.Now()
+	s.mu.RLock()
+	if now.Before(s.proxyCacheUntil) {
+		state := s.proxyCache
+		s.mu.RUnlock()
+		return state, nil
 	}
+	s.mu.RUnlock()
+
+	if s.rdb == nil {
+		return false, nil
+	}
+	exists, err := s.rdb.Exists(ctx, proxyCooldownKey).Result()
+	if err != nil {
+		return false, fmt.Errorf("get proxy cooldown: %w", err)
+	}
+	state := exists > 0
+
+	s.mu.Lock()
+	s.proxyCache = state
+	s.proxyCacheUntil = now.Add(proxyCacheTTL)
+	s.mu.Unlock()
+
+	return state, nil
+}
+
+func (s *Service) setProxyCooldown(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		duration = s.cfg.App.ProxyCooldown
+	}
+	if s.rdb == nil {
+		return errors.New("redis client is not initialized")
+	}
+	if err := s.rdb.Set(ctx, proxyCooldownKey, "1", duration).Err(); err != nil {
+		return fmt.Errorf("set proxy cooldown: %w", err)
+	}
+
+	s.mu.Lock()
+	s.proxyCache = true
+	s.proxyCacheUntil = time.Now().Add(proxyCacheTTL)
+	s.mu.Unlock()
+	return nil
 }
 
 func boolToGauge(v bool) float64 {
@@ -506,7 +599,7 @@ type fetchResult struct {
 }
 
 func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
-	if err := s.ensureBrowserState(); err != nil {
+	if err := s.ensureBrowserState(ctx); err != nil {
 		return nil, err
 	}
 
@@ -514,7 +607,9 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 		s.logger.Warn("direct connection failed, activating proxy",
 			slog.String("reason", "forced"),
 			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
-		s.activateProxyCooldown()
+		if err := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); err != nil {
+			return nil, err
+		}
 		return s.doCrawl(ctx, req, attempt+1)
 	}
 
@@ -526,7 +621,9 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 	if attempt == 0 && !s.isUsingProxy() && shouldActivateProxy(err) {
 		s.logger.Warn("direct connection failed, activating proxy",
 			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
-		s.activateProxyCooldown()
+		if err := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); err != nil {
+			return nil, err
+		}
 		return s.doCrawl(ctx, req, attempt+1)
 	}
 
@@ -539,11 +636,24 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	start := time.Now()
 
 	if s.rateLimiter != nil {
-		if err := s.rateLimiter.Acquire(ctx); err != nil {
-			if errors.Is(err, ratelimit.ErrRateLimitTimeout) {
-				return nil, fmt.Errorf("rate limit wait timeout: %w", err)
+		start := time.Now()
+		for {
+			allowed, err := s.rateLimiter.Allow(ctx, rateLimitKey, int(s.cfg.App.RateLimit), int(s.cfg.App.RateBurst))
+			if err != nil {
+				return nil, fmt.Errorf("rate limit: %w", err)
 			}
-			return nil, fmt.Errorf("rate limit: %w", err)
+			if allowed {
+				metrics.RateLimitWaitDuration.Observe(time.Since(start).Seconds())
+				break
+			}
+
+			select {
+			case <-ctx.Done():
+				metrics.RateLimitWaitDuration.Observe(time.Since(start).Seconds())
+				metrics.RateLimitTimeoutTotal.Inc()
+				return nil, fmt.Errorf("rate limit wait timeout: %w", ctx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 
@@ -557,12 +667,14 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	page := stealth.MustPage(browser)
 	// 定义增强版屏蔽列表
 	blockedURLs := []string{
-		// 1. 高带宽资源 (图片/字体/媒体) - 保持不变
+		// 1. 高带宽资源 (图片/字体/媒体)
 		"*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
-		"*.woff", "*.woff2", "*.ttf", "*.eot",
-		"*.mp4", "*.mp3",
+		"*.avif", "*.apng", "*.heic", "*.heif", "*.bmp", "*.tif", "*.tiff",
+		"*.woff", "*.woff2", "*.ttf", "*.eot", "*.otf",
+		"*.mp4", "*.webm", "*.m4v", "*.mov", "*.avi",
+		"*.mp3", "*.aac", "*.m4a", "*.ogg", "*.wav", "*.flac",
 
-		// 2. 广告与追踪脚本 (新增了从日志里发现的!)
+		// 2. 广告与追踪脚本
 		"*google-analytics*",
 		"*googletagmanager*",
 		"*doubleclick*",
@@ -576,7 +688,6 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 		"*line-scdn*",
 		"*popin*",
 
-		// === [本次新增] ===
 		"*tiktok*",           // analytics.tiktok.com
 		"*sentry*",           // ingest.sentry.io (错误监控)
 		"*syndicatedsearch*", // Google 广告组件
@@ -636,6 +747,9 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 				TotalFound:   0,
 				ErrorMessage: "no_items",
 			}, nil
+		}
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
+			s.logPageTimeout("wait_for_items", taskID, url, page, err)
 		}
 		return nil, fmt.Errorf("wait for items: %w", err)
 	}
@@ -698,6 +812,9 @@ ParseItems:
 	// 解析商品列表。
 	elements, err := page.Elements(selector)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
+			s.logPageTimeout("get_elements", taskID, url, page, err)
+		}
 		return nil, fmt.Errorf("get elements: %w", err)
 	}
 	if len(elements) == 0 {
@@ -826,7 +943,11 @@ func shouldActivateProxy(err error) bool {
 	if strings.Contains(msg, "blocked_page") ||
 		strings.Contains(msg, "cloudflare") ||
 		strings.Contains(msg, "attention required") ||
-		strings.Contains(msg, "access denied") {
+		strings.Contains(msg, "access denied") ||
+		strings.Contains(msg, "403") ||
+		strings.Contains(msg, "429") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "too many requests") {
 		return true
 	}
 	if strings.Contains(msg, "net::") ||

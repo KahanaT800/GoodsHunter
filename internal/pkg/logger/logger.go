@@ -24,9 +24,36 @@ func New(cfg Config) *slog.Logger {
 	return slog.New(handler)
 }
 
+// NewWithIdentity creates a logger with hostname/worker_id fields.
+func NewWithIdentity(cfg Config) *slog.Logger {
+	base := New(cfg)
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	workerID := strings.TrimSpace(os.Getenv("WORKER_ID"))
+	if workerID == "" {
+		workerID = strings.TrimSpace(os.Getenv("HOSTNAME"))
+	}
+	if workerID == "" {
+		workerID = "unknown"
+	}
+	return base.With(
+		slog.String("hostname", host),
+		slog.String("worker_id", workerID),
+	)
+}
+
 // NewDefault 创建一个默认配置的日志记录器，输出到 stdout。
 func NewDefault(level string) *slog.Logger {
 	return New(Config{
+		Level: level,
+	})
+}
+
+// NewDefaultWithIdentity creates a default logger with hostname/worker_id fields.
+func NewDefaultWithIdentity(level string) *slog.Logger {
+	return NewWithIdentity(Config{
 		Level: level,
 	})
 }

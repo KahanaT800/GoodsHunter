@@ -32,8 +32,11 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	appLogger := logger.NewDefault(cfg.App.LogLevel)
+	appLogger := logger.NewDefaultWithIdentity(cfg.App.LogLevel)
 	ctx := context.Background()
+
+	host, _ := os.Hostname()
+	appLogger.Info("crawler booting", slog.String("hostname", host))
 
 	maxConcurrent := cfg.App.RateLimit * 30
 	if cfg.App.RateLimit > 0 && float64(cfg.App.WorkerPoolSize) > maxConcurrent {

@@ -1,0 +1,74 @@
+services:
+  crawler:
+    image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-crawler:latest
+    restart: always
+    stop_grace_period: 2m
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
+      APP_RATE_BURST: ${APP_RATE_BURST:-5}
+      WORKER_ID: ${WORKER_ID:-worker-01}
+      PROXY_COOLDOWN: ${PROXY_COOLDOWN:-10m}
+      MAX_TASKS: ${MAX_TASKS:-500}
+      FORCE_PROXY_ONCE: ${FORCE_PROXY_ONCE:-false}
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CRAWLER_METRICS_ADDR: ${CRAWLER_METRICS_ADDR:-:2112}
+      CHROME_BIN: ${CHROME_BIN:-/usr/bin/chromium-browser}
+      BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
+      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-3}
+      BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 2112"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    expose:
+      - "2112"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    tmpfs:
+      - /tmp/rod:size=256m
+    networks:
+      - goodshunter-net
+
+  alloy:
+    image: grafana/alloy:latest
+    restart: always
+    command:
+      - run
+      - /etc/alloy/config.river
+    environment:
+      - GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL=${GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL}
+      - GRAFANA_CLOUD_PROM_USERNAME=${GRAFANA_CLOUD_PROM_USERNAME}
+      - GRAFANA_CLOUD_PROM_API_KEY=${GRAFANA_CLOUD_PROM_API_KEY}
+      - GRAFANA_CLOUD_LOKI_URL=${GRAFANA_CLOUD_LOKI_URL}
+      - GRAFANA_CLOUD_LOKI_USERNAME=${GRAFANA_CLOUD_LOKI_USERNAME}
+      - GRAFANA_CLOUD_LOKI_API_KEY=${GRAFANA_CLOUD_LOKI_API_KEY}
+      - HOSTNAME=${HOSTNAME}
+      - WORKER_ID=${WORKER_ID}
+    volumes:
+      - ./deploy/alloy/config.worker.river:/etc/alloy/config.river:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    depends_on:
+      - crawler
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - goodshunter-net
+
+networks:
+  goodshunter-net:
+    driver: bridge

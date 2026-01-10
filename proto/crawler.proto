@@ -42,6 +42,7 @@ message FetchRequest {
   int32 limit = 8;
   SortBy sort = 9;
   SortOrder order = 10;
+  int64 created_at = 11; // Unix 时间戳 (秒)
 }
 
 // 商品信息。

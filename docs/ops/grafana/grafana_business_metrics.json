@@ -26,7 +26,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u722c\u866b\u8fde\u63a5\u6a21\u5f0f\uff08\u76f4\u8fde/\u4ee3\u7406\uff09\u5207\u6362\u60c5\u51b5",
+      "description": "爬虫连接模式（直连/代理）切换情况",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -87,11 +87,11 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
-          "expr": "goodshunter_crawler_proxy_mode{job=\"prometheus.scrape.goodshunter_crawler\"}",
+          "expr": "goodshunter_crawler_proxy_mode{\r\n  job=\"prometheus.scrape.goodshunter_crawler\",\r\n  worker_id!=\"\",\r\n  instance!~\"crawler:2112\"\r\n}\r\n",
           "legendFormat": "mode",
           "range": true,
           "refId": "A"
@@ -106,7 +106,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u76f4\u8fde\u8bf7\u6c42\u5360\u6bd4 (\u8d8a\u9ad8\u8d8a\u7701\u94b1)",
+      "description": "直连请求占比 (越高越省钱)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -158,7 +158,7 @@
         "showThresholdMarkers": true,
         "sizing": "auto"
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -176,7 +176,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u6309\u6a21\u5f0f\uff08direct/proxy\uff09\u5206\u7ec4\u7684\u5e73\u5747\u8bf7\u6c42\u8017\u65f6",
+      "description": "按模式（direct/proxy）分组的平均请求耗时",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -224,7 +224,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -242,7 +242,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "Scheduler \u5f53\u524d\u6267\u884c\u4e2d\u7684\u4efb\u52a1\u6570\u91cf\uff0c\u5224\u65ad\u662f\u5426\u6709\u6301\u7eed\u8d1f\u8f7d\u3002",
+      "description": "Scheduler 当前执行中的任务数量，判断是否有持续负载。",
       "fieldConfig": {
         "defaults": {
           "mappings": [],
@@ -286,7 +286,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -304,7 +304,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u5f53\u524d\u722c\u866b\u751f\u547d\u5468\u671f\u4e2d\u6b63\u5728\u5904\u7406\u7684\u4efb\u52a1",
+      "description": "当前爬虫生命周期中正在处理的任务",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -355,7 +355,7 @@
         "showThresholdMarkers": true,
         "sizing": "auto"
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -373,45 +373,11 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "Redis List \u961f\u5217\u6c34\u4f4d\u3002tasks \u4e0a\u5347\u8868\u793a\u722c\u866b\u8ddf\u4e0d\u4e0a\uff1bresults \u4e0a\u5347\u8868\u793a API \u5165\u5e93\u74f6\u9888\u3002",
+      "description": "Redis List 队列水位。tasks 上升表示爬虫跟不上；results 上升表示 API 入库瓶颈。",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "mappings": [],
           "thresholds": {
@@ -442,19 +408,30 @@
       },
       "id": 3,
       "options": {
+        "displayMode": "gradient",
         "legend": {
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -472,14 +449,14 @@
         }
       ],
       "title": "Queue Backlog (Tasks vs Results)",
-      "type": "timeseries"
+      "type": "bargauge"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u91cd\u8bd5\u3001\u6b7b\u4fe1\u4e0e\u81ea\u52a8\u56de\u6536\u901f\u7387\uff0c\u9a8c\u8bc1\u53ef\u9760\u6d88\u8d39\u94fe\u8def\u3002",
+      "description": "重试、死信与自动回收速率，验证可靠消费链路。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -557,7 +534,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -589,7 +566,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u722c\u866b\u8bf7\u6c42\u901f\u7387\uff0c\u6309\u5e73\u53f0\u4e0e\u72b6\u6001\u62c6\u5206\u3002",
+      "description": "爬虫请求速率，按平台与状态拆分。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -666,7 +643,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -684,7 +661,7 @@
         "type": "loki",
         "uid": "${loki}"
       },
-      "description": "\u722c\u866b\u8bf7\u6c42\u6210\u529f/\u5931\u8d25\u65e5\u5fd7\u8ba1\u6570\u8d8b\u52bf\u3002",
+      "description": "爬虫请求成功/失败日志计数趋势。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -761,7 +738,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -786,7 +763,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u722c\u866b\u8bf7\u6c42\u5e73\u5747\u8017\u65f6\uff08\u57fa\u4e8e Prometheus \u6307\u6807\uff09\uff0c\u6bd4\u65e5\u5fd7\u66f4\u7a33\u5b9a\u3002",
+      "description": "爬虫请求平均耗时（基于 Prometheus 指标），比日志更稳定。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -864,7 +841,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -882,7 +859,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u722c\u866b\u8017\u65f6 P50/P95\uff0c\u89c2\u5bdf\u5c3e\u5ef6\u8fdf\u3002",
+      "description": "爬虫耗时 P50/P95，观察尾延迟。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -959,7 +936,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -984,7 +961,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u4efb\u52a1\u5165\u961f\u7b49\u5f85\u65f6\u95f4 P95\uff0c\u53cd\u6620\u6392\u961f\u5ef6\u8fdf\u3002",
+      "description": "任务入队等待时间 P95，反映排队延迟。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1062,7 +1039,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1080,7 +1057,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u5185\u5b58\u961f\u5217\u7b49\u5f85\u4efb\u52a1\u91cf\uff0c\u6301\u7eed\u4e0a\u5347\u8868\u793a\u5904\u7406\u74f6\u9888\u3002",
+      "description": "内存队列等待任务量，持续上升表示处理瓶颈。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1158,7 +1135,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1176,7 +1153,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u5185\u5b58\u961f\u5217\u5360\u7528\u7387\uff0c\u63a5\u8fd1 100% \u8bf4\u660e\u5165\u961f\u901f\u5ea6\u8d85\u8fc7\u5904\u7406\u80fd\u529b\u3002",
+      "description": "内存队列占用率，接近 100% 说明入队速度超过处理能力。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1230,7 +1207,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1247,7 +1224,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u6700\u8fd1 5 \u5206\u949f\u9519\u8bef Top\uff0c\u5feb\u901f\u5b9a\u4f4d\u7a81\u53d1\u5f02\u5e38\u3002",
+      "description": "最近 5 分钟错误 Top，快速定位突发异常。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1324,7 +1301,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1342,7 +1319,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u6700\u8fd1 1 \u5c0f\u65f6\u722c\u866b\u9519\u8bef\u7c7b\u578b\u7edf\u8ba1\uff08Prometheus \u7edf\u8ba1\uff09\u3002",
+      "description": "最近 1 小时爬虫错误类型统计（Prometheus 统计）。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1419,7 +1396,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1437,7 +1414,7 @@
         "type": "loki",
         "uid": "${loki}"
       },
-      "description": "API \u4e0e\u722c\u866b\u5173\u952e\u65e5\u5fd7\u5165\u53e3\uff0c\u4fbf\u4e8e\u56de\u6eaf\u4efb\u52a1\u94fe\u8def\u3002",
+      "description": "API 与爬虫关键日志入口，便于回溯任务链路。",
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -1461,7 +1438,7 @@
         "sortOrder": "Descending",
         "wrapLogMessage": true
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1475,10 +1452,105 @@
     },
     {
       "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "description": "无结果次数趋势，识别搜索异常或库存变动。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.0-20781422371.patch1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "count_over_time({compose_service=\"crawler\"} |= \"no items found\" [10m])",
+          "legendFormat": "no_items",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "No Items Found",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u722c\u866b\u6d4f\u89c8\u5668\u5b9e\u4f8b\u6570\uff08Prometheus \u6307\u6807\uff09\u3002",
+      "description": "爬虫浏览器实例数（Prometheus 指标）。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1555,7 +1627,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1570,10 +1642,10 @@
     },
     {
       "datasource": {
-        "type": "loki",
-        "uid": "${loki}"
+        "type": "prometheus",
+        "uid": "${prometheus}"
       },
-      "description": "\u65e0\u7ed3\u679c\u6b21\u6570\u8d8b\u52bf\uff0c\u8bc6\u522b\u641c\u7d22\u5f02\u5e38\u6216\u5e93\u5b58\u53d8\u52a8\u3002",
+      "description": "浏览器活跃页与实例数，衡量爬虫负载。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1636,101 +1708,6 @@
         "x": 12,
         "y": 52
       },
-      "id": 11,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.4.0-20781422371",
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "count_over_time({compose_service=\"crawler\"} |= \"no items found\" [10m])",
-          "legendFormat": "no_items",
-          "queryType": "range",
-          "refId": "A"
-        }
-      ],
-      "title": "No Items Found",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${prometheus}"
-      },
-      "description": "\u6d4f\u89c8\u5668\u6d3b\u8dc3\u9875\u4e0e\u5b9e\u4f8b\u6570\uff0c\u8861\u91cf\u722c\u866b\u8d1f\u8f7d\u3002",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 60
-      },
       "id": 17,
       "options": {
         "legend": {
@@ -1745,7 +1722,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1771,7 +1748,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 60
       },
       "id": 19,
       "panels": [],
@@ -1783,7 +1760,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "P99/P50 \u9650\u6d41\u7b49\u5f85\u8017\u65f6\u8d8b\u52bf\uff0c\u9608\u503c 1s\u3002",
+      "description": "P99/P50 限流等待耗时趋势，阈值 1s。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1845,7 +1822,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 61
       },
       "id": 20,
       "options": {
@@ -1861,7 +1838,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1886,7 +1863,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u5165\u53e3\u53bb\u91cd\u62e6\u622a\u6b21\u6570\uff081h \u7d2f\u8ba1\uff09\u3002",
+      "description": "入口去重拦截次数（1h 累计）。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1948,7 +1925,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 61
       },
       "id": 22,
       "options": {
@@ -1964,7 +1941,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -1982,7 +1959,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "\u8bf7\u6c42\u72b6\u6001\u7387\uff0c\u5305\u62ec403\u9519\u8bef\u548c\u7a7a\u7ed3\u679c\u3002",
+      "description": "请求状态率，包括403错误和空结果。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2043,7 +2020,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 77
+        "y": 69
       },
       "id": 25,
       "options": {
@@ -2059,7 +2036,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -2077,7 +2054,7 @@
         "type": "prometheus",
         "uid": "${prometheus}"
       },
-      "description": "1h \u5185\u9650\u6d41\u8d85\u65f6\u6b21\u6570\uff08>0 \u4e3a\u5f02\u5e38\uff09\u3002",
+      "description": "1h 内限流超时次数（>0 为异常）。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2139,7 +2116,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 77
+        "y": 69
       },
       "id": 21,
       "options": {
@@ -2155,7 +2132,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371",
+      "pluginVersion": "12.4.0-20781422371.patch1",
       "targets": [
         {
           "editorMode": "code",
@@ -2231,6 +2208,6 @@
   "timezone": "browser",
   "title": "GoodsHunter Business Metrics",
   "uid": "goodshunter-biz",
-  "version": 19,
+  "version": 25,
   "weekStart": ""
 }

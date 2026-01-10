@@ -2,7 +2,7 @@
 // 全局日志级别
 // ==============================
 logging {
-  level = "warn" // 将 Alloy 自身的日志级别调至 warn 以减少不必要的输出
+  level = "warn"
 }
 
 // ==============================
@@ -19,15 +19,8 @@ prometheus.remote_write "grafana_cloud" {
 }
 
 // ==============================
-// 业务指标采集 (频率从 10s 调至 60s)
+// 业务指标采集（仅 Crawler）
 // ==============================
-prometheus.scrape "goodshunter_api" {
-  targets = [{"__address__" = "api:8080"}]
-  metrics_path = "/metrics"
-  scrape_interval = "60s" // 降低频率以节省流量
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
-}
-
 discovery.relabel "crawler_targets" {
   targets = [{"__address__" = "crawler:2112"}]
 
@@ -45,34 +38,7 @@ discovery.relabel "crawler_targets" {
 prometheus.scrape "goodshunter_crawler" {
   targets = discovery.relabel.crawler_targets.output
   metrics_path = "/metrics"
-  scrape_interval = "60s" // 匹配你的业务调度周期 (3m)
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
-}
-
-// ==============================
-// 基础组件监控 (频率从 15s 调至 120s)
-// ==============================
-prometheus.scrape "redis_exporter" {
-  targets = [{"__address__" = "redis-exporter:9121"}]
-  scrape_interval = "120s" // 系统指标不需要实时，大幅降低请求数
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
-}
-
-prometheus.scrape "mysql_exporter" {
-  targets = [{"__address__" = "mysql-exporter:9104"}]
-  scrape_interval = "120s"
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
-}
-
-prometheus.scrape "cadvisor" {
-  targets = [{"__address__" = "cadvisor:8080"}]
-  scrape_interval = "120s"
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
-}
-
-prometheus.scrape "node_exporter" {
-  targets = [{"__address__" = "node-exporter:9100"}]
-  scrape_interval = "120s"
+  scrape_interval = "60s"
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
 
@@ -86,18 +52,15 @@ discovery.docker "containers" {
 discovery.relabel "container_logs" {
   targets = discovery.docker.containers.targets
 
-  // 1. 提取容器名
   rule {
     source_labels = ["__meta_docker_container_name"]
     regex         = "/(.*)"
     target_label  = "container"
   }
 
-  // 2. 核心过滤逻辑：仅保留 api, crawler, nginx 的日志
-  // 排除监控组件(alloy, exporter)和数据库的冗余日志
   rule {
     source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    regex         = "api|crawler|nginx"
+    regex         = "crawler|alloy"
     action        = "keep"
   }
 

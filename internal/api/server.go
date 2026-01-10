@@ -130,6 +130,8 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger, red
 		cfg.App.WorkerPoolSize, // Worker Pool 大小
 		cfg.App.QueueCapacity,  // 队列容量
 		cfg.App.QueueBatchSize,
+		cfg.App.JanitorInterval,
+		cfg.App.JanitorTimeout,
 	)
 
 	deduper := dedup.NewDeduplicator(rdb, time.Duration(cfg.App.DedupWindow)*time.Second)
@@ -203,6 +205,9 @@ func (s *Server) StartScheduler(ctx context.Context) {
 			s.logger.Error("result listener stopped", slog.String("error", err.Error()))
 		}
 	}()
+
+	// 3. 启动 Janitor 任务回收
+	s.sched.StartJanitor(ctx)
 }
 
 // Close 关闭数据库与缓存连接。

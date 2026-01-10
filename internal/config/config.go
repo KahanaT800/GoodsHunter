@@ -42,6 +42,8 @@ type AppConfig struct {
 	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
 	ProxyCooldown    time.Duration `json:"proxy_cooldown"`     // 直连失败后代理冷却时间
 	MaxTasks         int           `json:"max_tasks"`          // 重启前最大任务数
+	JanitorInterval  time.Duration `json:"janitor_interval"`   // Janitor 扫描间隔
+	JanitorTimeout   time.Duration `json:"janitor_timeout"`    // Janitor 超时阈值
 }
 
 // MySQLConfig MySQL 数据库配置。
@@ -57,11 +59,12 @@ type RedisConfig struct {
 
 // BrowserConfig 爬虫浏览器配置。
 type BrowserConfig struct {
-	BinPath        string `json:"bin_path"`        // 浏览器可执行文件路径
-	ProxyURL       string `json:"proxy_url"`       // 代理服务器 URL
-	Headless       bool   `json:"headless"`        // 是否使用无头模式
-	MaxConcurrency int    `json:"max_concurrency"` // 最大并发页面数
-	MaxFetchCount  int    `json:"max_fetch_count"` // 每次爬取最大数量
+	BinPath        string        `json:"bin_path"`        // 浏览器可执行文件路径
+	ProxyURL       string        `json:"proxy_url"`       // 代理服务器 URL
+	Headless       bool          `json:"headless"`        // 是否使用无头模式
+	MaxConcurrency int           `json:"max_concurrency"` // 最大并发页面数
+	MaxFetchCount  int           `json:"max_fetch_count"` // 每次爬取最大数量
+	PageTimeout    time.Duration `json:"page_timeout"`    // 页面加载/元素等待超时
 }
 
 // EmailConfig 邮件通知配置。
@@ -182,6 +185,8 @@ func getDefaultConfig() *Config {
 			DedupWindow:      3600,
 			ProxyCooldown:    10 * time.Minute,
 			MaxTasks:         500,
+			JanitorInterval:  10 * time.Minute,
+			JanitorTimeout:   30 * time.Minute,
 		},
 		MySQL: MySQLConfig{
 			DSN: "root:password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local",
@@ -196,6 +201,7 @@ func getDefaultConfig() *Config {
 			Headless:       true,
 			MaxConcurrency: 3,
 			MaxFetchCount:  50,
+			PageTimeout:    2 * time.Minute,
 		},
 		Email: EmailConfig{
 			SMTPHost:  "smtp.gmail.com",
@@ -266,6 +272,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.App.MaxTasks == 0 {
 		cfg.App.MaxTasks = defaults.App.MaxTasks
 	}
+	if cfg.App.JanitorInterval == 0 {
+		cfg.App.JanitorInterval = defaults.App.JanitorInterval
+	}
+	if cfg.App.JanitorTimeout == 0 {
+		cfg.App.JanitorTimeout = defaults.App.JanitorTimeout
+	}
 	if cfg.Security.JWTSecret == "" {
 		if cfg.App.JWTSecret != "" {
 			cfg.Security.JWTSecret = cfg.App.JWTSecret
@@ -284,6 +296,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Browser.MaxFetchCount == 0 {
 		cfg.Browser.MaxFetchCount = defaults.Browser.MaxFetchCount
+	}
+	if cfg.Browser.PageTimeout == 0 {
+		cfg.Browser.PageTimeout = defaults.Browser.PageTimeout
 	}
 	if cfg.Email.SMTPPort == 0 {
 		cfg.Email.SMTPPort = defaults.Email.SMTPPort
@@ -381,6 +396,16 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.App.MaxTasks = i
 		}
 	}
+	if v := os.Getenv("JANITOR_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.App.JanitorInterval = d
+		}
+	}
+	if v := os.Getenv("JANITOR_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.App.JanitorTimeout = d
+		}
+	}
 
 	if v := viper.GetString("jwt_secret"); v != "" {
 		cfg.Security.JWTSecret = v
@@ -448,6 +473,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("BROWSER_MAX_FETCH_COUNT"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.Browser.MaxFetchCount = i
+		}
+	}
+	if v := os.Getenv("BROWSER_PAGE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Browser.PageTimeout = d
 		}
 	}
 
@@ -534,6 +564,8 @@ func (a *AppConfig) UnmarshalJSON(data []byte) error {
 		NewItemDuration  string `json:"new_item_duration"`
 		GuestIdleTimeout string `json:"guest_idle_timeout"`
 		GuestHeartbeat   string `json:"guest_heartbeat"`
+		JanitorInterval  string `json:"janitor_interval"`
+		JanitorTimeout   string `json:"janitor_timeout"`
 		*Alias
 	}{
 		Alias: (*Alias)(a),
@@ -572,6 +604,20 @@ func (a *AppConfig) UnmarshalJSON(data []byte) error {
 		}
 		a.GuestHeartbeat = duration
 	}
+	if aux.JanitorInterval != "" {
+		duration, err := time.ParseDuration(aux.JanitorInterval)
+		if err != nil {
+			return fmt.Errorf("invalid janitor_interval format: %w", err)
+		}
+		a.JanitorInterval = duration
+	}
+	if aux.JanitorTimeout != "" {
+		duration, err := time.ParseDuration(aux.JanitorTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid janitor_timeout format: %w", err)
+		}
+		a.JanitorTimeout = duration
+	}
 
 	return nil
 }
@@ -584,12 +630,16 @@ func (a AppConfig) MarshalJSON() ([]byte, error) {
 		NewItemDuration  string `json:"new_item_duration"`
 		GuestIdleTimeout string `json:"guest_idle_timeout"`
 		GuestHeartbeat   string `json:"guest_heartbeat"`
+		JanitorInterval  string `json:"janitor_interval"`
+		JanitorTimeout   string `json:"janitor_timeout"`
 		*Alias
 	}{
 		ScheduleInterval: a.ScheduleInterval.String(),
 		NewItemDuration:  a.NewItemDuration.String(),
 		GuestIdleTimeout: a.GuestIdleTimeout.String(),
 		GuestHeartbeat:   a.GuestHeartbeat.String(),
+		JanitorInterval:  a.JanitorInterval.String(),
+		JanitorTimeout:   a.JanitorTimeout.String(),
 		Alias:            (*Alias)(&a),
 	})
 }

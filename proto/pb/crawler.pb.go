@@ -187,6 +187,7 @@ type FetchRequest struct {
 	Limit         int32     `protobuf:"varint,8,opt,name=limit,proto3" json:"limit,omitempty"`
 	Sort          SortBy    `protobuf:"varint,9,opt,name=sort,proto3,enum=crawler.SortBy" json:"sort,omitempty"`
 	Order         SortOrder `protobuf:"varint,10,opt,name=order,proto3,enum=crawler.SortOrder" json:"order,omitempty"`
+	CreatedAt     int64     `protobuf:"varint,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"` // Unix 时间戳 (秒)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -289,6 +290,13 @@ func (x *FetchRequest) GetOrder() SortOrder {
 		return x.Order
 	}
 	return SortOrder_SORT_ORDER_DESC
+}
+
+func (x *FetchRequest) GetCreatedAt() int64 {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return 0
 }
 
 // 商品信息。
@@ -467,7 +475,7 @@ var File_proto_crawler_proto protoreflect.FileDescriptor
 
 const file_proto_crawler_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/crawler.proto\x12\acrawler\"\xdc\x02\n" +
+	"\x13proto/crawler.proto\x12\acrawler\"\xfb\x02\n" +
 	"\fFetchRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12-\n" +
 	"\bplatform\x18\x02 \x01(\x0e2\x11.crawler.PlatformR\bplatform\x12\x18\n" +
@@ -480,7 +488,9 @@ const file_proto_crawler_proto_rawDesc = "" +
 	"\x05limit\x18\b \x01(\x05R\x05limit\x12#\n" +
 	"\x04sort\x18\t \x01(\x0e2\x0f.crawler.SortByR\x04sort\x12(\n" +
 	"\x05order\x18\n" +
-	" \x01(\x0e2\x12.crawler.SortOrderR\x05order\"\xea\x01\n" +
+	" \x01(\x0e2\x12.crawler.SortOrderR\x05order\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\v \x01(\x03R\tcreatedAt\"\xea\x01\n" +
 	"\x04Item\x12\x1b\n" +
 	"\tsource_id\x18\x01 \x01(\tR\bsourceId\x12\x14\n" +
 	"\x05title\x18\x02 \x01(\tR\x05title\x12\x14\n" +

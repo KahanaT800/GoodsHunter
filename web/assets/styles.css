@@ -31,6 +31,12 @@
         align-items: center;
         gap: 12px;
       }
+      .lang-select {
+        width: auto;
+        min-width: 110px;
+        margin-bottom: 0;
+        font-size: 12px;
+      }
       .user-meta {
         display: flex;
         flex-direction: column;

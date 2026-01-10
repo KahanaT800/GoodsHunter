@@ -95,3 +95,33 @@ jobs:
             
             # 7. 验证服务状态
             docker compose ps
+
+  deploy-worker:
+    # Worker 节点已迁移到个人电脑，暂时禁用自动部署
+    if: ${{ false }}
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Worker EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST_WORKER }}
+          username: ${{ secrets.SSH_USER_WORKER }}
+          key: ${{ secrets.SSH_KEY_WORKER }}
+          script: |
+            cd ~/GoodsHunter
+
+            # 1. 拉取最新代码 (包含 docker-compose.worker.yml)
+            git pull --ff-only origin main
+
+            # 2. 拉取最新镜像
+            docker compose -f docker-compose.worker.yml pull crawler
+
+            # 3. 重启 Worker 服务
+            docker compose -f docker-compose.worker.yml up -d crawler alloy
+
+            # 4. 清理旧镜像
+            docker image prune -f
+
+            # 5. 验证服务状态
+            docker compose -f docker-compose.worker.yml ps

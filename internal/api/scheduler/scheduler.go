@@ -37,6 +37,8 @@ type Scheduler struct {
 	notifier        notify.Notifier
 	redisQueue      *redisqueue.Client
 	batchSize       int // 轮询批量入队大小
+	janitorInterval time.Duration
+	janitorTimeout  time.Duration
 }
 
 // NewScheduler 创建一个新的调度器实例。
@@ -56,7 +58,7 @@ type Scheduler struct {
 // 返回值:
 //
 //	*Scheduler: 调度器实例
-func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, redisQueue *redisqueue.Client, notifier notify.Notifier, interval time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, batchSize int) *Scheduler {
+func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, redisQueue *redisqueue.Client, notifier notify.Notifier, interval time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, batchSize int, janitorInterval time.Duration, janitorTimeout time.Duration) *Scheduler {
 	// 使用默认值（如果参数为 0）
 	if workers <= 0 {
 		workers = 50 // 默认 50 个并发 worker
@@ -79,6 +81,12 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, redisQueu
 	if batchSize <= 0 {
 		batchSize = 100
 	}
+	if janitorInterval <= 0 {
+		janitorInterval = 10 * time.Minute
+	}
+	if janitorTimeout <= 0 {
+		janitorTimeout = 30 * time.Minute
+	}
 
 	return &Scheduler{
 		db:              db,
@@ -91,6 +99,8 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, redisQueu
 		notifier:        notifier,
 		redisQueue:      redisQueue,
 		batchSize:       batchSize,
+		janitorInterval: janitorInterval,
+		janitorTimeout:  janitorTimeout,
 	}
 }
 
@@ -226,6 +236,42 @@ func (s *Scheduler) StartResultListener(ctx context.Context) error {
 					slog.Int("items", len(resp.GetItems())))
 			}
 		}(res)
+	}
+}
+
+// StartJanitor runs a periodic rescue loop for stuck tasks.
+func (s *Scheduler) StartJanitor(ctx context.Context) {
+	ticker := time.NewTicker(s.janitorInterval)
+	s.logger.Info("janitor started")
+
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.runRescue(ctx)
+			}
+		}
+	}()
+}
+
+func (s *Scheduler) runRescue(ctx context.Context) {
+	if s.redisQueue == nil {
+		return
+	}
+	timeout := s.janitorTimeout
+	rescueCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	count, err := s.redisQueue.RescueStuckTasks(rescueCtx, timeout)
+	if err != nil {
+		s.logger.Error("janitor failed to rescue tasks", slog.String("error", err.Error()))
+		return
+	}
+	if count > 0 {
+		s.logger.Info("janitor rescued stuck tasks", slog.Int("count", count))
 	}
 }
 
@@ -435,6 +481,7 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) erro
 		OnlyOnSale: true,
 		Sort:       pb.SortBy(task.SortBy),
 		Order:      pb.SortOrder(task.SortOrder),
+		CreatedAt:  time.Now().Unix(),
 	}
 
 	if err := s.redisQueue.PushTask(parentCtx, req); err != nil {
