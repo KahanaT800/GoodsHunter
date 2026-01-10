@@ -621,6 +621,13 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 		// 标准 Mercari 图片规则
 		imageURL = fmt.Sprintf("https://static.mercdn.net/thumb/item/webp/%s_1.jpg", id)
 	}
+	if imageURL == "" {
+		if img, err := el.Element("img"); err == nil {
+			if src, _ := img.Attribute("src"); src != nil {
+				imageURL = *src
+			}
+		}
+	}
 
 	// 6. 状态判断
 	status := "on_sale"
