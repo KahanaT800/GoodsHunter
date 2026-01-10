@@ -39,6 +39,8 @@ services:
       APP_CRAWLER_GRPC_ADDR: ${APP_CRAWLER_GRPC_ADDR:-:50051}
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
+      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-goodshunter_redis}
       CRAWLER_METRICS_ADDR: ${CRAWLER_METRICS_ADDR:-:2112}
       CHROME_BIN: ${CHROME_BIN:-/usr/bin/chromium-browser}
       BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
