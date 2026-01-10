@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +15,9 @@ import (
 	"goodshunter/internal/api/middleware"
 	"goodshunter/internal/api/scheduler"
 	"goodshunter/internal/config"
+	"goodshunter/internal/crawler"
 	"goodshunter/internal/model"
+	"goodshunter/internal/pkg/dedup"
 	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/notify"
 	"goodshunter/internal/pkg/taskqueue"
@@ -42,6 +46,7 @@ type Server struct {
 	sched        *scheduler.Scheduler
 	auth         *auth.Handler
 	taskProducer *taskqueue.Producer // Redis Streams 任务生产者
+	deduper      *dedup.Deduplicator
 }
 
 // NewServer 初始化 API 服务器。
@@ -120,6 +125,8 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		logger.Info("redis queue disabled, using polling mode")
 	}
 
+	deduper := dedup.NewDeduplicator(rdb, time.Duration(cfg.App.DedupWindow)*time.Second)
+
 	// 初始化 Prometheus 指标
 	metrics.InitMetrics(cfg.App.EnableRedisQueue, cfg.App.WorkerPoolSize)
 
@@ -138,6 +145,7 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 		sched:        sched,
 		auth:         auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
 		taskProducer: taskProducer,
+		deduper:      deduper,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -616,6 +624,19 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		return
 	}
 
+	dedupURL := buildDedupURL(req, sortBy, sortOrder)
+	if dedupURL != "" {
+		dup, err := s.deduper.IsDuplicate(c.Request.Context(), dedupURL)
+		if err != nil {
+			s.logger.Error("dedup check failed", slog.String("error", err.Error()), slog.String("url", dedupURL))
+		} else if dup {
+			s.logger.Info("task deduplicated", slog.String("url", dedupURL))
+			metrics.TaskDuplicatePreventedTotal.Inc()
+			c.JSON(http.StatusOK, gin.H{"status": "skipped_duplicate"})
+			return
+		}
+	}
+
 	status := req.Status
 	if status == "" {
 		status = "running"
@@ -700,6 +721,44 @@ func mapSortAndOrder(s string) (int, int) {
 	}
 
 	return sortBy, sortOrder
+}
+
+func buildDedupURL(req createTaskRequest, sortBy, sortOrder int) string {
+	if req.Keyword == "" {
+		return ""
+	}
+
+	if req.Platform == int(pb.Platform_PLATFORM_MERCARI) {
+		fetchReq := &pb.FetchRequest{
+			Platform:   pb.Platform(req.Platform),
+			Keyword:    req.Keyword,
+			MinPrice:   req.MinPrice,
+			MaxPrice:   req.MaxPrice,
+			Sort:       pb.SortBy(sortBy),
+			Order:      pb.SortOrder(sortOrder),
+			OnlyOnSale: true,
+		}
+		return crawler.BuildMercariURL(fetchReq)
+	}
+
+	values := url.Values{}
+	values.Set("keyword", req.Keyword)
+	if req.MinPrice > 0 {
+		values.Set("min_price", strconv.FormatInt(int64(req.MinPrice), 10))
+	}
+	if req.MaxPrice > 0 {
+		values.Set("max_price", strconv.FormatInt(int64(req.MaxPrice), 10))
+	}
+	values.Set("sort_by", strconv.Itoa(sortBy))
+	values.Set("sort_order", strconv.Itoa(sortOrder))
+
+	u := url.URL{
+		Scheme:   "goodshunter",
+		Host:     fmt.Sprintf("platform-%d", req.Platform),
+		Path:     "/search",
+		RawQuery: values.Encode(),
+	}
+	return u.String()
 }
 
 // timelineItem 时间轴接口返回的商品结构。

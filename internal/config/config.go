@@ -40,6 +40,7 @@ type AppConfig struct {
 	RateLimit        float64       `json:"rate_limit"`         // 限流速率（token/s）
 	RateBurst        float64       `json:"rate_burst"`         // 限流桶容量
 	QueueBatchSize   int           `json:"queue_batch_size"`   // 轮询批量入队大小
+	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
 
 	// Redis Streams 任务队列配置
 	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
@@ -183,6 +184,7 @@ func getDefaultConfig() *Config {
 			RateLimit:        3,
 			RateBurst:        5,
 			QueueBatchSize:   100,
+			DedupWindow:      3600,
 
 			// Redis Streams 默认配置
 			EnableRedisQueue: false, // 默认关闭，渐进式升级
@@ -265,6 +267,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.QueueBatchSize == 0 {
 		cfg.App.QueueBatchSize = defaults.App.QueueBatchSize
+	}
+	if cfg.App.DedupWindow == 0 {
+		cfg.App.DedupWindow = defaults.App.DedupWindow
 	}
 	// Redis Streams 默认值
 	if cfg.App.TaskQueueStream == "" {
@@ -374,6 +379,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("APP_QUEUE_BATCH_SIZE"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.App.QueueBatchSize = i
+		}
+	}
+	if v := os.Getenv("APP_DEDUP_WINDOW"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.App.DedupWindow = i
 		}
 	}
 

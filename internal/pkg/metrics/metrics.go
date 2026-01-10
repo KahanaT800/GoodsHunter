@@ -112,6 +112,12 @@ var (
 		Name: "goodshunter_task_autoclaim_total",
 		Help: "Total number of pending messages auto-claimed",
 	})
+
+	// TaskDuplicatePreventedTotal 入口去重拦截次数
+	TaskDuplicatePreventedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_task_duplicate_prevented_total",
+		Help: "Total number of tasks prevented by ingress deduplication",
+	})
 )
 
 // HTTP API 相关指标
