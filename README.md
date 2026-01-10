@@ -20,8 +20,8 @@
 **系统监控仪表盘**
 ![系统监控仪表盘](image/grafana_sys.png)
 
-**爬虫监控仪表盘**
-![爬虫监控仪表盘](image/grafana_crawler.png)
+**业务监控仪表盘**
+![业务监控仪表盘](image/grafana_crawler.png)
 
 ---
 
@@ -212,12 +212,20 @@ docker compose up -d
 
 ```
 GoodsHunter/
+├── .github/workflows/       # CI/CD 流水线
 ├── cmd/
 │   ├── api/                 # API 服务入口
 │   └── crawler/             # 爬虫服务入口
 ├── configs/                 # 配置模板与示例
 ├── deploy/                  # 生产部署配置（Grafana Alloy）
-├── docs/                    # 项目文档与验收清单
+├── docs/                    # 项目文档
+│   ├── architecture/        # 架构设计与演进
+│   ├── ops/                 # 配置、部署与运维
+│   │   └── grafana/          # Grafana 仪表盘 JSON
+│   ├── dev/                 # 开发与测试指南
+│   ├── archive/             # 归档资料
+│   └── README.md            # 文档索引
+├── image/                   # README 截图
 ├── internal/
 │   ├── api/                 # HTTP 处理器、中间件、调度器
 │   ├── crawler/             # Chromium 自动化、HTML 解析
@@ -230,11 +238,12 @@ GoodsHunter/
 ├── build/
 │   ├── api/Dockerfile
 │   └── crawler/Dockerfile
+├── nginx/                   # Nginx 配置
 ├── proto/
+├── scripts/                 # 运维脚本
 ├── web/
-├── .github/workflows/
 ├── docker-compose.yml
-└── scripts/
+└── Makefile
 ```
 
 ---
