@@ -1,0 +1,101 @@
+package crawler
+
+import (
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+)
+
+func TestParsePrice(t *testing.T) {
+	val, err := parsePrice("¥ 1,200")
+	if err != nil {
+		t.Fatalf("parse price: %v", err)
+	}
+	if val != 1200 {
+		t.Fatalf("expected 1200, got %d", val)
+	}
+}
+
+func TestBlockedText(t *testing.T) {
+	html := "<html><body><h1>Attention Required!</h1><p>Cloudflare</p></body></html>"
+	if !isBlockedText(html) {
+		t.Fatalf("expected blocked text to be detected")
+	}
+}
+
+func TestExtractItemFromHTML(t *testing.T) {
+	html := `<!doctype html>
+<html>
+  <body>
+    <div data-testid="item-cell">
+      <a href="/item/m123456">detail</a>
+      <img alt="Nike Shoes thumbnail" src="https://example.com/m123456.jpg"/>
+      <div class="merPrice">¥ 1,200</div>
+      <span>SOLD</span>
+    </div>
+  </body>
+</html>`
+
+	u := launcher.New().Headless(true).NoSandbox(true)
+	bin, err := u.Launch()
+	if err != nil {
+		t.Fatalf("launch browser: %v", err)
+	}
+	browser := rod.New().ControlURL(bin)
+	if err := browser.Connect(); err != nil {
+		t.Fatalf("connect browser: %v", err)
+	}
+	t.Cleanup(func() { _ = browser.Close() })
+
+	page := browser.MustPage()
+	page.MustNavigate("data:text/html," + url.PathEscape(html))
+	page = page.Timeout(5 * time.Second)
+
+	el, err := page.Element(`[data-testid="item-cell"]`)
+	if err != nil {
+		t.Fatalf("find item-cell: %v", err)
+	}
+	item, err := extractItem(el)
+	if err != nil {
+		t.Fatalf("extract item: %v", err)
+	}
+	if item.Title != "Nike Shoes thumbnail" {
+		t.Fatalf("unexpected title: %s", item.Title)
+	}
+	if item.Price != 1200 {
+		t.Fatalf("unexpected price: %d", item.Price)
+	}
+	if !strings.Contains(item.ImageUrl, "m123456.jpg") {
+		t.Fatalf("unexpected image url: %s", item.ImageUrl)
+	}
+	if item.Status != "sold" {
+		t.Fatalf("expected sold status, got %s", item.Status)
+	}
+}
+
+func TestBlockedPageReturnsError(t *testing.T) {
+	html := `<!doctype html><html><body><h1>Attention Required!</h1><p>Cloudflare</p></body></html>`
+
+	u := launcher.New().Headless(true).NoSandbox(true)
+	bin, err := u.Launch()
+	if err != nil {
+		t.Fatalf("launch browser: %v", err)
+	}
+	browser := rod.New().ControlURL(bin)
+	if err := browser.Connect(); err != nil {
+		t.Fatalf("connect browser: %v", err)
+	}
+	t.Cleanup(func() { _ = browser.Close() })
+
+	page := browser.MustPage()
+	page.MustNavigate("data:text/html," + url.PathEscape(html))
+
+	svc := &Service{}
+	if !svc.isBlockedPage(page) {
+		t.Fatalf("expected blocked page detection")
+	}
+}

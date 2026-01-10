@@ -37,16 +37,52 @@ import (
 //
 // 它持有数据库连接、Redis 客户端、爬虫 gRPC 客户端以及 Gin 路由引擎。
 type Server struct {
-	cfg          *config.Config
-	logger       *slog.Logger
-	db           *gorm.DB
-	rdb          *redis.Client
-	crawler      pb.CrawlerServiceClient
-	router       *gin.Engine
-	sched        *scheduler.Scheduler
-	auth         *auth.Handler
-	taskProducer *taskqueue.Producer // Redis Streams 任务生产者
-	deduper      *dedup.Deduplicator
+	cfg           *config.Config
+	logger        *slog.Logger
+	db            *gorm.DB
+	rdb           *redis.Client
+	crawler       pb.CrawlerServiceClient
+	router        *gin.Engine
+	sched         *scheduler.Scheduler
+	auth          *auth.Handler
+	taskProducer  *taskqueue.Producer // Redis Streams 任务生产者
+	deduper       Deduper
+	taskStore     TaskStore
+	taskScheduler TaskScheduler
+	taskPublisher TaskPublisher
+}
+
+type TaskStore interface {
+	CountTasks(ctx context.Context, userID int) (int64, error)
+	CreateTask(ctx context.Context, task *model.Task) error
+}
+
+type TaskPublisher interface {
+	SubmitTask(ctx context.Context, taskID uint, source string) error
+}
+
+type TaskScheduler interface {
+	StartTask(ctx context.Context, task *model.Task)
+}
+
+type Deduper interface {
+	IsDuplicate(ctx context.Context, url string) (bool, error)
+}
+
+type dbTaskStore struct {
+	db *gorm.DB
+}
+
+func (s dbTaskStore) CountTasks(ctx context.Context, userID int) (int64, error) {
+	var taskCount int64
+	if err := s.db.WithContext(ctx).Model(&model.Task{}).Where("user_id = ?", userID).Count(&taskCount).Error; err != nil {
+		return 0, err
+	}
+	return taskCount, nil
+}
+
+func (s dbTaskStore) CreateTask(ctx context.Context, task *model.Task) error {
+	return s.db.WithContext(ctx).Create(task).Error
 }
 
 // NewServer 初始化 API 服务器。
@@ -136,16 +172,19 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*S
 	r.Use(middleware.RequestLogger(logger))
 
 	s := &Server{
-		cfg:          cfg,
-		logger:       logger,
-		db:           db,
-		rdb:          rdb,
-		crawler:      crawlerClient,
-		router:       r,
-		sched:        sched,
-		auth:         auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
-		taskProducer: taskProducer,
-		deduper:      deduper,
+		cfg:           cfg,
+		logger:        logger,
+		db:            db,
+		rdb:           rdb,
+		crawler:       crawlerClient,
+		router:        r,
+		sched:         sched,
+		auth:          auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
+		taskProducer:  taskProducer,
+		deduper:       deduper,
+		taskStore:     dbTaskStore{db: db},
+		taskScheduler: sched,
+		taskPublisher: taskProducer,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -603,8 +642,8 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 	}
 	userID := getUserID(c)
 
-	var taskCount int64
-	if err := s.db.Model(&model.Task{}).Where("user_id = ?", userID).Count(&taskCount).Error; err != nil {
+	taskCount, err := s.taskStore.CountTasks(c.Request.Context(), userID)
+	if err != nil {
 		s.logger.Error("count tasks failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "count tasks failed"})
 		return
@@ -653,7 +692,7 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		Status:    status,
 	}
 
-	if err := s.db.Create(&task).Error; err != nil {
+	if err := s.taskStore.CreateTask(c.Request.Context(), &task); err != nil {
 		s.logger.Error("create task failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create task failed"})
 		return
@@ -661,25 +700,25 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 
 	// 如果任务状态为 running，发布到队列
 	if task.Status == "running" {
-		if s.cfg.App.EnableRedisQueue && s.taskProducer != nil {
+		if s.cfg.App.EnableRedisQueue && s.taskPublisher != nil {
 			// 新模式：发布到 Redis Streams
-			if err := s.taskProducer.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
+			if err := s.taskPublisher.SubmitTask(c.Request.Context(), task.ID, "user_create"); err != nil {
 				s.logger.Warn("publish task to redis failed, fallback to direct schedule",
 					slog.Uint64("task_id", uint64(task.ID)),
 					slog.String("error", err.Error()))
 				// 降级：如果 Redis 失败，使用原有方式
-				s.sched.StartTask(context.Background(), &task)
+				s.taskScheduler.StartTask(context.Background(), &task)
 			} else {
 				s.logger.Info("task submitted to redis queue",
 					slog.Uint64("task_id", uint64(task.ID)))
 			}
 		} else {
 			// 旧模式：直接启动调度器
-			s.sched.StartTask(context.Background(), &task)
+			s.taskScheduler.StartTask(context.Background(), &task)
 		}
 	}
 
-	c.JSON(http.StatusOK, createTaskResponse{ID: task.ID})
+	c.JSON(http.StatusCreated, createTaskResponse{ID: task.ID})
 }
 
 // mapSortString 将前端传递的排序字符串映射为 Protobuf 枚举值。

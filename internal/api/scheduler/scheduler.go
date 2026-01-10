@@ -44,6 +44,7 @@ type Scheduler struct {
 	streamName   string              // Redis Stream 名称
 	groupName    string              // Consumer Group 名称
 	batchSize    int                 // 轮询批量入队大小
+	taskHandler  func(context.Context, uint) error
 }
 
 // NewScheduler 创建一个新的调度器实例。
@@ -130,6 +131,7 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 		streamName:      streamName,
 		groupName:       groupName,
 		batchSize:       batchSize,
+		taskHandler:     nil,
 	}
 }
 
@@ -477,6 +479,9 @@ func (s *Scheduler) enqueueTaskID(ctx context.Context, taskID uint) {
 		ctx = context.Background()
 	}
 	if err := s.queue.EnqueueBlocking(ctx, func(ctx context.Context) error {
+		if s.taskHandler != nil {
+			return s.taskHandler(ctx, taskID)
+		}
 		return s.handleTaskByID(ctx, taskID)
 	}); err != nil {
 		s.logger.Warn("enqueue task blocked or canceled",
@@ -493,7 +498,12 @@ func (s *Scheduler) enqueueTaskMessage(ctx context.Context, msg *taskqueue.Messa
 	}
 
 	if err := s.queue.EnqueueBlocking(ctx, func(workerCtx context.Context) error {
-		err := s.handleTaskByID(workerCtx, msg.Message.TaskID)
+		var err error
+		if s.taskHandler != nil {
+			err = s.taskHandler(workerCtx, msg.Message.TaskID)
+		} else {
+			err = s.handleTaskByID(workerCtx, msg.Message.TaskID)
+		}
 		if err != nil {
 			if s.taskConsumer != nil {
 				action, retryErr := s.taskConsumer.HandleFailure(workerCtx, msg, err)

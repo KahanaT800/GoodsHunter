@@ -280,6 +280,10 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		)
 	}
 
+	if s.isBlockedPage(page) {
+		return nil, fmt.Errorf("blocked_page")
+	}
+
 	// 等待列表元素加载完成。
 	// 使用 Race 同时等待商品列表或空状态标志，避免在无商品时死等直到超时
 	_, err = page.Race().
@@ -437,6 +441,19 @@ func (s *Service) isNoItemsPage(page *rod.Page) bool {
 	return isNoItemsText(text)
 }
 
+func (s *Service) isBlockedPage(page *rod.Page) bool {
+	pWithTimeout := page.Timeout(2 * time.Second)
+	body, err := pWithTimeout.Element("body")
+	if err != nil {
+		return false
+	}
+	text, err := body.Text()
+	if err != nil {
+		return false
+	}
+	return isBlockedText(text)
+}
+
 func isNoItemsText(text string) bool {
 	if text == "" {
 		return false
@@ -451,6 +468,26 @@ func isNoItemsText(text string) bool {
 	}
 	for _, hint := range noItemsHints {
 		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBlockedText(text string) bool {
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	blockHints := []string{
+		"cloudflare",
+		"attention required",
+		"verify you are human",
+		"access denied",
+		"temporarily unavailable",
+	}
+	for _, hint := range blockHints {
+		if strings.Contains(lower, hint) {
 			return true
 		}
 	}
@@ -567,13 +604,21 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 	}
 	itemURL = normalizeMercariURL(itemURL)
 
+	status := "on_sale"
+	if txt, err := el.Text(); err == nil {
+		lower := strings.ToLower(txt)
+		if strings.Contains(lower, "sold") || strings.Contains(txt, "売り切れ") {
+			status = "sold"
+		}
+	}
+
 	return &pb.Item{
 		SourceId: id,
 		Title:    titleStr,
 		Price:    int32(priceVal),
 		ImageUrl: imageURL,
 		ItemUrl:  itemURL,
-		Status:   "on_sale",
+		Status:   status,
 	}, nil
 }
 
