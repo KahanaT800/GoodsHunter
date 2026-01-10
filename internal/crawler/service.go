@@ -25,7 +25,8 @@ import (
 )
 
 var (
-	priceRe = regexp.MustCompile(`[0-9]+`)
+	priceRe             = regexp.MustCompile(`[0-9]+`)
+	priceWithCurrencyRe = regexp.MustCompile(`[¥￥]\s*([0-9][0-9,]*)`)
 )
 
 // Service 实现爬虫 gRPC 服务，负责浏览器调度与页面解析。
@@ -618,22 +619,9 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 	}
 
 	// 4. 提取价格
-	priceVal := int64(0)
-	// 尝试多种价格选择器，Mercari 经常变
-	priceSelectors := []string{".merPrice", "[data-testid='price']", "span[class*='price']"}
-	for _, sel := range priceSelectors {
-		if priceEl, err := el.Element(sel); err == nil {
-			if txt, err := priceEl.Text(); err == nil {
-				if val, err := parsePrice(txt); err == nil {
-					priceVal = val
-					break
-				}
-			}
-		}
-	}
-	// 如果实在解析不到价格，但其他信息都在，我们可以选择报错或者给个 0 (这里选择报错，因为没价格没意义)
-	if priceVal == 0 {
-		return nil, fmt.Errorf("price not found or zero")
+	priceVal, err := extractPriceHelper(el)
+	if err != nil {
+		return nil, fmt.Errorf("price not found or zero: %w", err)
 	}
 
 	// 5. 构造图片 URL (完全不依赖 img src)
@@ -684,6 +672,14 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 //	int64: 解析后的数值
 //	error: 解析失败返回错误
 func parsePrice(txt string) (int64, error) {
+	if match := priceWithCurrencyRe.FindStringSubmatch(txt); len(match) > 1 {
+		candidate := strings.ReplaceAll(match[1], ",", "")
+		val, err := strconv.ParseInt(candidate, 10, 64)
+		if err == nil {
+			return val, nil
+		}
+	}
+
 	cleaned := strings.ReplaceAll(txt, "¥", "")
 	cleaned = strings.ReplaceAll(cleaned, "￥", "")
 	cleaned = strings.ReplaceAll(cleaned, ",", "")
@@ -713,6 +709,36 @@ func parsePrice(txt string) (int64, error) {
 		return 0, fmt.Errorf("no valid digits")
 	}
 	return bestVal, nil
+}
+
+// extractPriceHelper 用于从价格元素中提取纯数字
+// 输入: "1,999", "¥1,999", "¥ 200"
+// 输出: 1999, 200
+func extractPriceHelper(el *rod.Element) (int64, error) {
+	containerSelectors := []string{
+		".merPrice",
+		"span[class^='merPrice']",
+		"[data-testid='price']",
+	}
+	for _, sel := range containerSelectors {
+		container, err := el.Element(sel)
+		if err != nil {
+			continue
+		}
+		if numEl, err := container.Element("span[class^='number']"); err == nil {
+			if txt, err := numEl.Text(); err == nil && txt != "" {
+				if price, err := parsePrice(txt); err == nil {
+					return price, nil
+				}
+			}
+		}
+		if txt, err := container.Text(); err == nil && txt != "" {
+			if price, err := parsePrice(txt); err == nil {
+				return price, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("price element not found")
 }
 
 // normalizeMercariURL 将相对或协议省略的链接补全为完整的 Mercari URL。
