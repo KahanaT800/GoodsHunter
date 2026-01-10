@@ -446,7 +446,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := viper.GetString("chrome_bin"); v != "" {
 		cfg.Browser.BinPath = v
 	}
-	if v := os.Getenv("BROWSER_PROXY_URL"); v != "" {
+	if v := os.Getenv("HTTP_PROXY"); v != "" {
+		cfg.Browser.ProxyURL = v
+	} else if v := os.Getenv("BROWSER_PROXY_URL"); v != "" {
 		cfg.Browser.ProxyURL = v
 	}
 	if v := os.Getenv("BROWSER_HEADLESS"); v != "" {

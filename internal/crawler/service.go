@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"goodshunter/internal/config"
@@ -140,14 +140,34 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 		NoSandbox(true).
 		Set("remote-allow-origins", "*")
 
+	var proxyServer string
+	var proxyUser string
+	var proxyPass string
+
 	// 读取并设置 HTTP 代理
 	if cfg.Browser.ProxyURL != "" {
-		l = l.Proxy(cfg.Browser.ProxyURL)
-		maskedProxy := cfg.Browser.ProxyURL
-		if parts := strings.Split(maskedProxy, "@"); len(parts) > 1 {
-			maskedProxy = "...@" + parts[1]
+		parsed, err := url.Parse(cfg.Browser.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy url: %w", err)
 		}
-		logger.Info("using http proxy", slog.String("proxy", maskedProxy))
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("invalid proxy url: %s", cfg.Browser.ProxyURL)
+		}
+		proxyServer = fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+		if parsed.User != nil {
+			proxyUser = parsed.User.Username()
+			if pass, ok := parsed.User.Password(); ok {
+				proxyPass = pass
+			}
+		}
+		l = l.Proxy(proxyServer)
+		if proxyUser != "" {
+			logger.Info("using http proxy",
+				slog.String("server", proxyServer),
+				slog.String("auth_user", proxyUser))
+		} else {
+			logger.Info("using http proxy", slog.String("server", proxyServer))
+		}
 	}
 
 	url, err := l.Launch()
@@ -159,40 +179,10 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
-
-	var reqLogCount uint64
-	var blockLogCount uint64
-	const logSampleRate = uint64(1000)
-
-	router := browser.HijackRequests()
-	router.MustAdd("*", func(ctx *rod.Hijack) {
-		reqType := ctx.Request.Type()
-		reqURL := ctx.Request.URL().String()
-		if atomic.AddUint64(&reqLogCount, 1)%logSampleRate == 0 {
-			logger.Debug("net_req", slog.String("type", string(reqType)), slog.String("url", reqURL))
-		}
-		switch reqType {
-		case proto.NetworkResourceTypeDocument,
-			proto.NetworkResourceTypeScript,
-			proto.NetworkResourceTypeXHR,
-			proto.NetworkResourceTypeFetch:
-			ctx.ContinueRequest(&proto.FetchContinueRequest{})
-			return
-		case proto.NetworkResourceTypeImage,
-			proto.NetworkResourceTypeMedia,
-			proto.NetworkResourceTypeFont,
-			proto.NetworkResourceTypeStylesheet:
-			if atomic.AddUint64(&blockLogCount, 1)%logSampleRate == 0 {
-				logger.Debug("blocking_resource", slog.String("type", string(reqType)), slog.String("url", reqURL))
-			}
-			ctx.Response.Fail(proto.NetworkErrorReasonBlockedByClient)
-			return
-		default:
-			ctx.ContinueRequest(&proto.FetchContinueRequest{})
-			return
-		}
-	})
-	go router.Run()
+	if proxyUser != "" {
+		go browser.MustHandleAuth(proxyUser, proxyPass)()
+		logger.Info("proxy authentication handler registered")
+	}
 
 	logger.Info("browser started", slog.String("bin", bin))
 	return browser, nil
@@ -296,6 +286,37 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 
 	url := BuildMercariURL(req)
 	page := stealth.MustPage(s.browser)
+	// 定义增强版屏蔽列表
+	blockedURLs := []string{
+		// 1. 高带宽资源 (图片/字体/媒体) - 保持不变
+		"*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
+		"*.woff", "*.woff2", "*.ttf", "*.eot",
+		"*.mp4", "*.mp3",
+
+		// 2. 广告与追踪脚本 (新增了从日志里发现的!)
+		"*google-analytics*",
+		"*googletagmanager*",
+		"*doubleclick*",
+		"*criteo*",
+		"*facebook*",
+		"*twitter*",
+		"*appsflyer*",
+		"*smartnews*",
+		"*bing*",
+		"*yahoo*",
+		"*line-scdn*",
+		"*popin*",
+
+		// === [本次新增] ===
+		"*tiktok*",           // analytics.tiktok.com
+		"*sentry*",           // ingest.sentry.io (错误监控)
+		"*syndicatedsearch*", // Google 广告组件
+	}
+	if err := (proto.NetworkSetBlockedURLs{
+		Urls: blockedURLs,
+	}).Call(page); err != nil {
+		s.logger.Warn("set blocked urls failed", slog.String("error", err.Error()))
+	}
 	metrics.CrawlerBrowserActive.Inc()
 	defer func() {
 		metrics.CrawlerBrowserActive.Dec()
