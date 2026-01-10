@@ -82,6 +82,19 @@ var (
 		Help: "Number of tasks currently being processed",
 	})
 
+	// RateLimitWaitDuration 限流等待时长
+	RateLimitWaitDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "goodshunter_ratelimit_wait_duration_seconds",
+		Help:    "Time spent waiting for rate limiter tokens",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
+	})
+
+	// RateLimitTimeoutTotal 限流等待超时总数
+	RateLimitTimeoutTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_ratelimit_timeout_total",
+		Help: "Total number of rate limit wait timeouts",
+	})
+
 	// TaskRetryTotal 任务重试总数
 	TaskRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "goodshunter_task_retry_total",

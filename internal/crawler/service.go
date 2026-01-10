@@ -13,12 +13,14 @@ import (
 	"goodshunter/internal/config"
 	"goodshunter/internal/pkg/metrics"
 	"goodshunter/internal/pkg/queue"
+	"goodshunter/internal/pkg/ratelimit"
 	"goodshunter/proto/pb"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -33,6 +35,8 @@ type Service struct {
 	pb.UnimplementedCrawlerServiceServer
 	browser       *rod.Browser
 	queue         *queue.Queue // Worker Pool 用于控制并发
+	rdb           *redis.Client
+	rateLimiter   *ratelimit.RateLimiter
 	logger        *slog.Logger
 	defaultUA     string
 	pageTimeout   time.Duration
@@ -58,6 +62,22 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 	}
 	metrics.CrawlerBrowserInstances.Inc()
 
+	var rdb *redis.Client
+	var limiter *ratelimit.RateLimiter
+	if cfg.App.RateLimit > 0 && cfg.App.RateBurst > 0 {
+		rdb = redis.NewClient(&redis.Options{
+			Addr:     cfg.Redis.Addr,
+			Password: cfg.Redis.Password,
+		})
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			return nil, fmt.Errorf("connect redis for rate limit: %w", err)
+		}
+		limiter = ratelimit.NewRedisRateLimiter(rdb, logger, "goodshunter:ratelimit:crawler", cfg.App.RateLimit, cfg.App.RateBurst)
+		logger.Info("rate limiter enabled",
+			slog.Float64("rate", cfg.App.RateLimit),
+			slog.Float64("burst", cfg.App.RateBurst))
+	}
+
 	// 创建 Worker Pool
 	// workers 数量使用浏览器的最大并发数
 	// 队列容量设置为并发数的 2 倍，避免请求积压
@@ -80,6 +100,8 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 	return &Service{
 		browser:       browser,
 		queue:         q,
+		rdb:           rdb,
+		rateLimiter:   limiter,
 		logger:        logger,
 		defaultUA:     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 		pageTimeout:   30 * time.Second,
@@ -222,6 +244,15 @@ type fetchResult struct {
 func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	start := time.Now()
+
+	if s.rateLimiter != nil {
+		if err := s.rateLimiter.Acquire(ctx); err != nil {
+			if errors.Is(err, ratelimit.ErrRateLimitTimeout) {
+				return nil, fmt.Errorf("rate limit wait timeout: %w", err)
+			}
+			return nil, fmt.Errorf("rate limit: %w", err)
+		}
+	}
 
 	// 构建 URL 并打开新页面。
 	url := BuildMercariURL(req)
@@ -625,6 +656,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.logger.Error("close browser failed", slog.String("error", err.Error()))
 	} else {
 		metrics.CrawlerBrowserInstances.Dec()
+	}
+
+	if s.rdb != nil {
+		if err := s.rdb.Close(); err != nil {
+			s.logger.Warn("close redis failed", slog.String("error", err.Error()))
+		}
 	}
 
 	s.logger.Info("crawler worker pool shutdown completed")

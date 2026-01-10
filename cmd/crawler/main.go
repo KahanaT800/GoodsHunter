@@ -37,6 +37,14 @@ func main() {
 	appLogger := logger.NewDefault(cfg.App.LogLevel)
 	ctx := context.Background()
 
+	maxConcurrent := cfg.App.RateLimit * 30
+	if cfg.App.RateLimit > 0 && float64(cfg.App.WorkerPoolSize) > maxConcurrent {
+		appLogger.Warn("worker pool size is significantly higher than rate limit throughput capacity",
+			slog.Int("worker_pool_size", cfg.App.WorkerPoolSize),
+			slog.Float64("rate_limit", cfg.App.RateLimit),
+			slog.Float64("throughput_capacity", maxConcurrent))
+	}
+
 	service, err := crawler.NewService(ctx, cfg, appLogger)
 	if err != nil {
 		appLogger.Error("init crawler service failed", slog.String("error", err.Error()))

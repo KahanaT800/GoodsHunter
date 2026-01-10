@@ -43,6 +43,7 @@ type Scheduler struct {
 	taskProducer *taskqueue.Producer // 任务生产者（用于周期发布）
 	streamName   string              // Redis Stream 名称
 	groupName    string              // Consumer Group 名称
+	batchSize    int                 // 轮询批量入队大小
 }
 
 // NewScheduler 创建一个新的调度器实例。
@@ -66,7 +67,7 @@ type Scheduler struct {
 // 返回值:
 //
 //	*Scheduler: 调度器实例
-func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, enableRedis bool, streamName string, groupName string) *Scheduler {
+func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb.CrawlerServiceClient, notifier notify.Notifier, interval time.Duration, timeout time.Duration, newItemDuration time.Duration, maxItems int, workers int, capacity int, enableRedis bool, streamName string, groupName string, batchSize int) *Scheduler {
 	// 使用默认值（如果参数为 0）
 	if workers <= 0 {
 		workers = 50 // 默认 50 个并发 worker
@@ -91,6 +92,9 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 	}
 	if groupName == "" {
 		groupName = "scheduler_group"
+	}
+	if batchSize <= 0 {
+		batchSize = 100
 	}
 
 	// 初始化 Redis Streams 消费者（如果启用）
@@ -125,6 +129,7 @@ func NewScheduler(db *gorm.DB, rdb *redis.Client, logger *slog.Logger, client pb
 		taskProducer:    taskProducer,
 		streamName:      streamName,
 		groupName:       groupName,
+		batchSize:       batchSize,
 	}
 }
 
@@ -222,7 +227,7 @@ func (s *Scheduler) runPollingMode(ctx context.Context) {
 	s.logger.Info("scheduler running in DB polling mode")
 
 	// 首次立即调度一次
-	s.enqueueRunningTasks()
+	s.enqueueRunningTasks(ctx)
 
 	// 定时调度循环
 	ticker := time.NewTicker(s.interval)
@@ -244,7 +249,7 @@ func (s *Scheduler) runPollingMode(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			s.enqueueRunningTasks()
+			s.enqueueRunningTasks(ctx)
 
 		case <-statsTicker.C:
 			// 打印队列统计信息
@@ -306,7 +311,7 @@ func (s *Scheduler) handleTaskMessage(ctx context.Context, msg *taskqueue.Messag
 	switch taskMsg.Action {
 	case "execute":
 		// 提交到内存队列执行，由 worker 完成后再 ack
-		s.enqueueTaskMessage(msg)
+		s.enqueueTaskMessage(ctx, msg)
 
 	case "stop":
 		// 未来可以实现停止逻辑
@@ -413,7 +418,7 @@ func (s *Scheduler) StartTask(parentCtx context.Context, task *model.Task) {
 	if task == nil || task.Status != "running" {
 		return
 	}
-	s.enqueueTaskID(task.ID)
+	s.enqueueTaskID(parentCtx, task.ID)
 }
 
 // StopTask 仅记录日志，实际停止由任务状态控制。
@@ -422,34 +427,72 @@ func (s *Scheduler) StopTask(taskID uint) {
 }
 
 // enqueueRunningTasks 查询并入队所有 running 任务。
-func (s *Scheduler) enqueueRunningTasks() {
-	var taskIDs []uint
-	if err := s.db.Model(&model.Task{}).Where("status = ?", "running").Pluck("id", &taskIDs).Error; err != nil {
-		s.logger.Error("failed to load running tasks", slog.String("error", err.Error()))
-		return
+func (s *Scheduler) enqueueRunningTasks(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	for _, id := range taskIDs {
-		s.enqueueTaskID(id)
+
+	batchSize := s.batchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if capLimit := s.queue.Cap() / 5; capLimit > 0 && batchSize > capLimit {
+		batchSize = capLimit
+	}
+
+	var lastID uint
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		var taskIDs []uint
+		if err := s.db.WithContext(ctx).
+			Model(&model.Task{}).
+			Select("id").
+			Where("status = ? AND id > ?", "running", lastID).
+			Order("id ASC").
+			Limit(batchSize).
+			Pluck("id", &taskIDs).Error; err != nil {
+			s.logger.Error("failed to load running tasks", slog.String("error", err.Error()))
+			return
+		}
+
+		if len(taskIDs) == 0 {
+			return
+		}
+
+		for _, id := range taskIDs {
+			if ctx.Err() != nil {
+				return
+			}
+			s.enqueueTaskID(ctx, id)
+			lastID = id
+		}
 	}
 }
 
-func (s *Scheduler) enqueueTaskID(taskID uint) {
-	if !s.queue.Enqueue(func(ctx context.Context) error {
+func (s *Scheduler) enqueueTaskID(ctx context.Context, taskID uint) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.queue.EnqueueBlocking(ctx, func(ctx context.Context) error {
 		return s.handleTaskByID(ctx, taskID)
-	}) {
-		s.logger.Warn("queue full, task dropped",
+	}); err != nil {
+		s.logger.Warn("enqueue task blocked or canceled",
 			slog.Uint64("task_id", uint64(taskID)),
+			slog.String("error", err.Error()),
 			slog.Int("queue_len", s.queue.Len()),
 			slog.Int("queue_cap", s.queue.Cap()))
 	}
 }
 
-func (s *Scheduler) enqueueTaskMessage(msg *taskqueue.MessageWithID) {
+func (s *Scheduler) enqueueTaskMessage(ctx context.Context, msg *taskqueue.MessageWithID) {
 	if msg == nil || msg.Message == nil {
 		return
 	}
 
-	if !s.queue.Enqueue(func(workerCtx context.Context) error {
+	if err := s.queue.EnqueueBlocking(ctx, func(workerCtx context.Context) error {
 		err := s.handleTaskByID(workerCtx, msg.Message.TaskID)
 		if err != nil {
 			if s.taskConsumer != nil {
@@ -478,9 +521,10 @@ func (s *Scheduler) enqueueTaskMessage(msg *taskqueue.MessageWithID) {
 			}
 		}
 		return nil
-	}) {
-		s.logger.Warn("queue full, task dropped",
+	}); err != nil {
+		s.logger.Warn("enqueue task blocked or canceled",
 			slog.Uint64("task_id", uint64(msg.Message.TaskID)),
+			slog.String("error", err.Error()),
 			slog.Int("queue_len", s.queue.Len()),
 			slog.Int("queue_cap", s.queue.Cap()))
 	}
