@@ -26,7 +26,6 @@ import (
 
 var (
 	priceRe = regexp.MustCompile(`[0-9]+`)
-	idRe    = regexp.MustCompile(`m[0-9]+`)
 )
 
 // Service 实现爬虫 gRPC 服务，负责浏览器调度与页面解析。
