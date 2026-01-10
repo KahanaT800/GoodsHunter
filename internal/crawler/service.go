@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"goodshunter/internal/config"
@@ -138,10 +139,16 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 		Headless(cfg.Browser.Headless).
 		Bin(bin).
 		NoSandbox(true).
-		Set("remote-allow-origins", "*") // 解决某些环境下的 CORS 问题
+		Set("remote-allow-origins", "*")
 
+	// 读取并设置 HTTP 代理
 	if cfg.Browser.ProxyURL != "" {
 		l = l.Proxy(cfg.Browser.ProxyURL)
+		maskedProxy := cfg.Browser.ProxyURL
+		if parts := strings.Split(maskedProxy, "@"); len(parts) > 1 {
+			maskedProxy = "...@" + parts[1]
+		}
+		logger.Info("using http proxy", slog.String("proxy", maskedProxy))
 	}
 
 	url, err := l.Launch()
@@ -153,6 +160,40 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
+
+	var reqLogCount uint64
+	var blockLogCount uint64
+	const logSampleRate = uint64(1000)
+
+	router := browser.HijackRequests()
+	router.MustAdd("*", func(ctx *rod.Hijack) {
+		reqType := ctx.Request.Type()
+		reqURL := ctx.Request.URL().String()
+		if atomic.AddUint64(&reqLogCount, 1)%logSampleRate == 0 {
+			logger.Debug("net_req", slog.String("type", string(reqType)), slog.String("url", reqURL))
+		}
+		switch reqType {
+		case proto.NetworkResourceTypeDocument,
+			proto.NetworkResourceTypeScript,
+			proto.NetworkResourceTypeXHR,
+			proto.NetworkResourceTypeFetch:
+			ctx.ContinueRequest(&proto.FetchContinueRequest{})
+			return
+		case proto.NetworkResourceTypeImage,
+			proto.NetworkResourceTypeMedia,
+			proto.NetworkResourceTypeFont,
+			proto.NetworkResourceTypeStylesheet:
+			if atomic.AddUint64(&blockLogCount, 1)%logSampleRate == 0 {
+				logger.Debug("blocking_resource", slog.String("type", string(reqType)), slog.String("url", reqURL))
+			}
+			ctx.Response.Fail(proto.NetworkErrorReasonBlockedByClient)
+			return
+		default:
+			ctx.ContinueRequest(&proto.FetchContinueRequest{})
+			return
+		}
+	})
+	go router.Run()
 
 	logger.Info("browser started", slog.String("bin", bin))
 	return browser, nil
@@ -254,7 +295,6 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		}
 	}
 
-	// 构建 URL 并打开新页面。
 	url := BuildMercariURL(req)
 	page := stealth.MustPage(s.browser)
 	metrics.CrawlerBrowserActive.Inc()
@@ -284,11 +324,10 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		return nil, fmt.Errorf("blocked_page")
 	}
 
-	// 等待列表元素加载完成。
-	// 使用 Race 同时等待商品列表或空状态标志，避免在无商品时死等直到超时
+	// 等待 [data-testid="item-cell"] 内部出现 <a> 标签，避免骨架屏阶段
 	_, err = page.Race().
-		Element(`[data-testid="item-cell"]`).Handle(func(e *rod.Element) error {
-		return nil // 找到商品
+		Element(`[data-testid="item-cell"] a`).Handle(func(e *rod.Element) error {
+		return nil
 	}).
 		Element(`.merEmptyState`).Handle(func(e *rod.Element) error {
 		return fmt.Errorf("no_items_state")
@@ -313,43 +352,32 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	}
 
 	// 滚动加载更多商品，直到达到 maxFetchCount 或无法加载更多
-	selector := `[data-testid="item-cell"]`
+	selector := `[data-testid="item-cell"]:has(a)`
 	limit := s.maxFetchCount
 	if limit <= 0 {
 		limit = 50 // 默认保底
 	}
 
-	lastCount := 0
 	timeout := time.After(s.pageTimeout) // 总超时控制
+	noGrowthAttempts := 0
+
+	countItems := func() (int, error) {
+		elements, err := page.Elements(selector)
+		if err != nil {
+			return 0, err
+		}
+		return len(elements), nil
+	}
 
 	// 滚动循环
 	for {
-		// 检查当前数量 (仅统计已加载图片的有效商品)
-		// 这一步至关重要：因为 DOM 可能预先存在空壳元素，如果只查 item-cell 会导致提前结束滚动，
-		// 从而导致后续提取时因图片未加载而失败。
-		loadedElements, err := page.Elements(selector + " img")
+		currentCount, err := countItems()
 		if err != nil {
 			break
 		}
-		currentCount := len(loadedElements)
 		if currentCount >= limit {
 			break
 		}
-
-		// 如果数量不再增加（且已经尝试过滚动），则停止
-		if currentCount == lastCount && currentCount > 0 {
-			// 可以增加一些重试次数或更智能的检测，这里简单处理：
-			// 如果没变，尝试再滚一次，如果还是没变就退出？
-			// 为了避免死循环，这里假设 rod 的 Wait 会处理好，
-			// 我们简单地：如果没变，等待短时间后再次检查，如果还是没变则退出。
-			time.Sleep(500 * time.Millisecond)
-			elements2, _ := page.Elements(selector)
-			if len(elements2) == lastCount {
-				break
-			}
-			currentCount = len(elements2)
-		}
-		lastCount = currentCount
 
 		// 滚动策略：逐步向下滚动，而不是直接到底部，确保 Lazy Load 触发
 		// 获取当前滚动高度
@@ -362,6 +390,19 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 		default:
 			time.Sleep(500 * time.Millisecond) // 等待页面渲染
 		}
+
+		afterCount, err := countItems()
+		if err != nil {
+			break
+		}
+		if afterCount <= currentCount {
+			noGrowthAttempts++
+			if noGrowthAttempts >= 3 && currentCount > 0 {
+				break
+			}
+		} else {
+			noGrowthAttempts = 0
+		}
 	}
 
 ParseItems:
@@ -371,15 +412,10 @@ ParseItems:
 		return nil, fmt.Errorf("get elements: %w", err)
 	}
 	if len(elements) == 0 {
-		s.logger.Info("no items found",
-			slog.String("task_id", taskID),
-			slog.String("url", url),
-			slog.String("duration", time.Since(start).String()),
-		)
 		return &pb.FetchResponse{
 			Items:        []*pb.Item{},
 			TotalFound:   0,
-			ErrorMessage: "no_items",
+			ErrorMessage: "",
 		}, nil
 	}
 
@@ -412,8 +448,7 @@ ParseItems:
 		slog.Int("skipped", skipCount))
 	s.logger.Info("crawl completed",
 		slog.String("task_id", taskID),
-		slog.String("url", url),
-		slog.Int("elements", len(elements)),
+		slog.Int("count", len(items)),
 		slog.String("duration", time.Since(start).String()))
 	return &pb.FetchResponse{
 		Items:        items,
@@ -515,36 +550,9 @@ func classifyCrawlerError(err error) string {
 }
 
 // extractItem 从单个 DOM 元素中提取商品信息。
-//
-// 参数:
-//
-//	el: 代表单个商品的 DOM 元素
-//
-// 返回值:
-//
-//	*pb.Item: 提取出的商品结构体
-//	error: 解析失败返回错误
+// 这里的关键是：不依赖 <img> 标签的存在，因为资源屏蔽可能导致它被 DOM 移除。
 func extractItem(el *rod.Element) (*pb.Item, error) {
-	// 解析主图与标题。
-	img, err := el.Element("img")
-	if err != nil {
-		return nil, fmt.Errorf("img: %w", err)
-	}
-	title, err := img.Attribute("alt")
-	if err != nil {
-		return nil, fmt.Errorf("img alt: %w", err)
-	}
-	src, err := img.Attribute("src")
-	if err != nil {
-		return nil, fmt.Errorf("img src: %w", err)
-	}
-
-	titleStr := ""
-	if title != nil {
-		titleStr = strings.TrimSuffix(*title, "のサムネイル")
-	}
-
-	// 解析商品链接。
+	// 1. 提取链接 (<a>) - 这是核心，必须存在
 	link, err := el.Element("a")
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -555,17 +563,10 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 		itemURL = *href
 	}
 
-	// 从图片 URL 提取商品 ID（m\d+）。
+	// 2. 提取 ID (从链接中)
 	id := ""
-	if src != nil {
-		if m := idRe.FindString(*src); m != "" {
-			id = m
-		}
-	}
-
-	// 如果从图片无法提取 ID，尝试从链接提取
-	if id == "" && itemURL != "" {
-		// 普通商品: /item/m123456
+	if itemURL != "" {
+		// 逻辑：匹配 /item/m... 或 /shops/product/...
 		if strings.Contains(itemURL, "/item/") {
 			parts := strings.Split(itemURL, "/")
 			if len(parts) > 0 {
@@ -574,9 +575,7 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 					id = possibleID
 				}
 			}
-		}
-		// Mercari Shops 商品: /shops/product/XYZ
-		if strings.Contains(itemURL, "/shops/product/") {
+		} else if strings.Contains(itemURL, "/shops/product/") {
 			parts := strings.Split(itemURL, "/")
 			if len(parts) > 0 {
 				id = "shops_" + parts[len(parts)-1]
@@ -584,26 +583,47 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 		}
 	}
 
-	// 解析价格。
-	priceEl, err := el.Element(".merPrice")
-	if err != nil {
-		return nil, fmt.Errorf("price: %w", err)
-	}
-	priceTxt, err := priceEl.Text()
-	if err != nil {
-		return nil, fmt.Errorf("price text: %w", err)
-	}
-	priceVal, err := parsePrice(priceTxt)
-	if err != nil {
-		return nil, fmt.Errorf("parse price: %w", err)
+	// 3. 提取标题
+	// 策略：优先找 data-testid="thumbnail-item-name" (最稳)，找不到再尝试找 img alt (兼容旧版)
+	titleStr := ""
+	if titleEl, err := el.Element(`[data-testid="thumbnail-item-name"]`); err == nil {
+		titleStr, _ = titleEl.Text()
+	} else {
+		// 只有在找不到文本节点时，才尝试去找 img (此时 img 不存在也没关系，只是标题为空)
+		if img, err := el.Element("img"); err == nil {
+			if alt, _ := img.Attribute("alt"); alt != nil {
+				titleStr = strings.TrimSuffix(*alt, "のサムネイル")
+			}
+		}
 	}
 
+	// 4. 提取价格
+	priceVal := int64(0)
+	// 尝试多种价格选择器，Mercari 经常变
+	priceSelectors := []string{".merPrice", "[data-testid='price']", "span[class*='price']"}
+	for _, sel := range priceSelectors {
+		if priceEl, err := el.Element(sel); err == nil {
+			if txt, err := priceEl.Text(); err == nil {
+				if val, err := parsePrice(txt); err == nil {
+					priceVal = val
+					break
+				}
+			}
+		}
+	}
+	// 如果实在解析不到价格，但其他信息都在，我们可以选择报错或者给个 0 (这里选择报错，因为没价格没意义)
+	if priceVal == 0 {
+		return nil, fmt.Errorf("price not found or zero")
+	}
+
+	// 5. 构造图片 URL (完全不依赖 img src)
 	imageURL := ""
-	if src != nil {
-		imageURL = *src
+	if id != "" && strings.HasPrefix(id, "m") {
+		// 标准 Mercari 图片规则
+		imageURL = fmt.Sprintf("https://static.mercdn.net/thumb/item/webp/%s_1.jpg", id)
 	}
-	itemURL = normalizeMercariURL(itemURL)
 
+	// 6. 状态判断
 	status := "on_sale"
 	if txt, err := el.Text(); err == nil {
 		lower := strings.ToLower(txt)
@@ -611,6 +631,8 @@ func extractItem(el *rod.Element) (*pb.Item, error) {
 			status = "sold"
 		}
 	}
+
+	itemURL = normalizeMercariURL(itemURL)
 
 	return &pb.Item{
 		SourceId: id,
