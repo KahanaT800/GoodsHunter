@@ -52,6 +52,17 @@ func main() {
 
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	go func() {
+		// 添加保险丝
+		defer func() {
+			if r := recover(); r != nil {
+				appLogger.Error("PANIC in redis worker loop", slog.Any("panic", r))
+				// 注意：这里 Panic 后循环就结束了，Worker 实际上停止了。
+				// 在生产环境中，你可能希望它能自动重启，或者让主进程退出触发 Docker 重启。
+				// 记录日志后，通知主进程退出，让 Docker 负责重启，保持状态干净。
+				os.Exit(1)
+			}
+		}()
+
 		appLogger.Info("starting redis worker loop")
 		if err := service.StartWorker(workerCtx); err != nil && err != context.Canceled {
 			appLogger.Error("redis worker loop stopped", slog.String("error", err.Error()))

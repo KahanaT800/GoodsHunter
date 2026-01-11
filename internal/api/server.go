@@ -181,8 +181,24 @@ func (s *Server) Router() http.Handler {
 
 // StartScheduler 启动调度器。
 func (s *Server) StartScheduler(ctx context.Context) {
-	go s.sched.DispatchTasks(ctx)
+	// 1. 保护任务分发器
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("PANIC in scheduler dispatcher", slog.Any("panic", r))
+				// 可选：在这里发送告警或尝试重启
+			}
+		}()
+		s.sched.DispatchTasks(ctx)
+	}()
+
+	// 2. 保护结果监听器
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("PANIC in result listener", slog.Any("panic", r))
+			}
+		}()
 		if err := s.sched.StartResultListener(ctx); err != nil {
 			s.logger.Error("result listener stopped", slog.String("error", err.Error()))
 		}

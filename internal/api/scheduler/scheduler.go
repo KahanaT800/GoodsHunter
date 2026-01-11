@@ -200,17 +200,30 @@ func (s *Scheduler) StartResultListener(ctx context.Context) error {
 		}
 
 		// 3. 并发处理入库
-		go func(r *pb.FetchResponse) {
+		go func(resp *pb.FetchResponse) {
 			// 任务结束时归还令牌
 			defer func() { <-sem }()
 
+			defer func() {
+				if r := recover(); r != nil {
+					// 如果代码运行到这里，说明发生了严重的 Panic！
+					// 1. 我们捕获它，不让它向上冒泡炸掉整个进程。
+					// 2. 我们记录下是谁（task_id）导致了崩溃，以及崩溃原因（r）。
+					s.logger.Error("PANIC in result handler",
+						slog.Any("panic", r), // 打印崩溃原因（如 "runtime error: ...")
+						slog.String("task_id", resp.GetTaskId()))
+
+					// 3. 函数在这里优雅结束，Goroutine 退出，但 API 进程还在！
+				}
+			}()
+
 			// 使用 Background context 防止入库操作被外层 cancel 中断（导致半个事务）
-			if err := s.handleResult(context.Background(), r); err != nil {
+			if err := s.handleResult(context.Background(), resp); err != nil {
 				s.logger.Error("result processing failed", slog.String("error", err.Error()))
 			} else {
 				s.logger.Info("result processed",
-					slog.String("task_id", r.GetTaskId()),
-					slog.Int("items", len(r.GetItems())))
+					slog.String("task_id", resp.GetTaskId()),
+					slog.Int("items", len(resp.GetItems())))
 			}
 		}(res)
 	}

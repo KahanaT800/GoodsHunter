@@ -128,7 +128,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		rateLimiter:    limiter,
 		logger:         logger,
 		defaultUA:      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-		pageTimeout:    30 * time.Second,
+		pageTimeout:    60 * time.Second,
 		maxFetchCount:  cfg.Browser.MaxFetchCount,
 		cfg:            cfg,
 		currentIsProxy: false,
@@ -197,7 +197,7 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			resp, err := s.FetchItems(taskCtx, t)
 			if err != nil {
 				s.logger.Warn("crawl task failed",
-					slog.String("task_id", task.GetTaskId()),
+					slog.String("task_id", t.GetTaskId()),
 					slog.String("error", err.Error()))
 				// 即使失败也构造一个包含 TaskId 的响应以便追踪
 				if resp == nil {
@@ -207,10 +207,13 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			// 推送结果到 Redis
 			if resp != nil {
 				if resp.TaskId == "" {
-					resp.TaskId = task.GetTaskId()
+					resp.TaskId = t.GetTaskId()
 				}
 				// 异步回传结果
-				if pushErr := s.redisQueue.PushResult(ctx, resp); pushErr != nil {
+				pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer pushCancel()
+
+				if pushErr := s.redisQueue.PushResult(pushCtx, resp); pushErr != nil {
 					s.logger.Error("push redis result failed", slog.String("error", pushErr.Error()))
 				}
 			}
