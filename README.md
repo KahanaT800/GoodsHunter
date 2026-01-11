@@ -58,7 +58,8 @@ graph TB
         Crawler3[Crawler 节点 ...]
     end
     
-    TaskQueue -->|3. BRPOP (Blocking)| WorkerScale
+    %% Fixed the parentheses in the label below
+    TaskQueue -->|"3. BRPOP (Blocking)"| WorkerScale
     WorkerScale -->|4. Execute| Target[目标网站]
     WorkerScale -->|5. LPUSH| ResultQueue[("Redis List<br/>goodshunter:queue:results")]
     
