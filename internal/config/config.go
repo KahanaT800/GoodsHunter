@@ -194,7 +194,7 @@ func getDefaultConfig() *Config {
 			BinPath:        "",
 			ProxyURL:       "",
 			Headless:       true,
-			MaxConcurrency: 5,
+			MaxConcurrency: 3,
 			MaxFetchCount:  50,
 		},
 		Email: EmailConfig{

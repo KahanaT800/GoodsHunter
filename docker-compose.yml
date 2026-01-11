@@ -34,6 +34,11 @@ services:
     image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-crawler:latest
     restart: always
     stop_grace_period: 2m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
@@ -49,7 +54,7 @@ services:
       BROWSER_BIN_PATH: ${BROWSER_BIN_PATH:-/usr/bin/chromium-browser}
       HTTP_PROXY: ${HTTP_PROXY:-}
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
-      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-5}
+      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-3}
       BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}
     depends_on:
       mysql:
@@ -69,6 +74,11 @@ services:
   api:
     image: ghcr.io/${REPO_OWNER:-kahanat800}/goodshunter-api:latest
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}

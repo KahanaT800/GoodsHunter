@@ -152,9 +152,24 @@ func (s *Service) StartWorker(ctx context.Context) error {
 		return errors.New("redis queue client is not initialized")
 	}
 
+	concurrencyLimit := s.queue.Cap() + 10       // 并发任务数设置略高于 Worker Pool 容量
+	sem := make(chan struct{}, concurrencyLimit) // 信号量通道
+	s.logger.Info("crawler worker started", slog.Int("concurrency_limit", concurrencyLimit))
+
 	for {
+		// 1. 在拉取任务前先申请令牌，如果处理不过来，就暂停拉取 Redis
+		select {
+		// 获取令牌
+		case sem <- struct{}{}:
+			// 成功获取令牌，继续
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// 2. 拉取任务
 		task, err := s.redisQueue.PopTask(ctx, 2*time.Second)
 		if err != nil {
+			<-sem // 拉取失败, 释放令牌
 			if errors.Is(err, redisqueue.ErrNoTask) {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -168,25 +183,38 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			continue
 		}
 
-		taskCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		resp, err := s.FetchItems(taskCtx, task)
-		cancel()
-		if err != nil {
-			s.logger.Warn("crawl task failed",
-				slog.String("task_id", task.GetTaskId()),
-				slog.String("error", err.Error()))
-		}
-		if resp == nil && err != nil {
-			resp = &pb.FetchResponse{ErrorMessage: err.Error(), TaskId: task.GetTaskId()}
-		}
-		if resp != nil {
-			if resp.TaskId == "" {
-				resp.TaskId = task.GetTaskId()
+		// 3. 处理任务（在独立 goroutine 中）
+		go func(t *pb.FetchRequest) {
+			defer func() {
+				<-sem // 任务处理完成，释放令牌
+			}()
+
+			// 为每个任务设置独立的上下文
+			taskCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+
+			// FetchItems 内部会通过 worker pool 进一步控制浏览器并发
+			resp, err := s.FetchItems(taskCtx, t)
+			if err != nil {
+				s.logger.Warn("crawl task failed",
+					slog.String("task_id", task.GetTaskId()),
+					slog.String("error", err.Error()))
+				// 即使失败也构造一个包含 TaskId 的响应以便追踪
+				if resp == nil {
+					resp = &pb.FetchResponse{ErrorMessage: err.Error(), TaskId: t.GetTaskId()}
+				}
 			}
-			if pushErr := s.redisQueue.PushResult(ctx, resp); pushErr != nil {
-				s.logger.Error("push redis result failed", slog.String("error", pushErr.Error()))
+			// 推送结果到 Redis
+			if resp != nil {
+				if resp.TaskId == "" {
+					resp.TaskId = task.GetTaskId()
+				}
+				// 异步回传结果
+				if pushErr := s.redisQueue.PushResult(ctx, resp); pushErr != nil {
+					s.logger.Error("push redis result failed", slog.String("error", pushErr.Error()))
+				}
 			}
-		}
+		}(task)
 	}
 }
 
@@ -215,10 +243,17 @@ func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.
 		bin = path
 	}
 
+	// 针对 Docker/EC2 环境的 Flag 优化
 	l := launcher.New().
 		Headless(cfg.Browser.Headless).
 		Bin(bin).
 		NoSandbox(true).
+		// 禁用 /dev/shm，防止容器内内存崩溃
+		Set("disable-dev-shm-usage", "true").
+		// 禁用 GPU，服务器环境不需要，节省资源
+		Set("disable-gpu", "true").
+		// 禁用软件光栅化器，进一步减少计算开销
+		Set("disable-software-rasterizer", "true").
 		Set("remote-allow-origins", "*")
 
 	var proxyServer string
