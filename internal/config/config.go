@@ -41,6 +41,7 @@ type AppConfig struct {
 	RateBurst        float64       `json:"rate_burst"`         // 限流桶容量
 	QueueBatchSize   int           `json:"queue_batch_size"`   // 轮询批量入队大小
 	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
+	ProxyCooldown    time.Duration `json:"proxy_cooldown"`     // 直连失败后代理冷却时间
 
 	// Redis Streams 任务队列配置
 	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
@@ -185,6 +186,7 @@ func getDefaultConfig() *Config {
 			RateBurst:        5,
 			QueueBatchSize:   100,
 			DedupWindow:      3600,
+			ProxyCooldown:    10 * time.Minute,
 
 			// Redis Streams 默认配置
 			EnableRedisQueue: false, // 默认关闭，渐进式升级
@@ -270,6 +272,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.DedupWindow == 0 {
 		cfg.App.DedupWindow = defaults.App.DedupWindow
+	}
+	if cfg.App.ProxyCooldown == 0 {
+		cfg.App.ProxyCooldown = defaults.App.ProxyCooldown
 	}
 	// Redis Streams 默认值
 	if cfg.App.TaskQueueStream == "" {
@@ -384,6 +389,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("APP_DEDUP_WINDOW"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
 			cfg.App.DedupWindow = i
+		}
+	}
+	if v := os.Getenv("PROXY_COOLDOWN"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.App.ProxyCooldown = d
 		}
 	}
 

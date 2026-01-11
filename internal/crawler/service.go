@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"goodshunter/internal/config"
@@ -34,14 +37,19 @@ var (
 // 它维护了一个 rod.Browser 实例，并使用 worker pool 控制并发抓取数量。
 type Service struct {
 	pb.UnimplementedCrawlerServiceServer
-	browser       *rod.Browser
-	queue         *queue.Queue // Worker Pool 用于控制并发
-	rdb           *redis.Client
-	rateLimiter   *ratelimit.RateLimiter
-	logger        *slog.Logger
-	defaultUA     string
-	pageTimeout   time.Duration
-	maxFetchCount int
+	browser        *rod.Browser
+	queue          *queue.Queue // Worker Pool 用于控制并发
+	rdb            *redis.Client
+	rateLimiter    *ratelimit.RateLimiter
+	logger         *slog.Logger
+	defaultUA      string
+	pageTimeout    time.Duration
+	maxFetchCount  int
+	cfg            *config.Config
+	proxyUntil     time.Time
+	currentIsProxy bool
+	mu             sync.RWMutex
+	forceProxyOnce uint32
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -57,7 +65,7 @@ type Service struct {
 //	*Service: 初始化完成的服务实例
 //	error: 如果浏览器启动失败则返回错误
 func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Service, error) {
-	browser, err := startBrowser(cfg, logger)
+	browser, err := startBrowser(cfg, logger, false)
 	if err != nil {
 		return nil, err
 	}
@@ -98,16 +106,27 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		slog.Int("workers", workers),
 		slog.Int("capacity", capacity))
 
-	return &Service{
-		browser:       browser,
-		queue:         q,
-		rdb:           rdb,
-		rateLimiter:   limiter,
-		logger:        logger,
-		defaultUA:     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-		pageTimeout:   30 * time.Second,
-		maxFetchCount: cfg.Browser.MaxFetchCount,
-	}, nil
+	forceProxyOnce := uint32(0)
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("FORCE_PROXY_ONCE"))); v == "1" || v == "true" || v == "yes" {
+		forceProxyOnce = 1
+		logger.Warn("force proxy switch enabled for next crawl", slog.String("env", "FORCE_PROXY_ONCE"))
+	}
+
+	service := &Service{
+		browser:        browser,
+		queue:          q,
+		rdb:            rdb,
+		rateLimiter:    limiter,
+		logger:         logger,
+		defaultUA:      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+		pageTimeout:    30 * time.Second,
+		maxFetchCount:  cfg.Browser.MaxFetchCount,
+		cfg:            cfg,
+		currentIsProxy: false,
+		forceProxyOnce: forceProxyOnce,
+	}
+	metrics.CrawlerProxyMode.Set(0)
+	return service, nil
 }
 
 // startBrowser 根据配置启动浏览器。
@@ -124,7 +143,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 //
 //	*rod.Browser: 连接好的浏览器实例
 //	error: 启动失败返回错误
-func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error) {
+func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.Browser, error) {
 	bin := cfg.Browser.BinPath
 	if bin == "" {
 		logger.Info("no browser binary specified, downloading default...")
@@ -146,7 +165,10 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 	var proxyPass string
 
 	// 读取并设置 HTTP 代理
-	if cfg.Browser.ProxyURL != "" {
+	if useProxy {
+		if cfg.Browser.ProxyURL == "" {
+			return nil, fmt.Errorf("proxy enabled but no proxy url configured")
+		}
 		parsed, err := url.Parse(cfg.Browser.ProxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy url: %w", err)
@@ -185,8 +207,82 @@ func startBrowser(cfg *config.Config, logger *slog.Logger) (*rod.Browser, error)
 		logger.Info("proxy authentication handler registered")
 	}
 
-	logger.Info("browser started", slog.String("bin", bin))
+	mode := "direct"
+	if useProxy {
+		mode = "proxy"
+	}
+	logger.Info("browser started", slog.String("bin", bin), slog.String("mode", mode))
 	return browser, nil
+}
+
+func (s *Service) ensureBrowserState() error {
+	s.mu.RLock()
+	shouldUseProxy := time.Now().Before(s.proxyUntil)
+	currentIsProxy := s.currentIsProxy
+	s.mu.RUnlock()
+
+	if shouldUseProxy == currentIsProxy {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	shouldUseProxy = time.Now().Before(s.proxyUntil)
+	if shouldUseProxy == s.currentIsProxy {
+		return nil
+	}
+
+	if err := s.rotateBrowser(shouldUseProxy); err != nil {
+		return err
+	}
+	s.currentIsProxy = shouldUseProxy
+	mode := "direct"
+	if shouldUseProxy {
+		mode = "proxy"
+	}
+	metrics.CrawlerProxyMode.Set(boolToGauge(shouldUseProxy))
+	metrics.CrawlerProxySwitchTotal.WithLabelValues(mode).Inc()
+	s.logger.Info("crawler mode switched", slog.String("mode", mode))
+	return nil
+}
+
+// rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
+func (s *Service) rotateBrowser(useProxy bool) error {
+	newBrowser, err := startBrowser(s.cfg, s.logger, useProxy)
+	if err != nil {
+		return err
+	}
+	oldBrowser := s.browser
+	s.browser = newBrowser
+	if oldBrowser != nil {
+		if err := oldBrowser.Close(); err != nil {
+			s.logger.Warn("close browser failed", slog.String("error", err.Error()))
+		}
+	}
+	return nil
+}
+
+func (s *Service) isUsingProxy() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentIsProxy
+}
+
+func (s *Service) activateProxyCooldown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until := time.Now().Add(s.cfg.App.ProxyCooldown)
+	if until.After(s.proxyUntil) {
+		s.proxyUntil = until
+	}
+}
+
+func boolToGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // FetchItems 处理抓取请求。
@@ -227,7 +323,7 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 	// 创建 Job 函数
 	job := func(workerCtx context.Context) error {
-		response, err := s.executeCrawl(ctx, req)
+		response, err := s.doCrawl(ctx, req, 0)
 
 		// 将结果发送到 channel
 		select {
@@ -271,8 +367,36 @@ type fetchResult struct {
 	err      error
 }
 
-// executeCrawl 执行实际的爬取逻辑
-func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
+func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
+	if err := s.ensureBrowserState(); err != nil {
+		return nil, err
+	}
+
+	if attempt == 0 && !s.isUsingProxy() && atomic.CompareAndSwapUint32(&s.forceProxyOnce, 1, 0) {
+		s.logger.Warn("direct connection failed, activating proxy",
+			slog.String("reason", "forced"),
+			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
+		s.activateProxyCooldown()
+		return s.doCrawl(ctx, req, attempt+1)
+	}
+
+	response, err := s.crawlOnce(ctx, req)
+	if err == nil {
+		return response, nil
+	}
+
+	if attempt == 0 && !s.isUsingProxy() && shouldActivateProxy(err) {
+		s.logger.Warn("direct connection failed, activating proxy",
+			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
+		s.activateProxyCooldown()
+		return s.doCrawl(ctx, req, attempt+1)
+	}
+
+	return response, err
+}
+
+// crawlOnce 执行单次爬取逻辑（不包含自动切换与重试）。
+func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	start := time.Now()
 
@@ -286,7 +410,13 @@ func (s *Service) executeCrawl(ctx context.Context, req *pb.FetchRequest) (*pb.F
 	}
 
 	url := BuildMercariURL(req)
-	page := stealth.MustPage(s.browser)
+	s.mu.RLock()
+	browser := s.browser
+	s.mu.RUnlock()
+	if browser == nil {
+		return nil, fmt.Errorf("browser not initialized")
+	}
+	page := stealth.MustPage(browser)
 	// 定义增强版屏蔽列表
 	blockedURLs := []string{
 		// 1. 高带宽资源 (图片/字体/媒体) - 保持不变
@@ -550,6 +680,25 @@ func isBlockedText(text string) bool {
 	return false
 }
 
+func shouldActivateProxy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "blocked_page") ||
+		strings.Contains(msg, "cloudflare") ||
+		strings.Contains(msg, "attention required") ||
+		strings.Contains(msg, "access denied") {
+		return true
+	}
+	if strings.Contains(msg, "net::") ||
+		strings.Contains(msg, "connection") ||
+		strings.Contains(msg, "navigate") {
+		return true
+	}
+	return false
+}
+
 func classifyCrawlerError(err error) string {
 	if err == nil {
 		return "unknown"
@@ -786,10 +935,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("shutdown worker pool: %w", err)
 	}
 
-	if err := s.browser.Close(); err != nil {
-		s.logger.Error("close browser failed", slog.String("error", err.Error()))
-	} else {
-		metrics.CrawlerBrowserInstances.Dec()
+	s.mu.Lock()
+	browser := s.browser
+	s.browser = nil
+	s.mu.Unlock()
+	if browser != nil {
+		if err := browser.Close(); err != nil {
+			s.logger.Error("close browser failed", slog.String("error", err.Error()))
+		} else {
+			metrics.CrawlerBrowserInstances.Dec()
+		}
 	}
 
 	if s.rdb != nil {

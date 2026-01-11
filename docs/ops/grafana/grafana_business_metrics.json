@@ -1439,6 +1439,79 @@
     },
     {
       "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "爬虫连接模式（直连/代理）切换情况，固定查看最近 12h。",
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "text": "direct"
+                },
+                "1": {
+                  "text": "proxy"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.0-20781422371",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "goodshunter_crawler_proxy_mode{job=\"prometheus.scrape.goodshunter_crawler\"}",
+          "legendFormat": "mode",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "timeFrom": "12h",
+      "title": "Crawler Connection Mode (12h)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
         "type": "loki",
         "uid": "${loki}"
       },
