@@ -47,12 +47,12 @@ graph TB
     User[用户] -->|HTTPS| Nginx[Nginx + SSL]
     Nginx -->|API| API[API 服务]
     
-    subgraph Scheduler [调度器 (API)]
+    subgraph Scheduler ["调度器 (API)"]
         API -->|1. 定期扫描| DB[(MySQL)]
-        API -->|2. LPUSH| TaskQueue[(Redis List<br/>goodshunter:queue:tasks)]
+        API -->|2. LPUSH| TaskQueue[("Redis List<br/>goodshunter:queue:tasks")]
     end
     
-    subgraph WorkerScale [水平扩展 Worker]
+    subgraph WorkerScale ["水平扩展 Worker"]
         Crawler1[Crawler 节点 1]
         Crawler2[Crawler 节点 2]
         Crawler3[Crawler 节点 ...]
@@ -60,9 +60,9 @@ graph TB
     
     TaskQueue -->|3. BRPOP (Blocking)| WorkerScale
     WorkerScale -->|4. Execute| Target[目标网站]
-    WorkerScale -->|5. LPUSH| ResultQueue[(Redis List<br/>goodshunter:queue:results)]
+    WorkerScale -->|5. LPUSH| ResultQueue[("Redis List<br/>goodshunter:queue:results")]
     
-    subgraph Processor [结果处理 (API)]
+    subgraph Processor ["结果处理 (API)"]
         ResultQueue -->|6. BRPOP| API
         API -->|7. Update| DB
     end
