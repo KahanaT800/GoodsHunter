@@ -153,6 +153,8 @@ func (s *Scheduler) DispatchTasks(ctx context.Context) {
 	}
 }
 
+// internal/api/scheduler/scheduler.go
+
 // StartResultListener 监听 Redis 结果队列并处理抓取结果。
 func (s *Scheduler) StartResultListener(ctx context.Context) error {
 	if s.redisQueue == nil {
@@ -163,48 +165,49 @@ func (s *Scheduler) StartResultListener(ctx context.Context) error {
 	go s.monitorQueueDepth(ctx)
 
 	// 限制 API 端并发处理结果的数量（例如 10 并发）
-	// t3.small 的数据库连接池有限，不宜过高
 	sem := make(chan struct{}, 10)
 
 	for {
-		// 申请令牌
+		// 1. 申请令牌
 		select {
 		case sem <- struct{}{}:
-			// 获得令牌，继续处理
+			// 获得令牌，继续
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil // 正常退出
 		}
 
+		// 2. 拉取结果
 		res, err := s.redisQueue.PopResult(ctx, 2*time.Second)
-		// 处理错误情况
 		if err != nil {
+			// 归还令牌
+			<-sem
 			if errors.Is(err, redisqueue.ErrNoResult) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
+			// 优雅关闭：返回 nil 而不是 err，防止 main 函数打印 "error: context canceled"
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.logger.Info("result listener stopped")
-				return err
+				return nil
 			}
 			s.logger.Error("pop redis result failed", slog.String("error", err.Error()))
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		// 空结果直接释放令牌继续
+
 		if res == nil {
-			<-sem // 释放令牌
+			<-sem // 防御性编程：空结果也归还
 			continue
 		}
 
-		// 并发处理入库
+		// 3. 并发处理入库
 		go func(r *pb.FetchResponse) {
+			// 任务结束时归还令牌
 			defer func() { <-sem }()
 
-			// 需要确保 db 实例是并发安全的（GORM 是安全的）
+			// 使用 Background context 防止入库操作被外层 cancel 中断（导致半个事务）
 			if err := s.handleResult(context.Background(), r); err != nil {
 				s.logger.Error("result processing failed", slog.String("error", err.Error()))
 			} else {
-				// 记录成功日志摘要
 				s.logger.Info("result processed",
 					slog.String("task_id", r.GetTaskId()),
 					slog.Int("items", len(r.GetItems())))
