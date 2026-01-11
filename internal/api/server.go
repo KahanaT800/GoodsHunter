@@ -127,8 +127,8 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger, red
 		cfg.App.ScheduleInterval,
 		cfg.App.NewItemDuration,
 		cfg.App.MaxItemsPerTask,
-		cfg.App.WorkerPoolSize,   // Worker Pool 大小
-		cfg.App.QueueCapacity,    // 队列容量
+		cfg.App.WorkerPoolSize, // Worker Pool 大小
+		cfg.App.QueueCapacity,  // 队列容量
 		cfg.App.QueueBatchSize,
 	)
 

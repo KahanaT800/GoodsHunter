@@ -52,6 +52,7 @@ type Scheduler struct {
 //	maxItems: 每个任务保留的最大商品数
 //	workers: Worker Pool 大小（并发任务数，0 表示使用默认值 50）
 //	capacity: 队列容量（0 表示使用默认值 1000）
+//
 // 返回值:
 //
 //	*Scheduler: 调度器实例
