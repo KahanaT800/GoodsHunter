@@ -50,6 +50,9 @@ type Service struct {
 	currentIsProxy bool
 	mu             sync.RWMutex
 	forceProxyOnce uint32
+	taskCounter    atomic.Uint64
+	maxTasks       uint64
+	restartCh      chan struct{}
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -112,6 +115,11 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		logger.Warn("force proxy switch enabled for next crawl", slog.String("env", "FORCE_PROXY_ONCE"))
 	}
 
+	maxTasks := uint64(0)
+	if cfg.App.MaxTasks > 0 {
+		maxTasks = uint64(cfg.App.MaxTasks)
+	}
+
 	service := &Service{
 		browser:        browser,
 		queue:          q,
@@ -124,9 +132,16 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*
 		cfg:            cfg,
 		currentIsProxy: false,
 		forceProxyOnce: forceProxyOnce,
+		maxTasks:       maxTasks,
+		restartCh:      make(chan struct{}, 1),
 	}
 	metrics.CrawlerProxyMode.Set(0)
 	return service, nil
+}
+
+// RestartSignal exposes the restart notification channel.
+func (s *Service) RestartSignal() <-chan struct{} {
+	return s.restartCh
 }
 
 // startBrowser 根据配置启动浏览器。
@@ -243,6 +258,9 @@ func (s *Service) ensureBrowserState() error {
 	}
 	metrics.CrawlerProxyMode.Set(boolToGauge(shouldUseProxy))
 	metrics.CrawlerProxySwitchTotal.WithLabelValues(mode).Inc()
+	if shouldUseProxy {
+		metrics.CrawlerProxySwitchToProxyTotal.Inc()
+	}
 	s.logger.Info("crawler mode switched", slog.String("mode", mode))
 	return nil
 }
@@ -318,6 +336,21 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 		}
 	}
 
+	recordModeMetrics := func(resp *pb.FetchResponse, err error) {
+		mode := "direct"
+		if s.isUsingProxy() {
+			mode = "proxy"
+		}
+		status := "success"
+		if err != nil {
+			status = classifyCrawlStatus(err)
+		} else if resp != nil && len(resp.Items) == 0 {
+			status = "empty_result"
+		}
+		metrics.CrawlerRequestsByModeTotal.WithLabelValues(platform, status, mode).Inc()
+		metrics.CrawlerRequestDurationByMode.WithLabelValues(platform, mode).Observe(time.Since(start).Seconds())
+	}
+
 	// 创建一个 channel 用于接收抓取结果
 	resultCh := make(chan *fetchResult, 1)
 
@@ -338,12 +371,27 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 	// 提交到 worker pool（阻塞式，直到队列有空间）
 	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
 		recordMetrics("failed", err)
+		recordModeMetrics(nil, err)
 		return nil, fmt.Errorf("enqueue crawl job: %w", err)
 	}
 
 	// 等待结果
 	select {
 	case result := <-resultCh:
+		if s.maxTasks > 0 {
+			newCount := s.taskCounter.Add(1)
+			metrics.CrawlerTasksProcessedCurrent.Set(float64(newCount))
+			if newCount >= s.maxTasks {
+				select {
+				case s.restartCh <- struct{}{}:
+					s.logger.Info("max tasks reached, signaling shutdown",
+						slog.Uint64("count", newCount),
+						slog.Uint64("limit", s.maxTasks))
+				default:
+				}
+			}
+		}
+
 		if result.err != nil {
 			s.logger.Error("crawl failed",
 				slog.String("task_id", taskID),
@@ -351,12 +399,15 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 				slog.String("duration", time.Since(start).String()),
 			)
 			recordMetrics("failed", result.err)
+			recordModeMetrics(result.response, result.err)
 			return nil, result.err
 		}
 		recordMetrics("success", nil)
+		recordModeMetrics(result.response, nil)
 		return result.response, nil
 	case <-ctx.Done():
 		recordMetrics("failed", ctx.Err())
+		recordModeMetrics(nil, ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -717,6 +768,20 @@ func classifyCrawlerError(err error) string {
 	default:
 		return "unknown"
 	}
+}
+
+func classifyCrawlStatus(err error) string {
+	if err == nil {
+		return "success"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "403") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "access denied") ||
+		strings.Contains(msg, "blocked_page") {
+		return "403_forbidden"
+	}
+	return "error"
 }
 
 // extractItem 从单个 DOM 元素中提取商品信息。

@@ -42,6 +42,7 @@ type AppConfig struct {
 	QueueBatchSize   int           `json:"queue_batch_size"`   // 轮询批量入队大小
 	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
 	ProxyCooldown    time.Duration `json:"proxy_cooldown"`     // 直连失败后代理冷却时间
+	MaxTasks         int           `json:"max_tasks"`          // 重启前最大任务数
 
 	// Redis Streams 任务队列配置
 	EnableRedisQueue bool   `json:"enable_redis_queue"` // 是否启用 Redis Streams 队列（开关）
@@ -187,6 +188,7 @@ func getDefaultConfig() *Config {
 			QueueBatchSize:   100,
 			DedupWindow:      3600,
 			ProxyCooldown:    10 * time.Minute,
+			MaxTasks:         500,
 
 			// Redis Streams 默认配置
 			EnableRedisQueue: false, // 默认关闭，渐进式升级
@@ -275,6 +277,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.ProxyCooldown == 0 {
 		cfg.App.ProxyCooldown = defaults.App.ProxyCooldown
+	}
+	if cfg.App.MaxTasks == 0 {
+		cfg.App.MaxTasks = defaults.App.MaxTasks
 	}
 	// Redis Streams 默认值
 	if cfg.App.TaskQueueStream == "" {
@@ -394,6 +399,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("PROXY_COOLDOWN"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.App.ProxyCooldown = d
+		}
+	}
+	if v := os.Getenv("MAX_TASKS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.App.MaxTasks = i
 		}
 	}
 
