@@ -252,6 +252,27 @@ var (
 	})
 )
 
+// 调度器去重相关指标
+var (
+	// SchedulerTasksPushedTotal 调度器推送任务总数
+	SchedulerTasksPushedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_scheduler_tasks_pushed_total",
+		Help: "Total number of tasks pushed to queue by scheduler",
+	})
+
+	// SchedulerTasksSkippedTotal 调度器跳过的任务总数（因为已在队列中）
+	SchedulerTasksSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "goodshunter_scheduler_tasks_skipped_total",
+		Help: "Total number of tasks skipped by scheduler (already in queue)",
+	})
+
+	// SchedulerTasksPendingInQueue 当前队列中等待处理的唯一任务数
+	SchedulerTasksPendingInQueue = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "goodshunter_scheduler_tasks_pending_in_queue",
+		Help: "Number of unique tasks currently pending in queue",
+	})
+)
+
 // InitMetrics 初始化指标（设置静态值）
 func InitMetrics(workerCapacity int) {
 	SchedulerMode.Set(1)

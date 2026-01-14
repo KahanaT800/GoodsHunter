@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 0,
+  "id": 1615647007907840,
   "links": [],
   "panels": [
     {
@@ -87,7 +87,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -158,7 +158,7 @@
         "showThresholdMarkers": true,
         "sizing": "auto"
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -224,7 +224,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -245,6 +245,9 @@
       "description": "Scheduler 当前执行中的任务数量，判断是否有持续负载。",
       "fieldConfig": {
         "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -270,11 +273,9 @@
       },
       "id": 1,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
         "orientation": "auto",
-        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -282,22 +283,22 @@
           "fields": "",
           "values": false
         },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto"
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(goodshunter_active_tasks{job=\"prometheus.scrape.goodshunter_api\"})",
+          "expr": "count by (worker_id, worker_id) (goodshunter_crawler_tasks_processed_current{job=\"prometheus.scrape.goodshunter_crawler\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Active Tasks (Running)",
-      "type": "stat"
+      "type": "gauge"
     },
     {
       "datasource": {
@@ -355,11 +356,11 @@
         "showThresholdMarkers": true,
         "sizing": "auto"
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
-          "expr": "max(goodshunter_crawler_tasks_processed_current{job=\"prometheus.scrape.goodshunter_crawler\"})",
+          "expr": "max by (worker_id, worker_id) (\r\n  goodshunter_crawler_tasks_processed_current{job=\"prometheus.scrape.goodshunter_crawler\"}\r\n)\r\n",
           "legendFormat": "tasks",
           "range": true,
           "refId": "A"
@@ -431,7 +432,7 @@
         "sizing": "auto",
         "valueMode": "color"
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -534,7 +535,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -643,12 +644,12 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (platform, status) (rate(goodshunter_crawler_requests_total{job=\"prometheus.scrape.goodshunter_crawler\"}[5m]))",
-          "legendFormat": "{{platform}} {{status}}",
+          "expr": "sum by (worker_id, status) (rate(goodshunter_crawler_requests_total{job=\"prometheus.scrape.goodshunter_crawler\"}[5m]))",
+          "legendFormat": "{{worker_id}} - {{status}}",
           "range": true,
           "refId": "A"
         }
@@ -738,19 +739,21 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
+          "direction": "backward",
           "editorMode": "code",
-          "expr": "count_over_time({compose_service=\"crawler\"} |= \"crawl completed\" [5m])",
-          "legendFormat": "completed",
+          "expr": "sum by (worker_id) (\r\n  count_over_time({compose_service=\"crawler\", worker_id=~\"master-ec2-01|worker-wsl-home\"} |= \"crawl completed\" [5m])\r\n)",
+          "legendFormat": "{{worker_id}} completed",
           "queryType": "range",
           "refId": "A"
         },
         {
+          "direction": "backward",
           "editorMode": "code",
-          "expr": "count_over_time({compose_service=\"crawler\"} |= \"crawl failed\" [5m])",
-          "legendFormat": "failed",
+          "expr": "sum by (worker_id) (\r\n  count_over_time({compose_service=\"crawler\", worker_id=~\"master-ec2-01|worker-wsl-home\"} |= \"crawl failed\" [5m])\r\n)",
+          "legendFormat": "{{worker_id}} failed",
           "queryType": "range",
           "refId": "B"
         }
@@ -841,7 +844,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -936,7 +939,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1039,7 +1042,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1135,7 +1138,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1207,7 +1210,7 @@
         "textMode": "auto",
         "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1301,7 +1304,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1396,7 +1399,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1438,7 +1441,7 @@
         "sortOrder": "Descending",
         "wrapLogMessage": true
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1532,11 +1535,12 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
+          "direction": "backward",
           "editorMode": "code",
-          "expr": "count_over_time({compose_service=\"crawler\"} |= \"no items found\" [10m])",
+          "expr": "count_over_time({compose_service=\"crawler\"} |= `no items found` [10m])",
           "legendFormat": "no_items",
           "queryType": "range",
           "refId": "A"
@@ -1554,41 +1558,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "mappings": [],
           "thresholds": {
@@ -1615,19 +1585,23 @@
       },
       "id": 12,
       "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1638,7 +1612,7 @@
         }
       ],
       "title": "Browser Instances",
-      "type": "timeseries"
+      "type": "stat"
     },
     {
       "datasource": {
@@ -1722,7 +1696,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1838,7 +1812,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -1941,7 +1915,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -2036,7 +2010,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -2132,7 +2106,7 @@
           "sort": "none"
         }
       },
-      "pluginVersion": "12.4.0-20781422371.patch1",
+      "pluginVersion": "12.4.0-20781422371.patch2",
       "targets": [
         {
           "editorMode": "code",
@@ -2143,6 +2117,734 @@
         }
       ],
       "title": "Rate Limit Timeouts (1h)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 77
+      },
+      "id": 100,
+      "panels": [],
+      "title": "🔄 Scheduler Deduplication",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "任务推送成功率（去重后实际入队的比例）",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 70
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 78
+      },
+      "id": 101,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * rate(goodshunter_scheduler_tasks_pushed_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]) / (rate(goodshunter_scheduler_tasks_pushed_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]) + rate(goodshunter_scheduler_tasks_skipped_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]))",
+          "legendFormat": "push_rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Push Success Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "去重跳过率（任务已在队列中被跳过的比例）",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 78
+      },
+      "id": 102,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * rate(goodshunter_scheduler_tasks_skipped_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]) / (rate(goodshunter_scheduler_tasks_pushed_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]) + rate(goodshunter_scheduler_tasks_skipped_total{job=\"prometheus.scrape.goodshunter_api\"}[5m]))",
+          "legendFormat": "skip_rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dedup Skip Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "当前队列中等待处理的唯一任务数",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 78
+      },
+      "id": 103,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "goodshunter_scheduler_tasks_pending_in_queue{job=\"prometheus.scrape.goodshunter_api\"}",
+          "legendFormat": "pending",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pending Unique Tasks",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "队列深度 vs 唯一任务数",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 78
+      },
+      "id": 104,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "crawler_queue_depth{job=\"prometheus.scrape.goodshunter_api\", queue_name=\"tasks\"}",
+          "legendFormat": "queue_depth",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Queue Depth",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "调度器推送/跳过趋势（按 worker_id 区分）",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*skipped.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*pushed.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 82
+      },
+      "id": 105,
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "rate(goodshunter_scheduler_tasks_pushed_total{job=\"prometheus.scrape.goodshunter_api\"}[1m])",
+          "legendFormat": "pushed",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "rate(goodshunter_scheduler_tasks_skipped_total{job=\"prometheus.scrape.goodshunter_api\"}[1m])",
+          "legendFormat": "skipped",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Scheduler Push vs Skip Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "爬虫消费速率（按 worker_id 区分）",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 82
+      },
+      "id": 106,
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "rate(crawler_task_throughput{job=\"prometheus.scrape.goodshunter_crawler\", direction=\"out\", status=\"popped\"}[1m])",
+          "legendFormat": "{{worker_id}} - consumed",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Crawler Consumption Rate (by Worker)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "唯一任务数 vs 队列深度趋势",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 90
+      },
+      "id": 107,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "goodshunter_scheduler_tasks_pending_in_queue{job=\"prometheus.scrape.goodshunter_api\"}",
+          "legendFormat": "unique_pending",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "crawler_queue_depth{job=\"prometheus.scrape.goodshunter_api\", queue_name=\"tasks\"}",
+          "legendFormat": "queue_depth",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Pending Tasks Trend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus}"
+      },
+      "description": "去重总计统计",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "skipped"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pushed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 90
+      },
+      "id": 108,
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "increase(goodshunter_scheduler_tasks_pushed_total{job=\"prometheus.scrape.goodshunter_api\"}[5m])",
+          "legendFormat": "pushed",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "increase(goodshunter_scheduler_tasks_skipped_total{job=\"prometheus.scrape.goodshunter_api\"}[5m])",
+          "legendFormat": "skipped",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Pushed vs Skipped (5m intervals)",
       "type": "timeseries"
     }
   ],
@@ -2208,6 +2910,6 @@
   "timezone": "browser",
   "title": "GoodsHunter Business Metrics",
   "uid": "goodshunter-biz",
-  "version": 25,
+  "version": 32,
   "weekStart": ""
 }

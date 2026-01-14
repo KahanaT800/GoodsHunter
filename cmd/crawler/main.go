@@ -47,6 +47,16 @@ func main() {
 	}
 
 	redisQueue := redisqueue.NewClient(cfg.Redis.Addr, cfg.Redis.Password)
+
+	// 启动时清理卡住的任务（超过 2 分钟的任务会被恢复）
+	rescueCtx, rescueCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer rescueCancel()
+	if count, err := redisQueue.RescueStuckTasks(rescueCtx, 2*time.Minute); err != nil {
+		appLogger.Warn("failed to rescue stuck tasks on startup", slog.String("error", err.Error()))
+	} else if count > 0 {
+		appLogger.Info("rescued stuck tasks on startup", slog.Int("count", count))
+	}
+
 	service, err := crawler.NewService(ctx, cfg, appLogger, redisQueue)
 	if err != nil {
 		appLogger.Error("init crawler service failed", slog.String("error", err.Error()))

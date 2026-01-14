@@ -17,11 +17,13 @@ const (
 	KeyTaskQueue           = "goodshunter:queue:tasks"
 	KeyTaskProcessingQueue = "goodshunter:queue:tasks:processing"
 	KeyResultQueue         = "goodshunter:queue:results"
+	KeyTaskPendingSet      = "goodshunter:queue:tasks:pending" // 去重集合
 )
 
 var (
-	ErrNoTask   = errors.New("no task available")
-	ErrNoResult = errors.New("no result available")
+	ErrNoTask     = errors.New("no task available")
+	ErrNoResult   = errors.New("no result available")
+	ErrTaskExists = errors.New("task already in queue") // 任务已存在
 )
 
 // Client wraps Redis List operations for task/result queues.
@@ -49,7 +51,53 @@ func NewClientWithRedis(rdb *redis.Client) (*Client, error) {
 }
 
 // PushTask serializes a FetchRequest and pushes it into the task queue.
+// 使用 Redis Set 进行去重：如果任务已在队列中，返回 ErrTaskExists。
 func (c *Client) PushTask(ctx context.Context, task *pb.FetchRequest) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	if c == nil || c.rdb == nil {
+		return errors.New("redis client is not initialized")
+	}
+
+	taskID := task.GetTaskId()
+	if taskID == "" {
+		return errors.New("task id is empty")
+	}
+
+	// 使用 SADD 尝试添加到去重集合
+	// 如果返回 0，说明已存在，跳过
+	added, err := c.rdb.SAdd(ctx, KeyTaskPendingSet, taskID).Result()
+	if err != nil {
+		return fmt.Errorf("sadd pending set: %w", err)
+	}
+	if added == 0 {
+		// 任务已在队列中，跳过
+		metrics.CrawlerTaskThroughput.WithLabelValues("in", "skipped").Inc()
+		metrics.SchedulerTasksSkippedTotal.Inc()
+		return ErrTaskExists
+	}
+
+	// 序列化并推送到队列
+	data, err := protojson.Marshal(task)
+	if err != nil {
+		// 推送失败，从集合中移除
+		c.rdb.SRem(ctx, KeyTaskPendingSet, taskID)
+		return fmt.Errorf("marshal task: %w", err)
+	}
+	if err := c.rdb.LPush(ctx, KeyTaskQueue, string(data)).Err(); err != nil {
+		// 推送失败，从集合中移除
+		c.rdb.SRem(ctx, KeyTaskPendingSet, taskID)
+		return fmt.Errorf("lpush task: %w", err)
+	}
+
+	metrics.CrawlerTaskThroughput.WithLabelValues("in", "pushed").Inc()
+	metrics.SchedulerTasksPushedTotal.Inc()
+	return nil
+}
+
+// PushTaskForce 强制推送任务，不检查去重（用于特殊场景）。
+func (c *Client) PushTaskForce(ctx context.Context, task *pb.FetchRequest) error {
 	if task == nil {
 		return errors.New("task is nil")
 	}
@@ -62,6 +110,10 @@ func (c *Client) PushTask(ctx context.Context, task *pb.FetchRequest) error {
 	}
 	if err := c.rdb.LPush(ctx, KeyTaskQueue, string(data)).Err(); err != nil {
 		return fmt.Errorf("lpush task: %w", err)
+	}
+	// 也加入 pending set
+	if taskID := task.GetTaskId(); taskID != "" {
+		c.rdb.SAdd(ctx, KeyTaskPendingSet, taskID)
 	}
 	metrics.CrawlerTaskThroughput.WithLabelValues("in", "pushed").Inc()
 	return nil
@@ -129,7 +181,8 @@ func (c *Client) PopResult(ctx context.Context, timeout time.Duration) (*pb.Fetc
 	return &resp, nil
 }
 
-// AckTask removes a processed task from the processing queue.
+// AckTask removes a processed task from the processing queue and pending set.
+// 这允许该任务在下一个调度周期被重新推送。
 func (c *Client) AckTask(ctx context.Context, task *pb.FetchRequest) error {
 	if task == nil {
 		return errors.New("task is nil")
@@ -141,7 +194,14 @@ func (c *Client) AckTask(ctx context.Context, task *pb.FetchRequest) error {
 	if err != nil {
 		return fmt.Errorf("marshal task: %w", err)
 	}
-	if err := c.rdb.LRem(ctx, KeyTaskProcessingQueue, 1, string(data)).Err(); err != nil {
+
+	// 使用 Pipeline 原子执行：从处理队列和 pending set 中移除
+	pipe := c.rdb.TxPipeline()
+	pipe.LRem(ctx, KeyTaskProcessingQueue, 1, string(data))
+	if taskID := task.GetTaskId(); taskID != "" {
+		pipe.SRem(ctx, KeyTaskPendingSet, taskID)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("ack task failed: %w", err)
 	}
 	return nil
@@ -161,6 +221,18 @@ func (c *Client) QueueDepth(ctx context.Context) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("llen results: %w", err)
 	}
 	return tasks, results, nil
+}
+
+// PendingSetSize returns the number of unique tasks currently pending.
+func (c *Client) PendingSetSize(ctx context.Context) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client is not initialized")
+	}
+	size, err := c.rdb.SCard(ctx, KeyTaskPendingSet).Result()
+	if err != nil {
+		return 0, fmt.Errorf("scard pending set: %w", err)
+	}
+	return size, nil
 }
 
 // RescueStuckTasks scans processing queue and requeues tasks that exceed timeout.

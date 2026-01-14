@@ -2,7 +2,6 @@ package crawler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,7 +16,6 @@ import (
 
 	"goodshunter/internal/config"
 	"goodshunter/internal/pkg/metrics"
-	"goodshunter/internal/pkg/queue"
 	"goodshunter/internal/pkg/ratelimit"
 	"goodshunter/internal/pkg/redisqueue"
 	"goodshunter/proto/pb"
@@ -42,10 +40,9 @@ const (
 
 // Service 负责浏览器调度与页面解析。
 //
-// 它维护了一个 rod.Browser 实例，并使用 worker pool 控制并发抓取数量。
+// 它维护了一个 rod.Browser 实例，并发控制由 StartWorker 中的信号量管理。
 type Service struct {
 	browser         *rod.Browser
-	queue           *queue.Queue // Worker Pool 用于控制并发
 	rdb             *redis.Client
 	rateLimiter     *ratelimit.RateLimiter
 	logger          *slog.Logger
@@ -58,10 +55,25 @@ type Service struct {
 	proxyCacheUntil time.Time
 	mu              sync.RWMutex
 	forceProxyOnce  uint32
-	taskCounter     atomic.Uint64
+	taskCounter     atomic.Uint64 // 用于触发 maxTasks 重启
 	maxTasks        uint64
 	restartCh       chan struct{}
 	redisQueue      *redisqueue.Client
+
+	// 后台任务控制
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+
+	// 统计信息
+	stats crawlerStats
+}
+
+// crawlerStats 爬虫统计信息
+type crawlerStats struct {
+	TotalProcessed atomic.Int64
+	TotalSucceeded atomic.Int64
+	TotalFailed    atomic.Int64
+	TotalPanics    atomic.Int64
 }
 
 // NewService 启动浏览器实例并创建服务。
@@ -102,24 +114,8 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 			slog.Float64("burst", cfg.App.RateBurst))
 	}
 
-	// 创建 Worker Pool
-	// workers 数量使用浏览器的最大并发数
-	// 队列容量设置为并发数的 2 倍，避免请求积压
-	workers := cfg.Browser.MaxConcurrency
-	capacity := workers * 2
-	q := queue.NewQueue(logger, workers, capacity)
-
-	// 设置错误处理器：记录爬取任务失败
-	q.SetErrorHandler(func(err error, job queue.Job) {
-		logger.Error("crawler job execution failed",
-			slog.String("error", err.Error()))
-	})
-
-	// 启动 worker pool
-	q.Start(ctx)
-	logger.Info("crawler worker pool started",
-		slog.Int("workers", workers),
-		slog.Int("capacity", capacity))
+	logger.Info("crawler service initialized",
+		slog.Int("max_concurrency", cfg.Browser.MaxConcurrency))
 
 	forceProxyOnce := uint32(0)
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("FORCE_PROXY_ONCE"))); v == "1" || v == "true" || v == "yes" {
@@ -137,9 +133,11 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		pageTimeout = 60 * time.Second
 	}
 
+	// 创建后台任务的独立 context（由 Shutdown 控制生命周期）
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+
 	service := &Service{
 		browser:        browser,
-		queue:          q,
 		rdb:            rdb,
 		rateLimiter:    limiter,
 		logger:         logger,
@@ -152,11 +150,14 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		maxTasks:       maxTasks,
 		restartCh:      make(chan struct{}, 1),
 		redisQueue:     redisQueue,
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
 	metrics.CrawlerProxyMode.Set(0)
 
-	// 启动浏览器健康检查
-	go service.startBrowserHealthCheck(ctx)
+	// 启动后台任务（使用独立的 bgCtx，由 Shutdown 控制停止）
+	go service.startBrowserHealthCheck(bgCtx)
+	go service.startStuckTaskCleanup(bgCtx)
 
 	return service, nil
 }
@@ -183,6 +184,31 @@ func (s *Service) startBrowserHealthCheck(ctx context.Context) {
 				} else {
 					s.logger.Info("browser instance restarted successfully")
 				}
+			}
+		}
+	}
+}
+
+// startStuckTaskCleanup 定期清理卡住的任务（超过 2 分钟的任务会被恢复）。
+func (s *Service) startStuckTaskCleanup(ctx context.Context) {
+	if s.redisQueue == nil {
+		return
+	}
+	ticker := time.NewTicker(1 * time.Minute) // 每分钟检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rescueCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			count, err := s.redisQueue.RescueStuckTasks(rescueCtx, 2*time.Minute)
+			cancel()
+			if err != nil {
+				s.logger.Warn("failed to rescue stuck tasks", slog.String("error", err.Error()))
+			} else if count > 0 {
+				s.logger.Info("rescued stuck tasks", slog.Int("count", count))
 			}
 		}
 	}
@@ -254,14 +280,14 @@ func (s *Service) StartWorker(ctx context.Context) error {
 		return errors.New("redis queue client is not initialized")
 	}
 
-	concurrencyLimit := s.cfg.Browser.MaxConcurrency + 2 // 限制拉取速率，避免内存队列阻塞
+	// 令牌数 = 浏览器最大并发数，确保同时打开的页面数不超过配置值
+	concurrencyLimit := s.cfg.Browser.MaxConcurrency
 	if concurrencyLimit < 1 {
 		concurrencyLimit = 1
 	}
 	sem := make(chan struct{}, concurrencyLimit)
 	s.logger.Info("crawler worker started",
-		slog.Int("concurrency_limit", concurrencyLimit),
-		slog.Int("browser_max_concurrency", s.cfg.Browser.MaxConcurrency))
+		slog.Int("max_concurrent_pages", concurrencyLimit))
 
 	for {
 		// 1. 在拉取任务前先申请令牌，如果处理不过来，就暂停拉取 Redis
@@ -290,31 +316,112 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			continue
 		}
 
-		// 3. 处理任务（在独立 goroutine 中）
+		// 3. 处理任务（在独立 goroutine 中，带看门狗保护）
 		go func(t *pb.FetchRequest) {
+			taskID := t.GetTaskId()
+			taskStart := time.Now()
+
+			// 看门狗超时：确保无论如何都会释放信号量
+			// 设置为 100 秒（比任务超时 90 秒稍长，给正常超时一点余量）
+			watchdogTimeout := 100 * time.Second
+			done := make(chan struct{})
+
+			// 看门狗 goroutine
+			go func() {
+				select {
+				case <-done:
+					// 任务正常完成
+				case <-time.After(watchdogTimeout):
+					// 看门狗超时触发
+					s.logger.Error("watchdog timeout triggered, task stuck",
+						slog.String("task_id", taskID),
+						slog.Duration("elapsed", time.Since(taskStart)))
+					s.stats.TotalFailed.Add(1)
+					metrics.CrawlerErrorsTotal.WithLabelValues("unknown", "watchdog_timeout").Inc()
+				}
+			}()
+
+			// 确保信号量一定会被释放
 			defer func() {
-				<-sem // 任务处理完成，释放令牌
+				close(done) // 通知看门狗任务已完成
+				<-sem       // 释放令牌
+				s.logger.Debug("task goroutine exited",
+					slog.String("task_id", taskID),
+					slog.Duration("total_duration", time.Since(taskStart)))
+			}()
+
+			// Panic 恢复
+			defer func() {
+				if r := recover(); r != nil {
+					s.stats.TotalPanics.Add(1)
+					s.logger.Error("crawl task panic recovered",
+						slog.String("task_id", taskID),
+						slog.Any("panic", r))
+					// 推送错误响应
+					resp := &pb.FetchResponse{
+						ErrorMessage: fmt.Sprintf("panic: %v", r),
+						TaskId:       taskID,
+					}
+					pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer pushCancel()
+					if pushErr := s.redisQueue.PushResult(pushCtx, resp); pushErr != nil {
+						s.logger.Error("push panic result failed", slog.String("error", pushErr.Error()))
+					}
+				}
 			}()
 
 			// 为每个任务设置独立的上下文（90秒超时，避免任务卡住太久）
 			taskCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 
-			// FetchItems 内部会通过 worker pool 进一步控制浏览器并发
-			resp, err := s.FetchItems(taskCtx, t)
+			// 使用带超时的 channel 包装 FetchItems 调用
+			// 这样即使 FetchItems 内部卡住，我们也能在超时后继续执行
+			type fetchResult struct {
+				resp *pb.FetchResponse
+				err  error
+			}
+			resultCh := make(chan fetchResult, 1)
+
+			go func() {
+				resp, err := s.FetchItems(taskCtx, t)
+				select {
+				case resultCh <- fetchResult{resp: resp, err: err}:
+				default:
+					// 如果 channel 满了（主 goroutine 已超时离开），记录日志
+					s.logger.Warn("fetch result discarded (timeout)",
+						slog.String("task_id", taskID))
+				}
+			}()
+
+			var resp *pb.FetchResponse
+			var err error
+
+			select {
+			case result := <-resultCh:
+				resp = result.resp
+				err = result.err
+			case <-taskCtx.Done():
+				err = fmt.Errorf("task context timeout: %w", taskCtx.Err())
+				s.logger.Error("task context timeout",
+					slog.String("task_id", taskID),
+					slog.Duration("elapsed", time.Since(taskStart)))
+			}
+
 			if err != nil {
 				s.logger.Warn("crawl task failed",
-					slog.String("task_id", t.GetTaskId()),
-					slog.String("error", err.Error()))
+					slog.String("task_id", taskID),
+					slog.String("error", err.Error()),
+					slog.Duration("duration", time.Since(taskStart)))
 				// 即使失败也构造一个包含 TaskId 的响应以便追踪
 				if resp == nil {
-					resp = &pb.FetchResponse{ErrorMessage: err.Error(), TaskId: t.GetTaskId()}
+					resp = &pb.FetchResponse{ErrorMessage: err.Error(), TaskId: taskID}
 				}
 			}
+
 			// 推送结果到 Redis
 			if resp != nil {
 				if resp.TaskId == "" {
-					resp.TaskId = t.GetTaskId()
+					resp.TaskId = taskID
 				}
 				// 异步回传结果
 				pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -329,10 +436,10 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			defer ackCancel()
 			if ackErr := s.redisQueue.AckTask(ackCtx, t); ackErr != nil {
 				s.logger.Error("failed to ack task",
-					slog.String("task_id", t.GetTaskId()),
+					slog.String("task_id", taskID),
 					slog.String("error", ackErr.Error()))
 			} else {
-				s.logger.Debug("task acked", slog.String("task_id", t.GetTaskId()))
+				s.logger.Debug("task acked", slog.String("task_id", taskID))
 			}
 		}(task)
 	}
@@ -534,9 +641,21 @@ func (s *Service) getProxyState(ctx context.Context) (bool, error) {
 	if s.rdb == nil {
 		return false, nil
 	}
-	exists, err := s.rdb.Exists(ctx, proxyCooldownKey).Result()
+
+	// 为 Redis 调用设置短超时，避免卡住
+	redisCtx, redisCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer redisCancel()
+
+	exists, err := s.rdb.Exists(redisCtx, proxyCooldownKey).Result()
 	if err != nil {
-		return false, fmt.Errorf("get proxy cooldown: %w", err)
+		// Redis 错误时使用缓存值（如果有）或默认值（降级策略）
+		s.mu.RLock()
+		cachedState := s.proxyCache
+		s.mu.RUnlock()
+		s.logger.Warn("get proxy state from redis failed, using cached value",
+			slog.Bool("cached_state", cachedState),
+			slog.String("error", err.Error()))
+		return cachedState, nil // 降级：返回缓存值而不是错误
 	}
 	state := exists > 0
 
@@ -555,8 +674,15 @@ func (s *Service) setProxyCooldown(ctx context.Context, duration time.Duration) 
 	if s.rdb == nil {
 		return errors.New("redis client is not initialized")
 	}
-	if err := s.rdb.Set(ctx, proxyCooldownKey, "1", duration).Err(); err != nil {
-		return fmt.Errorf("set proxy cooldown: %w", err)
+
+	// 为 Redis 调用设置短超时
+	redisCtx, redisCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer redisCancel()
+
+	if err := s.rdb.Set(redisCtx, proxyCooldownKey, "1", duration).Err(); err != nil {
+		s.logger.Warn("set proxy cooldown failed, updating local cache only",
+			slog.String("error", err.Error()))
+		// 即使 Redis 失败，也更新本地缓存（降级策略）
 	}
 
 	s.mu.Lock()
@@ -576,12 +702,13 @@ func boolToGauge(v bool) float64 {
 // FetchItems 处理抓取请求。
 //
 // 流程：
-// 1. 将抓取任务提交到 worker pool
-// 2. 构建目标 URL
-// 3. 打开新标签页（使用 Stealth 模式隐藏特征）
-// 4. 导航至 URL 并等待页面加载
-// 5. 解析商品列表元素
-// 6. 返回抓取结果
+// 1. 构建目标 URL
+// 2. 打开新标签页（使用 Stealth 模式隐藏特征）
+// 3. 导航至 URL 并等待页面加载
+// 4. 解析商品列表元素
+// 5. 返回抓取结果
+//
+// 注意：并发控制由 StartWorker 中的信号量管理，此方法直接执行抓取。
 //
 // 参数:
 //
@@ -597,6 +724,11 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 	start := time.Now()
 	platform := strings.ToLower(req.GetPlatform().String())
 	s.logger.Info("fetching items", slog.String("task_id", taskID), slog.String("platform", platform))
+
+	// 统计计数
+	s.stats.TotalProcessed.Add(1)
+	metrics.ActiveTasks.Inc()
+	defer metrics.ActiveTasks.Dec()
 
 	recordMetrics := func(status string, err error) {
 		metrics.CrawlerRequestsTotal.WithLabelValues(platform, status).Inc()
@@ -621,261 +753,57 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 		metrics.CrawlerRequestDurationByMode.WithLabelValues(platform, mode).Observe(time.Since(start).Seconds())
 	}
 
-	// 创建一个 channel 用于接收抓取结果
-	resultCh := make(chan *fetchResult, 1)
+	// 直接执行抓取（并发由 StartWorker 的 sem 控制）
+	response, err := s.doCrawl(ctx, req, 0)
 
-	// 创建 Job 函数
-	job := func(workerCtx context.Context) error {
-		// #region agent log
-		func() {
-			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				logEntry := map[string]interface{}{
-					"sessionId":    "debug-session",
-					"runId":        "run1",
-					"hypothesisId": "B",
-					"location":     "service.go:627",
-					"message":      "job function started",
-					"data":         map[string]interface{}{"task_id": taskID},
-					"timestamp":    time.Now().UnixMilli(),
-				}
-				_ = json.NewEncoder(logFile).Encode(logEntry)
-				_ = logFile.Close()
-			}
-		}()
-		// #endregion
-		var response *pb.FetchResponse
-		var err error
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("crawl panic: %v", r)
-			}
-			// #region agent log
-			func() {
-				logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					logEntry := map[string]interface{}{
-						"sessionId":    "debug-session",
-						"runId":        "run1",
-						"hypothesisId": "B",
-						"location":     "service.go:639",
-						"message":      "job function defer executing",
-						"data": map[string]interface{}{
-							"task_id":  taskID,
-							"has_err":  err != nil,
-							"has_resp": response != nil,
-						},
-						"timestamp": time.Now().UnixMilli(),
-					}
-					_ = json.NewEncoder(logFile).Encode(logEntry)
-					_ = logFile.Close()
-				}
-			}()
-			// #endregion
-			// 结果通道只发一次，避免 FetchItems 卡死
+	// 更新任务计数
+	if s.maxTasks > 0 {
+		newCount := s.taskCounter.Add(1)
+		metrics.CrawlerTasksProcessedCurrent.Set(float64(newCount))
+		if newCount >= s.maxTasks {
 			select {
-			case resultCh <- &fetchResult{response: response, err: err}:
-				// #region agent log
-				func() {
-					logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if logFile != nil {
-						logEntry := map[string]interface{}{
-							"sessionId":    "debug-session",
-							"runId":        "run1",
-							"hypothesisId": "C",
-							"location":     "service.go:656",
-							"message":      "result sent to channel",
-							"data":         map[string]interface{}{"task_id": taskID},
-							"timestamp":    time.Now().UnixMilli(),
-						}
-						_ = json.NewEncoder(logFile).Encode(logEntry)
-						_ = logFile.Close()
-					}
-				}()
-				// #endregion
+			case s.restartCh <- struct{}{}:
+				s.logger.Info("max tasks reached, signaling shutdown",
+					slog.Uint64("count", newCount),
+					slog.Uint64("limit", s.maxTasks))
 			default:
-				// #region agent log
-				func() {
-					logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if logFile != nil {
-						logEntry := map[string]interface{}{
-							"sessionId":    "debug-session",
-							"runId":        "run1",
-							"hypothesisId": "C",
-							"location":     "service.go:662",
-							"message":      "result channel send failed (channel full)",
-							"data":         map[string]interface{}{"task_id": taskID},
-							"timestamp":    time.Now().UnixMilli(),
-						}
-						_ = json.NewEncoder(logFile).Encode(logEntry)
-						_ = logFile.Close()
-					}
-				}()
-				// #endregion
 			}
-		}()
-
-		response, err = s.doCrawl(ctx, req, 0)
-		if err == nil && workerCtx.Err() == nil {
-			return nil
 		}
-		if workerCtx.Err() != nil {
-			err = workerCtx.Err()
-		}
-		return err
 	}
 
-	// 提交到 worker pool（阻塞式，直到队列有空间）
-	// #region agent log
-	func() {
-		logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			logEntry := map[string]interface{}{
-				"sessionId":    "debug-session",
-				"runId":        "run1",
-				"hypothesisId": "A",
-				"location":     "service.go:698",
-				"message":      "before EnqueueBlocking",
-				"data":         map[string]interface{}{"task_id": taskID},
-				"timestamp":    time.Now().UnixMilli(),
-			}
-			_ = json.NewEncoder(logFile).Encode(logEntry)
-			_ = logFile.Close()
-		}
-	}()
-	// #endregion
-	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
-		// #region agent log
-		func() {
-			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				logEntry := map[string]interface{}{
-					"sessionId":    "debug-session",
-					"runId":        "run1",
-					"hypothesisId": "A",
-					"location":     "service.go:723",
-					"message":      "EnqueueBlocking failed",
-					"data":         map[string]interface{}{"task_id": taskID, "error": err.Error()},
-					"timestamp":    time.Now().UnixMilli(),
-				}
-				_ = json.NewEncoder(logFile).Encode(logEntry)
-				_ = logFile.Close()
-			}
-		}()
-		// #endregion
+	if err != nil {
+		s.stats.TotalFailed.Add(1)
+		s.logger.Error("crawl failed",
+			slog.String("task_id", taskID),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(start)),
+		)
 		recordMetrics("failed", err)
-		recordModeMetrics(nil, err)
-		return nil, fmt.Errorf("enqueue crawl job: %w", err)
+		recordModeMetrics(response, err)
+		return nil, err
 	}
-	// #region agent log
-	func() {
-		logFile, _ := os.OpenFile("/home/lyc/GoodsHunter/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			logEntry := map[string]interface{}{
-				"sessionId":    "debug-session",
-				"runId":        "run1",
-				"hypothesisId": "A",
-				"location":     "service.go:738",
-				"message":      "EnqueueBlocking succeeded, waiting for result",
-				"data":         map[string]interface{}{"task_id": taskID},
-				"timestamp":    time.Now().UnixMilli(),
-			}
-			_ = json.NewEncoder(logFile).Encode(logEntry)
-			_ = logFile.Close()
-		}
-	}()
-	// #endregion
 
-	// 等待结果
-	select {
-	case result := <-resultCh:
-		// #region agent log
-		func() {
-			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				logEntry := map[string]interface{}{
-					"sessionId":    "debug-session",
-					"runId":        "run1",
-					"hypothesisId": "C",
-					"location":     "service.go:755",
-					"message":      "result received from channel",
-					"data": map[string]interface{}{
-						"task_id":  taskID,
-						"has_err":  result.err != nil,
-						"has_resp": result.response != nil,
-					},
-					"timestamp": time.Now().UnixMilli(),
-				}
-				_ = json.NewEncoder(logFile).Encode(logEntry)
-				_ = logFile.Close()
-			}
-		}()
-		// #endregion
-		if result.response != nil {
-			result.response.TaskId = taskID
-		}
-		if s.maxTasks > 0 {
-			newCount := s.taskCounter.Add(1)
-			metrics.CrawlerTasksProcessedCurrent.Set(float64(newCount))
-			if newCount >= s.maxTasks {
-				select {
-				case s.restartCh <- struct{}{}:
-					s.logger.Info("max tasks reached, signaling shutdown",
-						slog.Uint64("count", newCount),
-						slog.Uint64("limit", s.maxTasks))
-				default:
-				}
-			}
-		}
-
-		if result.err != nil {
-			s.logger.Error("crawl failed",
-				slog.String("task_id", taskID),
-				slog.String("error", result.err.Error()),
-				slog.String("duration", time.Since(start).String()),
-			)
-			recordMetrics("failed", result.err)
-			recordModeMetrics(result.response, result.err)
-			return nil, result.err
-		}
-		recordMetrics("success", nil)
-		recordModeMetrics(result.response, nil)
-		return result.response, nil
-	case <-ctx.Done():
-		recordMetrics("failed", ctx.Err())
-		recordModeMetrics(nil, ctx.Err())
-		return nil, ctx.Err()
+	s.stats.TotalSucceeded.Add(1)
+	if response != nil {
+		response.TaskId = taskID
 	}
-}
-
-// fetchResult 保存抓取任务的执行结果
-type fetchResult struct {
-	response *pb.FetchResponse
-	err      error
+	recordMetrics("success", nil)
+	recordModeMetrics(response, nil)
+	return response, nil
 }
 
 func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
-	// #region agent log
-	func() {
-		logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			logEntry := map[string]interface{}{
-				"sessionId":    "debug-session",
-				"runId":        "run1",
-				"hypothesisId": "D",
-				"location":     "service.go:704",
-				"message":      "doCrawl started",
-				"data":         map[string]interface{}{"task_id": req.GetTaskId(), "attempt": attempt},
-				"timestamp":    time.Now().UnixMilli(),
-			}
-			_ = json.NewEncoder(logFile).Encode(logEntry)
-			_ = logFile.Close()
-		}
-	}()
-	// #endregion
-	if err := s.ensureBrowserState(ctx); err != nil {
-		return nil, err
+	taskID := req.GetTaskId()
+	s.logger.Debug("doCrawl started", slog.String("task_id", taskID), slog.Int("attempt", attempt))
+
+	// 为 ensureBrowserState 设置独立的短超时（防止 Redis 调用卡住）
+	browserStateCtx, browserStateCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer browserStateCancel()
+	if err := s.ensureBrowserState(browserStateCtx); err != nil {
+		s.logger.Warn("ensureBrowserState failed", slog.String("task_id", taskID), slog.String("error", err.Error()))
+		return nil, fmt.Errorf("ensure browser state: %w", err)
 	}
+	s.logger.Debug("browser state ensured", slog.String("task_id", taskID))
 
 	if attempt == 0 && !s.isUsingProxy() && atomic.CompareAndSwapUint32(&s.forceProxyOnce, 1, 0) {
 		s.logger.Warn("direct connection failed, activating proxy",
@@ -907,31 +835,50 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 // crawlOnce 执行单次爬取逻辑（不包含自动切换与重试）。
 func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
-	start := time.Now()
+	crawlStart := time.Now()
+	s.logger.Debug("crawlOnce started", slog.String("task_id", taskID))
 
 	if s.rateLimiter != nil {
-		start := time.Now()
+		s.logger.Debug("waiting for rate limit", slog.String("task_id", taskID))
+		rateLimitStart := time.Now()
+		// 为速率限制设置最大等待时间（30秒），防止无限等待
+		rateLimitDeadline := time.After(30 * time.Second)
 		for {
-			allowed, err := s.rateLimiter.Allow(ctx, rateLimitKey, int(s.cfg.App.RateLimit), int(s.cfg.App.RateBurst))
+			// 为单次 Redis 调用设置短超时
+			rateLimitCtx, rateLimitCancel := context.WithTimeout(ctx, 5*time.Second)
+			allowed, err := s.rateLimiter.Allow(rateLimitCtx, rateLimitKey, int(s.cfg.App.RateLimit), int(s.cfg.App.RateBurst))
+			rateLimitCancel()
+
 			if err != nil {
-				return nil, fmt.Errorf("rate limit: %w", err)
+				s.logger.Warn("rate limit check failed", slog.String("task_id", taskID), slog.String("error", err.Error()))
+				// Redis 错误时，放行请求避免阻塞（降级策略）
+				s.logger.Warn("rate limit degraded, allowing request", slog.String("task_id", taskID))
+				break
 			}
 			if allowed {
-				metrics.RateLimitWaitDuration.Observe(time.Since(start).Seconds())
+				metrics.RateLimitWaitDuration.Observe(time.Since(rateLimitStart).Seconds())
+				s.logger.Debug("rate limit acquired", slog.String("task_id", taskID), slog.Duration("wait_time", time.Since(rateLimitStart)))
 				break
 			}
 
 			select {
 			case <-ctx.Done():
-				metrics.RateLimitWaitDuration.Observe(time.Since(start).Seconds())
+				metrics.RateLimitWaitDuration.Observe(time.Since(rateLimitStart).Seconds())
 				metrics.RateLimitTimeoutTotal.Inc()
 				return nil, fmt.Errorf("rate limit wait timeout: %w", ctx.Err())
+			case <-rateLimitDeadline:
+				s.logger.Warn("rate limit max wait exceeded, allowing request", slog.String("task_id", taskID))
+				metrics.RateLimitWaitDuration.Observe(time.Since(rateLimitStart).Seconds())
+				goto RateLimitDone
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}
+RateLimitDone:
 
 	url := BuildMercariURL(req)
+	s.logger.Debug("built mercari URL", slog.String("task_id", taskID), slog.String("url", url))
+
 	s.mu.RLock()
 	browser := s.browser
 	s.mu.RUnlock()
@@ -939,35 +886,75 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 		return nil, fmt.Errorf("browser not initialized")
 	}
 
-	// 使用带超时的 context 包装 Page 创建操作，确保即使浏览器卡住也能及时返回
-	pageCtx, pageCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer pageCancel()
+	// 重要：页面创建时使用任务的完整 context（不是短超时的 context）
+	// 因为页面对象会继承这个 context，后续所有操作都受它限制
+	// 我们只在外层用 select 做超时保护，不让 Page 对象绑定短超时 context
+	s.logger.Debug("creating browser page", slog.String("task_id", taskID))
 
 	type pageResult struct {
 		page *rod.Page
 		err  error
 	}
 	pageResultCh := make(chan pageResult, 1)
+
+	// 页面创建使用任务 context（90秒），而不是短超时 context
 	go func() {
-		page, pageErr := browser.Context(pageCtx).Page(proto.TargetCreateTarget{URL: ""})
-		pageResultCh <- pageResult{page: page, err: pageErr}
+		page, pageErr := browser.Context(ctx).Page(proto.TargetCreateTarget{URL: ""})
+		select {
+		case pageResultCh <- pageResult{page: page, err: pageErr}:
+		default:
+			// channel 满了，说明主 goroutine 已超时退出，需要清理页面
+			if page != nil {
+				_ = page.Close()
+			}
+			s.logger.Warn("page creation completed after timeout, cleaned up",
+				slog.String("task_id", taskID))
+		}
 	}()
+
+	// 页面创建的超时保护（10秒）- 只用于这个 select，不影响页面对象的内部 context
+	pageCreateTimer := time.NewTimer(10 * time.Second)
+	defer pageCreateTimer.Stop()
 
 	var basePage *rod.Page
 	var err error
 	select {
 	case result := <-pageResultCh:
 		if result.err != nil {
-			return nil, fmt.Errorf("create page timeout or failed: %w", result.err)
+			return nil, fmt.Errorf("create page failed: %w", result.err)
 		}
 		basePage = result.page
-	case <-pageCtx.Done():
-		return nil, fmt.Errorf("create page timeout: %w", pageCtx.Err())
+		s.logger.Debug("browser page created", slog.String("task_id", taskID))
+	case <-pageCreateTimer.C:
+		s.logger.Warn("page creation timeout", slog.String("task_id", taskID))
+		return nil, fmt.Errorf("create page timeout after 10s")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context cancelled during page creation: %w", ctx.Err())
 	}
-	if _, err = basePage.EvalOnNewDocument(stealth.JS); err != nil {
+
+	// Stealth 脚本应用 - 同样只用 select 做超时保护
+	stealthTimer := time.NewTimer(5 * time.Second)
+	defer stealthTimer.Stop()
+	stealthDone := make(chan error, 1)
+	go func() {
+		_, evalErr := basePage.EvalOnNewDocument(stealth.JS)
+		stealthDone <- evalErr
+	}()
+
+	select {
+	case err = <-stealthDone:
+		if err != nil {
+			_ = basePage.Close()
+			return nil, fmt.Errorf("apply stealth script: %w", err)
+		}
+	case <-stealthTimer.C:
 		_ = basePage.Close()
-		return nil, fmt.Errorf("apply stealth script: %w", err)
+		return nil, fmt.Errorf("apply stealth script timeout after 5s")
+	case <-ctx.Done():
+		_ = basePage.Close()
+		return nil, fmt.Errorf("context cancelled during stealth script: %w", ctx.Err())
 	}
+	s.logger.Debug("stealth script applied", slog.String("task_id", taskID))
 
 	page := basePage
 	// 定义增强版屏蔽列表
@@ -1077,7 +1064,7 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 			s.logger.Info("no items found",
 				slog.String("task_id", taskID),
 				slog.String("url", url),
-				slog.String("duration", time.Since(start).String()),
+				slog.String("duration", time.Since(crawlStart).String()),
 			)
 			return &pb.FetchResponse{
 				Items:        []*pb.Item{},
@@ -1185,17 +1172,16 @@ ParseItems:
 	case result := <-elementsResultCh:
 		elements = result.elements
 		err = result.err
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
+				s.logPageTimeout("get_elements", taskID, url, page, err)
+			}
+			return nil, fmt.Errorf("get elements: %w", err)
+		}
 	case <-elementsCtx.Done():
 		err = fmt.Errorf("get elements timeout: %w", elementsCtx.Err())
 		s.logPageTimeout("get_elements", taskID, url, page, elementsCtx.Err())
-		return nil, fmt.Errorf("get elements: %w", err)
-	}
-
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
-			s.logPageTimeout("get_elements", taskID, url, page, err)
-		}
-		return nil, fmt.Errorf("get elements: %w", err)
+		return nil, err
 	}
 	if len(elements) == 0 {
 		return &pb.FetchResponse{
@@ -1235,7 +1221,7 @@ ParseItems:
 	s.logger.Info("crawl completed",
 		slog.String("task_id", taskID),
 		slog.Int("count", len(items)),
-		slog.String("duration", time.Since(start).String()))
+		slog.String("duration", time.Since(crawlStart).String()))
 	return &pb.FetchResponse{
 		Items:        items,
 		TotalFound:   int32(len(items)),
@@ -1565,7 +1551,10 @@ func normalizeMercariURL(u string) string {
 
 // Shutdown 优雅关闭爬虫服务。
 //
-// 它会等待所有正在执行的爬取任务完成。
+// 关闭顺序：
+// 1. 停止后台任务（健康检查、卡住任务清理）
+// 2. 关闭浏览器实例
+// 3. 关闭 Redis 连接
 //
 // 参数:
 //
@@ -1575,22 +1564,14 @@ func normalizeMercariURL(u string) string {
 //
 //	error: 关闭过程中的错误
 func (s *Service) Shutdown(ctx context.Context) error {
-	s.logger.Info("shutting down crawler worker pool...")
+	s.logger.Info("shutting down crawler service...")
 
-	// 从 context 获取超时时间
-	deadline, ok := ctx.Deadline()
-	var timeout time.Duration
-	if ok {
-		timeout = time.Until(deadline)
-	} else {
-		timeout = 30 * time.Second // 默认 30 秒
+	// 1. 停止后台任务
+	if s.bgCancel != nil {
+		s.bgCancel()
 	}
 
-	// 等待所有爬取任务完成
-	if err := s.queue.ShutdownWithTimeout(timeout); err != nil {
-		return fmt.Errorf("shutdown worker pool: %w", err)
-	}
-
+	// 2. 关闭浏览器
 	s.mu.Lock()
 	browser := s.browser
 	s.browser = nil
@@ -1603,21 +1584,35 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	// 3. 关闭 Redis
 	if s.rdb != nil {
 		if err := s.rdb.Close(); err != nil {
 			s.logger.Warn("close redis failed", slog.String("error", err.Error()))
 		}
 	}
 
-	s.logger.Info("crawler worker pool shutdown completed")
+	s.logger.Info("crawler service shutdown completed",
+		slog.Int64("total_processed", s.stats.TotalProcessed.Load()),
+		slog.Int64("total_succeeded", s.stats.TotalSucceeded.Load()),
+		slog.Int64("total_failed", s.stats.TotalFailed.Load()),
+	)
 	return nil
 }
 
+// CrawlerStats 爬虫统计信息快照
+type CrawlerStats struct {
+	TotalProcessed int64
+	TotalSucceeded int64
+	TotalFailed    int64
+	TotalPanics    int64
+}
+
 // Stats 获取爬虫服务的统计信息。
-//
-// 返回值:
-//
-//	queue.QueueStats: 队列统计信息快照
-func (s *Service) Stats() queue.QueueStats {
-	return s.queue.Stats()
+func (s *Service) Stats() CrawlerStats {
+	return CrawlerStats{
+		TotalProcessed: s.stats.TotalProcessed.Load(),
+		TotalSucceeded: s.stats.TotalSucceeded.Load(),
+		TotalFailed:    s.stats.TotalFailed.Load(),
+		TotalPanics:    s.stats.TotalPanics.Load(),
+	}
 }

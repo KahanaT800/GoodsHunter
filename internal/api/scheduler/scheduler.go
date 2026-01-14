@@ -301,6 +301,14 @@ func (s *Scheduler) monitorQueueDepth(ctx context.Context) {
 			}
 			metrics.CrawlerQueueDepth.WithLabelValues("tasks").Set(float64(tasks))
 			metrics.CrawlerQueueDepth.WithLabelValues("results").Set(float64(results))
+
+			// 监控 pending set 大小（去重后的唯一任务数）
+			pendingSize, err := s.redisQueue.PendingSetSize(ctx)
+			if err != nil {
+				s.logger.Warn("pending set size probe failed", slog.String("error", err.Error()))
+				continue
+			}
+			metrics.SchedulerTasksPendingInQueue.Set(float64(pendingSize))
 		}
 	}
 }
@@ -349,7 +357,7 @@ func (s *Scheduler) handleResult(ctx context.Context, resp *pb.FetchResponse) er
 
 	// 统一走 DB 持久化逻辑，不再区分 Guest
 	if status != "failed" {
-		s.processItems(&task, resp.Items, notifyAllowed, userEmail)
+		s.processItems(ctx, &task, resp.Items, notifyAllowed, userEmail)
 	}
 
 	now := time.Now()
@@ -406,10 +414,6 @@ func (s *Scheduler) StopTask(taskID uint) {
 
 // enqueueRunningTasks 查询并入队所有 running 任务。
 func (s *Scheduler) enqueueRunningTasks(ctx context.Context) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
 	batchSize := s.batchSize
 	if batchSize <= 0 {
 		batchSize = 100
@@ -451,9 +455,6 @@ func (s *Scheduler) enqueueRunningTasks(ctx context.Context) {
 }
 
 func (s *Scheduler) enqueueTaskID(ctx context.Context, taskID uint) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if err := s.queue.EnqueueBlocking(ctx, func(ctx context.Context) error {
 		return s.handleTaskByID(ctx, taskID)
 	}); err != nil {
@@ -474,6 +475,7 @@ func (s *Scheduler) handleTaskByID(parentCtx context.Context, taskID uint) error
 }
 
 // handleTask 将任务派发到 Redis List 队列。
+// 使用 Redis Set 去重：如果任务已在队列中，跳过而不报错。
 func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) error {
 	if task == nil {
 		return nil
@@ -495,6 +497,12 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) erro
 	}
 
 	if err := s.redisQueue.PushTask(parentCtx, req); err != nil {
+		// 如果任务已在队列中，这是预期的行为，静默跳过
+		if errors.Is(err, redisqueue.ErrTaskExists) {
+			s.logger.Debug("task already in queue, skipped",
+				slog.String("task_id", req.TaskId))
+			return nil
+		}
 		s.logger.Error("push task failed",
 			slog.String("task_id", req.TaskId),
 			slog.String("error", err.Error()))
@@ -541,8 +549,7 @@ func (s *Scheduler) setTaskCrawlStatus(ctx context.Context, taskID uint, status,
 //   - 如果之前尚未遇到过旧商品（列表头部），则判定为“真正的新品”，使用当前 batchTime。
 //   - 如果之前已经遇到过旧商品（列表尾部），则判定为“因抓取更深而发现的历史商品”，使用 lastKnownTime。
 //     这确保它们在时间轴排序中位于旧商品之后（Rank 更大）。
-func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool, userEmail string) {
-	ctx := context.Background()
+func (s *Scheduler) processItems(ctx context.Context, task *model.Task, items []*pb.Item, notify bool, userEmail string) {
 	dedupKey := "dedup:" + intToString(task.ID)
 
 	batchTime := time.Now()
@@ -570,8 +577,8 @@ func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool
 			var ti model.TaskItem
 			// 先获取 ItemID
 			var item model.Item
-			if err := s.db.Select("id").Where("source_id = ?", it.SourceId).First(&item).Error; err == nil {
-				if err := s.db.Where("task_id = ? AND item_id = ?", task.ID, item.ID).First(&ti).Error; err == nil {
+			if err := s.db.WithContext(ctx).Select("id").Where("source_id = ?", it.SourceId).First(&item).Error; err == nil {
+				if err := s.db.WithContext(ctx).Where("task_id = ? AND item_id = ?", task.ID, item.ID).First(&ti).Error; err == nil {
 					lastKnownTime = ti.CreatedAt
 				}
 			}
@@ -593,7 +600,7 @@ func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool
 				s.logger.Error("redis hset failed for new item", slog.String("task_id", intToString(task.ID)), slog.String("source_id", it.SourceId), slog.String("error", err.Error()))
 			}
 
-			s.linkTaskItem(task.ID, itemID, idx+1, linkTime)
+			s.linkTaskItem(ctx, task.ID, itemID, idx+1, linkTime)
 
 			// 仅当认为是“真正的新品”（linkTime == batchTime）时才通知
 			realNew := linkTime.Equal(batchTime)
@@ -629,11 +636,11 @@ func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool
 			s.logger.Debug("skip unchanged item db write", slog.String("task_id", intToString(task.ID)), slog.String("source_id", it.SourceId))
 			var item model.Item
 			// 仅查询 ID 用于关联
-			if err := s.db.Model(&model.Item{}).Select("id").Where("source_id = ?", it.SourceId).First(&item).Error; err != nil {
+			if err := s.db.WithContext(ctx).Model(&model.Item{}).Select("id").Where("source_id = ?", it.SourceId).First(&item).Error; err != nil {
 				s.logger.Error("failed to get id for existing item", slog.String("task_id", intToString(task.ID)), slog.String("source_id", it.SourceId), slog.String("error", err.Error()))
 				continue
 			}
-			s.linkTaskItem(task.ID, item.ID, idx+1, batchTime) // linkTaskItem 是幂等的，这里的时间实际上不会覆盖旧时间
+			s.linkTaskItem(ctx, task.ID, item.ID, idx+1, batchTime) // linkTaskItem 是幂等的，这里的时间实际上不会覆盖旧时间
 			continue
 		}
 
@@ -643,7 +650,7 @@ func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool
 			s.logger.Error("update item failed", slog.String("task_id", intToString(task.ID)), slog.String("source_id", it.SourceId), slog.String("error", err.Error()))
 			continue
 		}
-		s.linkTaskItem(task.ID, itemID, idx+1, batchTime) // 同上
+		s.linkTaskItem(ctx, task.ID, itemID, idx+1, batchTime) // 同上
 
 		// 更新 Redis 价格
 		if err := s.rdb.HSet(ctx, dedupKey, it.SourceId, newPrice).Err(); err != nil {
@@ -653,7 +660,7 @@ func (s *Scheduler) processItems(task *model.Task, items []*pb.Item, notify bool
 		// 如果是降价，特别记录
 		if newPrice < oldPrice {
 			// 降价时刷新 Task-Item 关联时间，用于时间轴与 NEW 标记
-			if err := s.db.Model(&model.TaskItem{}).
+			if err := s.db.WithContext(ctx).Model(&model.TaskItem{}).
 				Where("task_id = ? AND item_id = ?", task.ID, itemID).
 				Update("created_at", time.Now()).Error; err != nil {
 				s.logger.Warn("touch task_item failed", slog.String("task_id", intToString(task.ID)), slog.String("item_id", intToString(itemID)), slog.String("error", err.Error()))
@@ -884,8 +891,8 @@ func (s *Scheduler) upsertItem(ctx context.Context, it *pb.Item) (uint, error) {
 }
 
 // linkTaskItem 创建 Task 与 Item 的关联（幂等）。
-func (s *Scheduler) linkTaskItem(taskID, itemID uint, rank int, linkedAt time.Time) {
-	if err := s.db.Clauses(clause.OnConflict{
+func (s *Scheduler) linkTaskItem(ctx context.Context, taskID, itemID uint, rank int, linkedAt time.Time) {
+	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "task_id"}, {Name: "item_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"rank"}),
 	}).Create(&model.TaskItem{
