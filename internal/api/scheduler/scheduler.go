@@ -273,6 +273,16 @@ func (s *Scheduler) runRescue(ctx context.Context) {
 	if count > 0 {
 		s.logger.Info("janitor rescued stuck tasks", slog.Int("count", count))
 	}
+
+	// 额外保险：如果历史上仍有卡在 queued 状态过久的任务，将其恢复为 running，
+	// 让调度器可以重新调度。这主要用于兼容老数据或未来潜在的状态异常。
+	if err := s.db.WithContext(rescueCtx).
+		Model(&model.Task{}).
+		Where("status = ? AND updated_at < ?", "queued", time.Now().Add(-timeout)).
+		Update("status", "running").Error; err != nil {
+		s.logger.Warn("janitor failed to reset queued tasks",
+			slog.String("error", err.Error()))
+	}
 }
 
 func (s *Scheduler) monitorQueueDepth(ctx context.Context) {
@@ -491,13 +501,6 @@ func (s *Scheduler) handleTask(parentCtx context.Context, task *model.Task) erro
 		return err
 	}
 
-	if err := s.db.WithContext(parentCtx).Model(&model.Task{}).Where("id = ?", task.ID).Update("status", "queued").Error; err != nil {
-		s.logger.Warn("update task status failed",
-			slog.String("task_id", req.TaskId),
-			slog.String("error", err.Error()))
-		return err
-	}
-
 	s.logger.Info("task pushed to redis queue",
 		slog.String("task_id", req.TaskId),
 		slog.String("keyword", task.Keyword),
@@ -706,7 +709,7 @@ func (s *Scheduler) cleanupOldItems(ctx context.Context, taskID uint) {
 	err := s.db.WithContext(ctx).Model(&model.TaskItem{}).
 		Select("created_at").
 		Where("task_id = ?", taskID).
-		Order("created_at DESC, rank ASC").
+		Order("created_at DESC, `rank` ASC").
 		Offset(s.maxItemsPerTask).
 		Limit(1).
 		Scan(&cutoffTime).Error

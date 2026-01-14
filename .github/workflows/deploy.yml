@@ -3,7 +3,7 @@ name: Build and Push Images
 on:
   workflow_run:
     workflows: ["CI"]
-    branches: ["main"]
+    branches: ["main", "debug"]
     types:
       - completed
 

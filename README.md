@@ -24,7 +24,7 @@ V2.0 represents a major paradigm shift from a monolithic application to a fully 
 ## Screenshots
 
 ### Web Management Interface (Guest View)
-![Guest Dashboard](image/guestpage.png)
+![Guest Dashboard](image/guesten.png)
 *Real-time task management and tracking.*
 
 ### Master Node System Monitoring

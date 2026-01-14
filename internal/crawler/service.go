@@ -76,7 +76,10 @@ type Service struct {
 //	*Service: 初始化完成的服务实例
 //	error: 如果浏览器启动失败则返回错误
 func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, redisQueue *redisqueue.Client) (*Service, error) {
-	browser, err := startBrowser(cfg, logger, false)
+	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	browser, err := startBrowser(initCtx, cfg, logger, false)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +265,7 @@ func (s *Service) StartWorker(ctx context.Context) error {
 //
 //	*rod.Browser: 连接好的浏览器实例
 //	error: 启动失败返回错误
-func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.Browser, error) {
+func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.Browser, error) {
 	bin := cfg.Browser.BinPath
 	if bin == "" {
 		logger.Info("no browser binary specified, downloading default...")
@@ -329,7 +332,7 @@ func startBrowser(cfg *config.Config, logger *slog.Logger, useProxy bool) (*rod.
 		return nil, fmt.Errorf("launch browser: %w", err)
 	}
 
-	browser := rod.New().ControlURL(url)
+	browser := rod.New().Context(ctx).ControlURL(url)
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
@@ -408,7 +411,10 @@ func (s *Service) logPageTimeout(phase string, taskID string, url string, page *
 
 // rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
 func (s *Service) rotateBrowser(useProxy bool) error {
-	newBrowser, err := startBrowser(s.cfg, s.logger, useProxy)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	newBrowser, err := startBrowser(ctx, s.cfg, s.logger, useProxy)
 	if err != nil {
 		return err
 	}
@@ -533,15 +539,26 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 	// 创建 Job 函数
 	job := func(workerCtx context.Context) error {
-		response, err := s.doCrawl(ctx, req, 0)
+		var response *pb.FetchResponse
+		var err error
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("crawl panic: %v", r)
+			}
+			// 结果通道只发一次，避免 FetchItems 卡死
+			select {
+			case resultCh <- &fetchResult{response: response, err: err}:
+			default:
+			}
+		}()
 
-		// 将结果发送到 channel
-		select {
-		case resultCh <- &fetchResult{response: response, err: err}:
-		case <-workerCtx.Done():
-			return workerCtx.Err()
+		response, err = s.doCrawl(ctx, req, 0)
+		if err == nil && workerCtx.Err() == nil {
+			return nil
 		}
-
+		if workerCtx.Err() != nil {
+			err = workerCtx.Err()
+		}
 		return err
 	}
 
@@ -664,7 +681,17 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	if browser == nil {
 		return nil, fmt.Errorf("browser not initialized")
 	}
-	page := stealth.MustPage(browser)
+
+	basePage, err := browser.Context(ctx).Page(proto.TargetCreateTarget{URL: ""})
+	if err != nil {
+		return nil, fmt.Errorf("create page timeout or failed: %w", err)
+	}
+	if _, err := basePage.EvalOnNewDocument(stealth.JS); err != nil {
+		_ = basePage.Close()
+		return nil, fmt.Errorf("apply stealth script: %w", err)
+	}
+
+	page := basePage
 	// 定义增强版屏蔽列表
 	blockedURLs := []string{
 		// 1. 高带宽资源 (图片/字体/媒体)
@@ -948,6 +975,9 @@ func shouldActivateProxy(err error) bool {
 		strings.Contains(msg, "429") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "too many requests") {
+		return true
+	}
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
 		return true
 	}
 	if strings.Contains(msg, "net::") ||
