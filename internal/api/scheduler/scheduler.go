@@ -706,7 +706,7 @@ func (s *Scheduler) cleanupOldItems(ctx context.Context, taskID uint) {
 	err := s.db.WithContext(ctx).Model(&model.TaskItem{}).
 		Select("created_at").
 		Where("task_id = ?", taskID).
-		Order("created_at DESC, rank ASC").
+		Order("created_at DESC, `rank` ASC").
 		Offset(s.maxItemsPerTask).
 		Limit(1).
 		Scan(&cutoffTime).Error

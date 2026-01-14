@@ -24,7 +24,7 @@ V2.0 では、モノリシックなアプリケーションから完全な **分
 ## スクリーンショット
 
 ### Web 管理インターフェース (ゲストビュー)
-![Guest Dashboard](image/guestpage.png)
+![Guest Dashboard](image/guestjp.png)
 *リアルタイムでのタスク管理と追跡。*
 
 ### マスターノード システム監視
