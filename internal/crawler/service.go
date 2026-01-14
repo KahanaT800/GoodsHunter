@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -153,12 +154,98 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		redisQueue:     redisQueue,
 	}
 	metrics.CrawlerProxyMode.Set(0)
+
+	// 启动浏览器健康检查
+	go service.startBrowserHealthCheck(ctx)
+
 	return service, nil
 }
 
 // RestartSignal exposes the restart notification channel.
 func (s *Service) RestartSignal() <-chan struct{} {
 	return s.restartCh
+}
+
+// startBrowserHealthCheck 定期检查浏览器健康状态，如果无响应则重启浏览器实例。
+func (s *Service) startBrowserHealthCheck(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.checkBrowserHealth(ctx) {
+				s.logger.Warn("browser health check failed, restarting browser instance")
+				if err := s.restartBrowserInstance(ctx); err != nil {
+					s.logger.Error("failed to restart browser instance", slog.String("error", err.Error()))
+				} else {
+					s.logger.Info("browser instance restarted successfully")
+				}
+			}
+		}
+	}
+}
+
+// checkBrowserHealth 检查浏览器是否响应，返回 true 表示健康，false 表示无响应。
+func (s *Service) checkBrowserHealth(ctx context.Context) bool {
+	s.mu.RLock()
+	browser := s.browser
+	s.mu.RUnlock()
+
+	if browser == nil {
+		return false
+	}
+
+	// 尝试创建一个测试页面来检查浏览器是否响应
+	healthCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	page, err := browser.Context(healthCtx).Page(proto.TargetCreateTarget{URL: "about:blank"})
+	if err != nil {
+		return false
+	}
+	defer func() {
+		if page != nil {
+			_ = page.Close()
+		}
+	}()
+
+	// 尝试执行一个简单的 JavaScript 来验证浏览器响应
+	_, err = page.Eval("() => document.title")
+	return err == nil
+}
+
+// restartBrowserInstance 重启浏览器实例（保持当前的代理状态）。
+func (s *Service) restartBrowserInstance(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 保存当前代理状态
+	shouldUseProxy := s.currentIsProxy
+
+	// 关闭旧浏览器
+	if s.browser != nil {
+		if err := s.browser.Close(); err != nil {
+			s.logger.Warn("close old browser failed", slog.String("error", err.Error()))
+		}
+		s.browser = nil
+	}
+
+	// 启动新浏览器
+	newBrowser, err := startBrowser(ctx, s.cfg, s.logger, shouldUseProxy)
+	if err != nil {
+		return fmt.Errorf("start new browser: %w", err)
+	}
+
+	s.browser = newBrowser
+	mode := "direct"
+	if shouldUseProxy {
+		mode = "proxy"
+	}
+	s.logger.Info("browser instance restarted", slog.String("mode", mode))
+	return nil
 }
 
 // StartWorker runs a Redis task consumption loop until ctx is canceled.
@@ -209,8 +296,8 @@ func (s *Service) StartWorker(ctx context.Context) error {
 				<-sem // 任务处理完成，释放令牌
 			}()
 
-			// 为每个任务设置独立的上下文
-			taskCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			// 为每个任务设置独立的上下文（90秒超时，避免任务卡住太久）
+			taskCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 
 			// FetchItems 内部会通过 worker pool 进一步控制浏览器并发
@@ -539,16 +626,92 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 	// 创建 Job 函数
 	job := func(workerCtx context.Context) error {
+		// #region agent log
+		func() {
+			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if logFile != nil {
+				logEntry := map[string]interface{}{
+					"sessionId":    "debug-session",
+					"runId":        "run1",
+					"hypothesisId": "B",
+					"location":     "service.go:627",
+					"message":      "job function started",
+					"data":         map[string]interface{}{"task_id": taskID},
+					"timestamp":    time.Now().UnixMilli(),
+				}
+				_ = json.NewEncoder(logFile).Encode(logEntry)
+				_ = logFile.Close()
+			}
+		}()
+		// #endregion
 		var response *pb.FetchResponse
 		var err error
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("crawl panic: %v", r)
 			}
+			// #region agent log
+			func() {
+				logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if logFile != nil {
+					logEntry := map[string]interface{}{
+						"sessionId":    "debug-session",
+						"runId":        "run1",
+						"hypothesisId": "B",
+						"location":     "service.go:639",
+						"message":      "job function defer executing",
+						"data": map[string]interface{}{
+							"task_id":  taskID,
+							"has_err":  err != nil,
+							"has_resp": response != nil,
+						},
+						"timestamp": time.Now().UnixMilli(),
+					}
+					_ = json.NewEncoder(logFile).Encode(logEntry)
+					_ = logFile.Close()
+				}
+			}()
+			// #endregion
 			// 结果通道只发一次，避免 FetchItems 卡死
 			select {
 			case resultCh <- &fetchResult{response: response, err: err}:
+				// #region agent log
+				func() {
+					logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+					if logFile != nil {
+						logEntry := map[string]interface{}{
+							"sessionId":    "debug-session",
+							"runId":        "run1",
+							"hypothesisId": "C",
+							"location":     "service.go:656",
+							"message":      "result sent to channel",
+							"data":         map[string]interface{}{"task_id": taskID},
+							"timestamp":    time.Now().UnixMilli(),
+						}
+						_ = json.NewEncoder(logFile).Encode(logEntry)
+						_ = logFile.Close()
+					}
+				}()
+				// #endregion
 			default:
+				// #region agent log
+				func() {
+					logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+					if logFile != nil {
+						logEntry := map[string]interface{}{
+							"sessionId":    "debug-session",
+							"runId":        "run1",
+							"hypothesisId": "C",
+							"location":     "service.go:662",
+							"message":      "result channel send failed (channel full)",
+							"data":         map[string]interface{}{"task_id": taskID},
+							"timestamp":    time.Now().UnixMilli(),
+						}
+						_ = json.NewEncoder(logFile).Encode(logEntry)
+						_ = logFile.Close()
+					}
+				}()
+				// #endregion
 			}
 		}()
 
@@ -563,15 +726,91 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 	}
 
 	// 提交到 worker pool（阻塞式，直到队列有空间）
+	// #region agent log
+	func() {
+		logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			logEntry := map[string]interface{}{
+				"sessionId":    "debug-session",
+				"runId":        "run1",
+				"hypothesisId": "A",
+				"location":     "service.go:698",
+				"message":      "before EnqueueBlocking",
+				"data":         map[string]interface{}{"task_id": taskID},
+				"timestamp":    time.Now().UnixMilli(),
+			}
+			_ = json.NewEncoder(logFile).Encode(logEntry)
+			_ = logFile.Close()
+		}
+	}()
+	// #endregion
 	if err := s.queue.EnqueueBlocking(ctx, job); err != nil {
+		// #region agent log
+		func() {
+			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if logFile != nil {
+				logEntry := map[string]interface{}{
+					"sessionId":    "debug-session",
+					"runId":        "run1",
+					"hypothesisId": "A",
+					"location":     "service.go:723",
+					"message":      "EnqueueBlocking failed",
+					"data":         map[string]interface{}{"task_id": taskID, "error": err.Error()},
+					"timestamp":    time.Now().UnixMilli(),
+				}
+				_ = json.NewEncoder(logFile).Encode(logEntry)
+				_ = logFile.Close()
+			}
+		}()
+		// #endregion
 		recordMetrics("failed", err)
 		recordModeMetrics(nil, err)
 		return nil, fmt.Errorf("enqueue crawl job: %w", err)
 	}
+	// #region agent log
+	func() {
+		logFile, _ := os.OpenFile("/home/lyc/GoodsHunter/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			logEntry := map[string]interface{}{
+				"sessionId":    "debug-session",
+				"runId":        "run1",
+				"hypothesisId": "A",
+				"location":     "service.go:738",
+				"message":      "EnqueueBlocking succeeded, waiting for result",
+				"data":         map[string]interface{}{"task_id": taskID},
+				"timestamp":    time.Now().UnixMilli(),
+			}
+			_ = json.NewEncoder(logFile).Encode(logEntry)
+			_ = logFile.Close()
+		}
+	}()
+	// #endregion
 
 	// 等待结果
 	select {
 	case result := <-resultCh:
+		// #region agent log
+		func() {
+			logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if logFile != nil {
+				logEntry := map[string]interface{}{
+					"sessionId":    "debug-session",
+					"runId":        "run1",
+					"hypothesisId": "C",
+					"location":     "service.go:755",
+					"message":      "result received from channel",
+					"data": map[string]interface{}{
+						"task_id":  taskID,
+						"has_err":  result.err != nil,
+						"has_resp": result.response != nil,
+					},
+					"timestamp": time.Now().UnixMilli(),
+				}
+				_ = json.NewEncoder(logFile).Encode(logEntry)
+				_ = logFile.Close()
+			}
+		}()
+		// #endregion
 		if result.response != nil {
 			result.response.TaskId = taskID
 		}
@@ -616,6 +855,24 @@ type fetchResult struct {
 }
 
 func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
+	// #region agent log
+	func() {
+		logFile, _ := os.OpenFile("/tmp/crawler-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			logEntry := map[string]interface{}{
+				"sessionId":    "debug-session",
+				"runId":        "run1",
+				"hypothesisId": "D",
+				"location":     "service.go:704",
+				"message":      "doCrawl started",
+				"data":         map[string]interface{}{"task_id": req.GetTaskId(), "attempt": attempt},
+				"timestamp":    time.Now().UnixMilli(),
+			}
+			_ = json.NewEncoder(logFile).Encode(logEntry)
+			_ = logFile.Close()
+		}
+	}()
+	// #endregion
 	if err := s.ensureBrowserState(ctx); err != nil {
 		return nil, err
 	}
@@ -682,11 +939,32 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 		return nil, fmt.Errorf("browser not initialized")
 	}
 
-	basePage, err := browser.Context(ctx).Page(proto.TargetCreateTarget{URL: ""})
-	if err != nil {
-		return nil, fmt.Errorf("create page timeout or failed: %w", err)
+	// 使用带超时的 context 包装 Page 创建操作，确保即使浏览器卡住也能及时返回
+	pageCtx, pageCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer pageCancel()
+
+	type pageResult struct {
+		page *rod.Page
+		err  error
 	}
-	if _, err := basePage.EvalOnNewDocument(stealth.JS); err != nil {
+	pageResultCh := make(chan pageResult, 1)
+	go func() {
+		page, pageErr := browser.Context(pageCtx).Page(proto.TargetCreateTarget{URL: ""})
+		pageResultCh <- pageResult{page: page, err: pageErr}
+	}()
+
+	var basePage *rod.Page
+	var err error
+	select {
+	case result := <-pageResultCh:
+		if result.err != nil {
+			return nil, fmt.Errorf("create page timeout or failed: %w", result.err)
+		}
+		basePage = result.page
+	case <-pageCtx.Done():
+		return nil, fmt.Errorf("create page timeout: %w", pageCtx.Err())
+	}
+	if _, err = basePage.EvalOnNewDocument(stealth.JS); err != nil {
 		_ = basePage.Close()
 		return nil, fmt.Errorf("apply stealth script: %w", err)
 	}
@@ -735,8 +1013,24 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: s.defaultUA})
 
 	s.logger.Info("loading page", slog.String("task_id", taskID), slog.String("url", url))
-	if err := page.Navigate(url); err != nil {
-		return nil, fmt.Errorf("navigate: %w", err)
+
+	// 使用带超时的 context 包装 Navigate 操作，确保即使浏览器卡住也能及时返回
+	navigateCtx, navigateCancel := context.WithTimeout(ctx, s.pageTimeout)
+	defer navigateCancel()
+
+	// 在 goroutine 中执行 Navigate，如果超时则强制取消
+	navigateErrCh := make(chan error, 1)
+	go func() {
+		navigateErrCh <- page.Navigate(url)
+	}()
+
+	select {
+	case navErr := <-navigateErrCh:
+		if navErr != nil {
+			return nil, fmt.Errorf("navigate: %w", navErr)
+		}
+	case <-navigateCtx.Done():
+		return nil, fmt.Errorf("navigate timeout: %w", navigateCtx.Err())
 	}
 
 	info, err := page.Info()
@@ -752,14 +1046,30 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	}
 
 	// 等待 [data-testid="item-cell"] 内部出现 <a> 标签，避免骨架屏阶段
-	_, err = page.Race().
-		Element(`[data-testid="item-cell"] a`).Handle(func(e *rod.Element) error {
-		return nil
-	}).
-		Element(`.merEmptyState`).Handle(func(e *rod.Element) error {
-		return fmt.Errorf("no_items_state")
-	}).
-		Do()
+	// 使用带超时的 context 包装 Race 操作，确保即使浏览器卡住也能及时返回
+	raceCtx, raceCancel := context.WithTimeout(ctx, s.pageTimeout)
+	defer raceCancel()
+
+	raceErrCh := make(chan error, 1)
+	go func() {
+		_, raceErr := page.Race().
+			Element(`[data-testid="item-cell"] a`).Handle(func(e *rod.Element) error {
+			return nil
+		}).
+			Element(`.merEmptyState`).Handle(func(e *rod.Element) error {
+			return fmt.Errorf("no_items_state")
+		}).
+			Do()
+		raceErrCh <- raceErr
+	}()
+
+	select {
+	case err = <-raceErrCh:
+		// 正常返回，继续处理
+	case <-raceCtx.Done():
+		err = fmt.Errorf("race timeout: %w", raceCtx.Err())
+		s.logPageTimeout("wait_for_items", taskID, url, page, raceCtx.Err())
+	}
 
 	if err != nil {
 		// 如果检测到空状态，或者 Race 超时/失败后通过文本再次确认（作为兜底）
@@ -792,11 +1102,30 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	noGrowthAttempts := 0
 
 	countItems := func() (int, error) {
-		elements, err := page.Elements(selector)
-		if err != nil {
-			return 0, err
+		// 使用带超时的 context 包装 Elements 操作，避免在滚动循环中卡住
+		countCtx, countCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer countCancel()
+
+		type countResult struct {
+			count int
+			err   error
 		}
-		return len(elements), nil
+		countResultCh := make(chan countResult, 1)
+		go func() {
+			elems, elemErr := page.Elements(selector)
+			if elemErr != nil {
+				countResultCh <- countResult{count: 0, err: elemErr}
+				return
+			}
+			countResultCh <- countResult{count: len(elems), err: nil}
+		}()
+
+		select {
+		case result := <-countResultCh:
+			return result.count, result.err
+		case <-countCtx.Done():
+			return 0, fmt.Errorf("count items timeout: %w", countCtx.Err())
+		}
 	}
 
 	// 滚动循环
@@ -837,9 +1166,33 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 
 ParseItems:
 	// 解析商品列表。
-	elements, err := page.Elements(selector)
+	// 使用带超时的 context 包装 Elements 操作，确保即使浏览器卡住也能及时返回
+	elementsCtx, elementsCancel := context.WithTimeout(ctx, s.pageTimeout)
+	defer elementsCancel()
+
+	type elementsResult struct {
+		elements rod.Elements
+		err      error
+	}
+	elementsResultCh := make(chan elementsResult, 1)
+	go func() {
+		elems, elemErr := page.Elements(selector)
+		elementsResultCh <- elementsResult{elements: elems, err: elemErr}
+	}()
+
+	var elements rod.Elements
+	select {
+	case result := <-elementsResultCh:
+		elements = result.elements
+		err = result.err
+	case <-elementsCtx.Done():
+		err = fmt.Errorf("get elements timeout: %w", elementsCtx.Err())
+		s.logPageTimeout("get_elements", taskID, url, page, elementsCtx.Err())
+		return nil, fmt.Errorf("get elements: %w", err)
+	}
+
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
 			s.logPageTimeout("get_elements", taskID, url, page, err)
 		}
 		return nil, fmt.Errorf("get elements: %w", err)
