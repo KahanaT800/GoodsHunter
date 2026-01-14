@@ -6,6 +6,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      TZ: Asia/Tokyo
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
       WORKER_ID: ${WORKER_ID:-worker-01}
@@ -53,6 +54,7 @@ services:
       - GRAFANA_CLOUD_LOKI_API_KEY=${GRAFANA_CLOUD_LOKI_API_KEY}
       - HOSTNAME=${HOSTNAME}
       - WORKER_ID=${WORKER_ID}
+      - TZ=Asia/Tokyo
     volumes:
       - ./deploy/alloy/config.worker.river:/etc/alloy/config.river:ro
       - /var/run/docker.sock:/var/run/docker.sock

@@ -5,6 +5,7 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-goodshunter_root}
       MYSQL_DATABASE: goodshunter
+      TZ: Asia/Tokyo
     volumes:
       - mysql_data:/var/lib/mysql
     command: --default-authentication-plugin=mysql_native_password
@@ -29,6 +30,8 @@ services:
         "--requirepass",
         "${REDIS_PASSWORD:-goodshunter_redis}"
       ]
+    environment:
+      TZ: Asia/Tokyo
     ports:
       - "6379:6379"
     volumes:
@@ -53,6 +56,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      TZ: Asia/Tokyo
       APP_RATE_LIMIT: ${APP_RATE_LIMIT:-3}
       APP_RATE_BURST: ${APP_RATE_BURST:-5}
       WORKER_ID: ${WORKER_ID:-master-01}
@@ -96,6 +100,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      TZ: Asia/Tokyo
       APP_HTTP_ADDR: ${APP_HTTP_ADDR:-:8080}
       APP_SCHEDULE_INTERVAL: ${APP_SCHEDULE_INTERVAL:-5m}
       APP_NEW_ITEM_DURATION: ${APP_NEW_ITEM_DURATION:-1h}
@@ -152,6 +157,8 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./certbot/conf:/etc/letsencrypt
       - ./certbot/www:/var/www/certbot
+    environment:
+      TZ: Asia/Tokyo
     command: '/bin/sh -c ''while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g "daemon off;"'''
     depends_on:
       - api
@@ -174,6 +181,7 @@ services:
     environment:
       - REDIS_ADDR=redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-goodshunter_redis}
+      - TZ=Asia/Tokyo
     networks:
       - goodshunter-net
   
@@ -186,6 +194,7 @@ services:
       - '--mysqld.address=mysql:3306'
     environment:
       - MYSQLD_EXPORTER_PASSWORD=${MYSQL_EXPORTER_PASSWORD:-exporter_password_123}
+      - TZ=Asia/Tokyo
     networks:
       - goodshunter-net
 
@@ -198,6 +207,8 @@ services:
     image: grafana/alloy:latest
     restart: always
     profiles: ["monitoring-cloud"]
+    environment:
+      - TZ=Asia/Tokyo
     command:
       - run
       - /etc/alloy/config.river
