@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,8 @@ func TestParsePriceWithExtraNumbers(t *testing.T) {
 
 func TestBlockedText(t *testing.T) {
 	html := "<html><body><h1>Attention Required!</h1><p>Cloudflare</p></body></html>"
-	if !isBlockedText(html) {
+	// isBlockedText 已重构为使用 containsAny + blockedHints
+	if !containsAny(strings.ToLower(html), blockedHints) {
 		t.Fatalf("expected blocked text to be detected")
 	}
 }

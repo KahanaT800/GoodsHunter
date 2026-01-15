@@ -36,6 +36,25 @@ const (
 	rateLimitKey     = "goodshunter:ratelimit:global"
 	proxyCooldownKey = "goodshunter:proxy:cooldown"
 	proxyCacheTTL    = 5 * time.Second
+
+	// 超时常量
+	browserInitTimeout     = 30 * time.Second       // 浏览器初始化超时
+	browserHealthInterval  = 30 * time.Second       // 浏览器健康检查间隔
+	browserHealthTimeout   = 5 * time.Second        // 健康检查单次超时
+	stuckTaskCheckInterval = 1 * time.Minute        // 卡住任务检查间隔
+	stuckTaskRescueTimeout = 10 * time.Second       // 卡住任务恢复超时
+	stuckTaskThreshold     = 2 * time.Minute        // 任务被认定为卡住的阈值
+	taskTimeout            = 90 * time.Second       // 单个任务最大执行时间
+	watchdogTimeout        = 100 * time.Second      // 看门狗超时（比任务超时稍长）
+	pageCreateTimeout      = 10 * time.Second       // 页面创建超时
+	stealthScriptTimeout   = 5 * time.Second        // Stealth 脚本应用超时
+	redisOperationTimeout  = 5 * time.Second        // Redis 操作超时
+	redisShortTimeout      = 3 * time.Second        // Redis 短操作超时
+	rateLimitCheckTimeout  = 5 * time.Second        // 速率限制检查超时
+	rateLimitMaxWait       = 30 * time.Second       // 速率限制最大等待时间
+	elementCountTimeout    = 5 * time.Second        // 元素计数超时
+	pageTextCheckTimeout   = 2 * time.Second        // 页面文本检查超时
+	scrollWaitInterval     = 500 * time.Millisecond // 滚动后等待间隔
 )
 
 // Service 负责浏览器调度与页面解析。
@@ -89,7 +108,7 @@ type crawlerStats struct {
 //	*Service: 初始化完成的服务实例
 //	error: 如果浏览器启动失败则返回错误
 func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, redisQueue *redisqueue.Client) (*Service, error) {
-	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	initCtx, cancel := context.WithTimeout(ctx, browserInitTimeout)
 	defer cancel()
 
 	browser, err := startBrowser(initCtx, cfg, logger, false)
@@ -169,7 +188,7 @@ func (s *Service) RestartSignal() <-chan struct{} {
 
 // startBrowserHealthCheck 定期检查浏览器健康状态，如果无响应则重启浏览器实例。
 func (s *Service) startBrowserHealthCheck(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
+	ticker := time.NewTicker(browserHealthInterval)
 	defer ticker.Stop()
 
 	for {
@@ -189,12 +208,12 @@ func (s *Service) startBrowserHealthCheck(ctx context.Context) {
 	}
 }
 
-// startStuckTaskCleanup 定期清理卡住的任务（超过 2 分钟的任务会被恢复）。
+// startStuckTaskCleanup 定期清理卡住的任务。
 func (s *Service) startStuckTaskCleanup(ctx context.Context) {
 	if s.redisQueue == nil {
 		return
 	}
-	ticker := time.NewTicker(1 * time.Minute) // 每分钟检查一次
+	ticker := time.NewTicker(stuckTaskCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -202,8 +221,8 @@ func (s *Service) startStuckTaskCleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rescueCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			count, err := s.redisQueue.RescueStuckTasks(rescueCtx, 2*time.Minute)
+			rescueCtx, cancel := context.WithTimeout(ctx, stuckTaskRescueTimeout)
+			count, err := s.redisQueue.RescueStuckTasks(rescueCtx, stuckTaskThreshold)
 			cancel()
 			if err != nil {
 				s.logger.Warn("failed to rescue stuck tasks", slog.String("error", err.Error()))
@@ -225,7 +244,7 @@ func (s *Service) checkBrowserHealth(ctx context.Context) bool {
 	}
 
 	// 尝试创建一个测试页面来检查浏览器是否响应
-	healthCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	healthCtx, cancel := context.WithTimeout(ctx, browserHealthTimeout)
 	defer cancel()
 
 	page, err := browser.Context(healthCtx).Page(proto.TargetCreateTarget{URL: "about:blank"})
@@ -322,21 +341,22 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			taskStart := time.Now()
 
 			// 看门狗超时：确保无论如何都会释放信号量
-			// 设置为 100 秒（比任务超时 90 秒稍长，给正常超时一点余量）
-			watchdogTimeout := 100 * time.Second
+			// 设置为比任务超时稍长，给正常超时一点余量
 			done := make(chan struct{})
 
 			// 看门狗 goroutine
+			// 注意：看门狗只负责记录日志和 watchdog 特定指标，不更新 TotalFailed
+			// 因为任务最终会通过 context 超时返回，届时 FetchItems 会正确更新统计
+			// 这样避免同一任务被重复计数
 			go func() {
 				select {
 				case <-done:
 					// 任务正常完成
 				case <-time.After(watchdogTimeout):
-					// 看门狗超时触发
+					// 看门狗超时触发 - 仅记录日志和 watchdog 专用指标
 					s.logger.Error("watchdog timeout triggered, task stuck",
 						slog.String("task_id", taskID),
 						slog.Duration("elapsed", time.Since(taskStart)))
-					s.stats.TotalFailed.Add(1)
 					metrics.CrawlerErrorsTotal.WithLabelValues("unknown", "watchdog_timeout").Inc()
 				}
 			}()
@@ -362,7 +382,7 @@ func (s *Service) StartWorker(ctx context.Context) error {
 						ErrorMessage: fmt.Sprintf("panic: %v", r),
 						TaskId:       taskID,
 					}
-					pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					pushCtx, pushCancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 					defer pushCancel()
 					if pushErr := s.redisQueue.PushResult(pushCtx, resp); pushErr != nil {
 						s.logger.Error("push panic result failed", slog.String("error", pushErr.Error()))
@@ -370,8 +390,8 @@ func (s *Service) StartWorker(ctx context.Context) error {
 				}
 			}()
 
-			// 为每个任务设置独立的上下文（90秒超时，避免任务卡住太久）
-			taskCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			// 为每个任务设置独立的上下文
+			taskCtx, cancel := context.WithTimeout(context.Background(), taskTimeout)
 			defer cancel()
 
 			// 使用带超时的 channel 包装 FetchItems 调用
@@ -424,7 +444,7 @@ func (s *Service) StartWorker(ctx context.Context) error {
 					resp.TaskId = taskID
 				}
 				// 异步回传结果
-				pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				pushCtx, pushCancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 				defer pushCancel()
 
 				if pushErr := s.redisQueue.PushResult(pushCtx, resp); pushErr != nil {
@@ -432,7 +452,7 @@ func (s *Service) StartWorker(ctx context.Context) error {
 				}
 			}
 
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), redisOperationTimeout)
 			defer ackCancel()
 			if ackErr := s.redisQueue.AckTask(ackCtx, t); ackErr != nil {
 				s.logger.Error("failed to ack task",
@@ -521,12 +541,12 @@ func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		}
 	}
 
-	url, err := l.Launch()
+	wsURL, err := l.Launch()
 	if err != nil {
 		return nil, fmt.Errorf("launch browser: %w", err)
 	}
 
-	browser := rod.New().Context(ctx).ControlURL(url)
+	browser := rod.New().Context(ctx).ControlURL(wsURL)
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
@@ -556,20 +576,32 @@ func (s *Service) ensureBrowserState(ctx context.Context) error {
 		return nil
 	}
 
+	// 检测到需要切换模式
+	s.logger.Info("browser mode switch detected",
+		slog.Bool("current_is_proxy", currentIsProxy),
+		slog.Bool("should_use_proxy", shouldUseProxy))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	shouldUseProxy, err = s.getProxyState(ctx)
-	if err != nil {
-		return err
-	}
+	// 双重检查（可能其他 goroutine 已完成切换）
+	// 注意：不能在持有写锁时调用 getProxyState（会导致死锁，因为 getProxyState 内部使用 RLock）
+	// 只需要检查 s.currentIsProxy 是否已被其他 goroutine 更新
 	if shouldUseProxy == s.currentIsProxy {
+		s.logger.Debug("browser mode already switched by another goroutine")
 		return nil
 	}
 
+	s.logger.Info("rotating browser instance",
+		slog.Bool("to_proxy", shouldUseProxy))
+
 	if err := s.rotateBrowser(shouldUseProxy); err != nil {
+		s.logger.Error("failed to rotate browser",
+			slog.Bool("to_proxy", shouldUseProxy),
+			slog.String("error", err.Error()))
 		return err
 	}
+
 	s.currentIsProxy = shouldUseProxy
 	mode := "direct"
 	if shouldUseProxy {
@@ -580,7 +612,7 @@ func (s *Service) ensureBrowserState(ctx context.Context) error {
 	if shouldUseProxy {
 		metrics.CrawlerProxySwitchToProxyTotal.Inc()
 	}
-	s.logger.Info("crawler mode switched", slog.String("mode", mode))
+	s.logger.Info("crawler mode switched successfully", slog.String("mode", mode))
 	return nil
 }
 
@@ -605,7 +637,7 @@ func (s *Service) logPageTimeout(phase string, taskID string, url string, page *
 
 // rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
 func (s *Service) rotateBrowser(useProxy bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), browserInitTimeout)
 	defer cancel()
 
 	newBrowser, err := startBrowser(ctx, s.cfg, s.logger, useProxy)
@@ -628,7 +660,7 @@ func (s *Service) isUsingProxy() bool {
 	return s.currentIsProxy
 }
 
-func (s *Service) getProxyState(ctx context.Context) (bool, error) {
+func (s *Service) getProxyState(_ context.Context) (bool, error) {
 	now := time.Now()
 	s.mu.RLock()
 	if now.Before(s.proxyCacheUntil) {
@@ -642,8 +674,8 @@ func (s *Service) getProxyState(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// 为 Redis 调用设置短超时，避免卡住
-	redisCtx, redisCancel := context.WithTimeout(ctx, 3*time.Second)
+	// 使用独立的 context，不依赖调用方（可能已超时）
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), redisShortTimeout)
 	defer redisCancel()
 
 	exists, err := s.rdb.Exists(redisCtx, proxyCooldownKey).Result()
@@ -667,7 +699,16 @@ func (s *Service) getProxyState(ctx context.Context) (bool, error) {
 	return state, nil
 }
 
-func (s *Service) setProxyCooldown(ctx context.Context, duration time.Duration) error {
+// setProxyCooldown 设置代理冷却时间。
+//
+// 降级策略说明：
+// - 如果 Redis 可用：同时更新 Redis 和本地缓存
+// - 如果 Redis 不可用：仅更新本地缓存，记录警告日志
+// - 只有在 Redis 客户端完全未初始化时才返回错误
+//
+// 注意：此函数使用独立的 context（不依赖传入的 ctx），确保即使调用方的 ctx 已超时，
+// Redis 操作仍能正常执行。这对于任务超时后触发的代理切换场景至关重要。
+func (s *Service) setProxyCooldown(_ context.Context, duration time.Duration) error {
 	if duration <= 0 {
 		duration = s.cfg.App.ProxyCooldown
 	}
@@ -675,20 +716,28 @@ func (s *Service) setProxyCooldown(ctx context.Context, duration time.Duration) 
 		return errors.New("redis client is not initialized")
 	}
 
-	// 为 Redis 调用设置短超时
-	redisCtx, redisCancel := context.WithTimeout(ctx, 3*time.Second)
+	// 使用独立的 context，不依赖调用方的 ctx（可能已超时）
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), redisShortTimeout)
 	defer redisCancel()
 
+	redisOK := true
 	if err := s.rdb.Set(redisCtx, proxyCooldownKey, "1", duration).Err(); err != nil {
+		redisOK = false
 		s.logger.Warn("set proxy cooldown failed, updating local cache only",
-			slog.String("error", err.Error()))
-		// 即使 Redis 失败，也更新本地缓存（降级策略）
+			slog.String("error", err.Error()),
+			slog.Duration("duration", duration))
+		metrics.CrawlerErrorsTotal.WithLabelValues("internal", "redis_degraded").Inc()
 	}
 
 	s.mu.Lock()
 	s.proxyCache = true
 	s.proxyCacheUntil = time.Now().Add(proxyCacheTTL)
 	s.mu.Unlock()
+
+	if redisOK {
+		s.logger.Info("proxy cooldown set",
+			slog.Duration("duration", duration))
+	}
 	return nil
 }
 
@@ -767,6 +816,8 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 					slog.Uint64("count", newCount),
 					slog.Uint64("limit", s.maxTasks))
 			default:
+				s.logger.Debug("restart signal already pending, skipping",
+					slog.Uint64("count", newCount))
 			}
 		}
 	}
@@ -796,8 +847,9 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 	taskID := req.GetTaskId()
 	s.logger.Debug("doCrawl started", slog.String("task_id", taskID), slog.Int("attempt", attempt))
 
-	// 为 ensureBrowserState 设置独立的短超时（防止 Redis 调用卡住）
-	browserStateCtx, browserStateCancel := context.WithTimeout(ctx, 10*time.Second)
+	// 使用独立的 context 确保浏览器状态检查不受任务 ctx 影响
+	// 这对于任务超时后需要切换代理模式的场景至关重要
+	browserStateCtx, browserStateCancel := context.WithTimeout(context.Background(), pageCreateTimeout)
 	defer browserStateCancel()
 	if err := s.ensureBrowserState(browserStateCtx); err != nil {
 		s.logger.Warn("ensureBrowserState failed", slog.String("task_id", taskID), slog.String("error", err.Error()))
@@ -822,10 +874,23 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 
 	if attempt == 0 && !s.isUsingProxy() && shouldActivateProxy(err) {
 		s.logger.Warn("direct connection failed, activating proxy",
-			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
-		if err := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); err != nil {
-			return nil, err
+			slog.Duration("cooldown", s.cfg.App.ProxyCooldown),
+			slog.String("trigger_error", err.Error()))
+
+		if setErr := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); setErr != nil {
+			s.logger.Error("failed to set proxy cooldown", slog.String("error", setErr.Error()))
 		}
+
+		// 检查 ctx 是否已超时或即将超时
+		// 如果 ctx 剩余时间不足，不要重试当前任务，而是让它重新入队
+		if ctx.Err() != nil {
+			s.logger.Info("context already cancelled, skip retry and let task re-queue",
+				slog.String("task_id", taskID))
+			return nil, fmt.Errorf("proxy activated, task needs retry: %w", err)
+		}
+
+		// ctx 还有足够时间，可以尝试重试
+		s.logger.Info("retrying with proxy mode", slog.String("task_id", taskID))
 		return s.doCrawl(ctx, req, attempt+1)
 	}
 
@@ -841,11 +906,12 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	if s.rateLimiter != nil {
 		s.logger.Debug("waiting for rate limit", slog.String("task_id", taskID))
 		rateLimitStart := time.Now()
-		// 为速率限制设置最大等待时间（30秒），防止无限等待
-		rateLimitDeadline := time.After(30 * time.Second)
+		// 为速率限制设置最大等待时间，防止无限等待
+		rateLimitDeadline := time.After(rateLimitMaxWait)
+	RateLimitLoop:
 		for {
 			// 为单次 Redis 调用设置短超时
-			rateLimitCtx, rateLimitCancel := context.WithTimeout(ctx, 5*time.Second)
+			rateLimitCtx, rateLimitCancel := context.WithTimeout(ctx, rateLimitCheckTimeout)
 			allowed, err := s.rateLimiter.Allow(rateLimitCtx, rateLimitKey, int(s.cfg.App.RateLimit), int(s.cfg.App.RateBurst))
 			rateLimitCancel()
 
@@ -869,12 +935,11 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 			case <-rateLimitDeadline:
 				s.logger.Warn("rate limit max wait exceeded, allowing request", slog.String("task_id", taskID))
 				metrics.RateLimitWaitDuration.Observe(time.Since(rateLimitStart).Seconds())
-				goto RateLimitDone
+				break RateLimitLoop
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}
-RateLimitDone:
 
 	url := BuildMercariURL(req)
 	s.logger.Debug("built mercari URL", slog.String("task_id", taskID), slog.String("url", url))
@@ -912,8 +977,8 @@ RateLimitDone:
 		}
 	}()
 
-	// 页面创建的超时保护（10秒）- 只用于这个 select，不影响页面对象的内部 context
-	pageCreateTimer := time.NewTimer(10 * time.Second)
+	// 页面创建的超时保护 - 只用于这个 select，不影响页面对象的内部 context
+	pageCreateTimer := time.NewTimer(pageCreateTimeout)
 	defer pageCreateTimer.Stop()
 
 	var basePage *rod.Page
@@ -927,13 +992,13 @@ RateLimitDone:
 		s.logger.Debug("browser page created", slog.String("task_id", taskID))
 	case <-pageCreateTimer.C:
 		s.logger.Warn("page creation timeout", slog.String("task_id", taskID))
-		return nil, fmt.Errorf("create page timeout after 10s")
+		return nil, fmt.Errorf("create page timeout after %v", pageCreateTimeout)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("context cancelled during page creation: %w", ctx.Err())
 	}
 
 	// Stealth 脚本应用 - 同样只用 select 做超时保护
-	stealthTimer := time.NewTimer(5 * time.Second)
+	stealthTimer := time.NewTimer(stealthScriptTimeout)
 	defer stealthTimer.Stop()
 	stealthDone := make(chan error, 1)
 	go func() {
@@ -949,7 +1014,7 @@ RateLimitDone:
 		}
 	case <-stealthTimer.C:
 		_ = basePage.Close()
-		return nil, fmt.Errorf("apply stealth script timeout after 5s")
+		return nil, fmt.Errorf("apply stealth script timeout after %v", stealthScriptTimeout)
 	case <-ctx.Done():
 		_ = basePage.Close()
 		return nil, fmt.Errorf("context cancelled during stealth script: %w", ctx.Err())
@@ -995,9 +1060,11 @@ RateLimitDone:
 		_ = page.Close()
 	}()
 
-	// 设置超时、Stealth 与 UA。
+	// 设置超时与 UA
 	page = page.Timeout(s.pageTimeout)
-	page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: s.defaultUA})
+	if err := page.SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: s.defaultUA}); err != nil {
+		s.logger.Warn("set user agent failed", slog.String("task_id", taskID), slog.String("error", err.Error()))
+	}
 
 	s.logger.Info("loading page", slog.String("task_id", taskID), slog.String("url", url))
 
@@ -1090,7 +1157,7 @@ RateLimitDone:
 
 	countItems := func() (int, error) {
 		// 使用带超时的 context 包装 Elements 操作，避免在滚动循环中卡住
-		countCtx, countCancel := context.WithTimeout(ctx, 5*time.Second)
+		countCtx, countCancel := context.WithTimeout(ctx, elementCountTimeout)
 		defer countCancel()
 
 		type countResult struct {
@@ -1116,6 +1183,7 @@ RateLimitDone:
 	}
 
 	// 滚动循环
+ScrollLoop:
 	for {
 		currentCount, err := countItems()
 		if err != nil {
@@ -1132,9 +1200,9 @@ RateLimitDone:
 		// 等待加载... 使用 Race 来处理超时
 		select {
 		case <-timeout:
-			goto ParseItems // 超时跳出循环
+			break ScrollLoop // 超时跳出循环
 		default:
-			time.Sleep(500 * time.Millisecond) // 等待页面渲染
+			time.Sleep(scrollWaitInterval) // 等待页面渲染
 		}
 
 		afterCount, err := countItems()
@@ -1151,7 +1219,7 @@ RateLimitDone:
 		}
 	}
 
-ParseItems:
+	// 解析商品列表
 	// 解析商品列表。
 	// 使用带超时的 context 包装 Elements 操作，确保即使浏览器卡住也能及时返回
 	elementsCtx, elementsCancel := context.WithTimeout(ctx, s.pageTimeout)
@@ -1229,43 +1297,9 @@ ParseItems:
 	}, nil
 }
 
-func (s *Service) isNoItemsPage(page *rod.Page) bool {
-	// 使用 Elements 而不是 Element，避免在元素不存在时阻塞等待超时
-	if elems, err := page.Elements(".merEmptyState"); err == nil && len(elems) > 0 {
-		return true
-	}
-
-	// 使用带超时的 Page 克隆进行文本检查，避免卡顿
-	pWithTimeout := page.Timeout(2 * time.Second)
-	body, err := pWithTimeout.Element("body")
-	if err != nil {
-		return false
-	}
-	text, err := body.Text()
-	if err != nil {
-		return false
-	}
-	return isNoItemsText(text)
-}
-
-func (s *Service) isBlockedPage(page *rod.Page) bool {
-	pWithTimeout := page.Timeout(2 * time.Second)
-	body, err := pWithTimeout.Element("body")
-	if err != nil {
-		return false
-	}
-	text, err := body.Text()
-	if err != nil {
-		return false
-	}
-	return isBlockedText(text)
-}
-
-func isNoItemsText(text string) bool {
-	if text == "" {
-		return false
-	}
-	noItemsHints := []string{
+// 页面检测关键词
+var (
+	noItemsHints = []string{
 		"出品された商品がありません",
 		"該当する商品はありません",
 		"検索結果はありません",
@@ -1273,89 +1307,142 @@ func isNoItemsText(text string) bool {
 		"見つかりませんでした",
 		"検索結果がありません",
 	}
-	for _, hint := range noItemsHints {
-		if strings.Contains(text, hint) {
-			return true
-		}
-	}
-	return false
-}
-
-func isBlockedText(text string) bool {
-	if text == "" {
-		return false
-	}
-	lower := strings.ToLower(text)
-	blockHints := []string{
+	blockedHints = []string{
 		"cloudflare",
 		"attention required",
 		"verify you are human",
 		"access denied",
 		"temporarily unavailable",
 	}
-	for _, hint := range blockHints {
-		if strings.Contains(lower, hint) {
+)
+
+// containsAny 检查文本是否包含任意一个关键词
+func containsAny(text string, keywords []string) bool {
+	for _, kw := range keywords {
+		if strings.Contains(text, kw) {
 			return true
 		}
 	}
 	return false
 }
 
+// getPageBodyText 获取页面 body 文本（带超时保护）
+func (s *Service) getPageBodyText(page *rod.Page) string {
+	pWithTimeout := page.Timeout(pageTextCheckTimeout)
+	body, err := pWithTimeout.Element("body")
+	if err != nil {
+		return ""
+	}
+	text, err := body.Text()
+	if err != nil {
+		return ""
+	}
+	return text
+}
+
+func (s *Service) isNoItemsPage(page *rod.Page) bool {
+	// 先检查空状态 DOM 元素
+	if elems, err := page.Elements(".merEmptyState"); err == nil && len(elems) > 0 {
+		return true
+	}
+	// 再检查页面文本
+	text := s.getPageBodyText(page)
+	return text != "" && containsAny(text, noItemsHints)
+}
+
+func (s *Service) isBlockedPage(page *rod.Page) bool {
+	text := s.getPageBodyText(page)
+	return text != "" && containsAny(strings.ToLower(text), blockedHints)
+}
+
+// crawlErrorType 爬虫错误类型
+type crawlErrorType int
+
+const (
+	errTypeUnknown crawlErrorType = iota
+	errTypeTimeout
+	errTypeBlocked    // 被封禁（403/429/Cloudflare等）
+	errTypeNetwork    // 网络错误
+	errTypeParseError // 解析错误
+)
+
+// classifyError 统一的错误分类函数
+func classifyError(err error) crawlErrorType {
+	if err == nil {
+		return errTypeUnknown
+	}
+
+	// 先检查标准 context 错误
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return errTypeTimeout
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	// 检查被封禁的错误
+	blockedKeywords := []string{
+		"blocked_page", "cloudflare", "attention required",
+		"access denied", "403", "429", "forbidden", "too many requests",
+	}
+	for _, kw := range blockedKeywords {
+		if strings.Contains(msg, kw) {
+			return errTypeBlocked
+		}
+	}
+
+	// 检查超时错误
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+		return errTypeTimeout
+	}
+
+	// 检查网络错误
+	networkKeywords := []string{"net::", "connection", "navigate"}
+	for _, kw := range networkKeywords {
+		if strings.Contains(msg, kw) {
+			return errTypeNetwork
+		}
+	}
+
+	// 检查解析错误
+	if strings.Contains(msg, "parse") || strings.Contains(msg, "extract") {
+		return errTypeParseError
+	}
+
+	return errTypeUnknown
+}
+
+// shouldActivateProxy 判断是否应该切换到代理模式
 func shouldActivateProxy(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "blocked_page") ||
-		strings.Contains(msg, "cloudflare") ||
-		strings.Contains(msg, "attention required") ||
-		strings.Contains(msg, "access denied") ||
-		strings.Contains(msg, "403") ||
-		strings.Contains(msg, "429") ||
-		strings.Contains(msg, "forbidden") ||
-		strings.Contains(msg, "too many requests") {
-		return true
-	}
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
-		return true
-	}
-	if strings.Contains(msg, "net::") ||
-		strings.Contains(msg, "connection") ||
-		strings.Contains(msg, "navigate") {
-		return true
-	}
-	return false
+	errType := classifyError(err)
+	// 被封禁、超时、网络错误都应该尝试代理
+	return errType == errTypeBlocked || errType == errTypeTimeout || errType == errTypeNetwork
 }
 
+// classifyCrawlerError 返回用于 metrics 的错误类型字符串
 func classifyCrawlerError(err error) string {
-	if err == nil {
-		return "unknown"
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	switch classifyError(err) {
+	case errTypeTimeout:
 		return "timeout"
-	}
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "timeout"):
-		return "timeout"
-	case strings.Contains(msg, "navigate") || strings.Contains(msg, "net::") || strings.Contains(msg, "connection"):
+	case errTypeNetwork:
 		return "network_error"
-	case strings.Contains(msg, "parse") || strings.Contains(msg, "extract"):
+	case errTypeParseError:
 		return "parse_error"
+	case errTypeBlocked:
+		return "blocked"
 	default:
 		return "unknown"
 	}
 }
 
+// classifyCrawlStatus 返回用于 metrics 的爬取状态字符串
 func classifyCrawlStatus(err error) string {
 	if err == nil {
 		return "success"
 	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "403") ||
-		strings.Contains(msg, "forbidden") ||
-		strings.Contains(msg, "access denied") ||
-		strings.Contains(msg, "blocked_page") {
+	if classifyError(err) == errTypeBlocked {
 		return "403_forbidden"
 	}
 	return "error"
