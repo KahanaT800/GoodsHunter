@@ -1,87 +1,156 @@
-# 本地测试检查清单 - 上云前必读
+# Local Testing Checklist
 
-只保留核心 API 与爬虫功能验证步骤，已移除本地 Prometheus/Grafana 相关内容。
+Essential verification steps before deploying to production.
 
 ---
 
-## 步骤 1: 启动核心服务
+## Step 1: Start Core Services
 
 ```bash
 docker compose up -d
 docker compose ps
 ```
 
-应看到：
-- mysql / redis / api / crawler / nginx 都是 Up
+**Expected**: All services (mysql, redis, api, crawler, nginx) show `Up` status.
 
 ---
 
-## 步骤 2: 健康检查
+## Step 2: Health Check
 
 ```bash
 curl http://localhost:8081/healthz
 ```
 
-应返回：
-```
+**Expected Response**:
+```json
 {"status":"ok"}
 ```
 
 ---
 
-## 步骤 3: 任务闭环验证
+## Step 3: End-to-End Task Verification
 
-1) 注册或登录获取 token  
-2) 创建任务  
-3) 查询任务与时间线  
+### Register & Login
 
 ```bash
-# 注册
+# Register
 curl -X POST http://localhost:8081/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "username": "test_user",
     "email": "test@example.com",
     "password": "test123456",
-    "invite_code": "3724"
+    "invite_code": "YOUR_INVITE_CODE"
   }'
 
-# 登录
-TOKEN=$(curl -X POST http://localhost:8081/api/auth/login \
+# Login and get token
+TOKEN=$(curl -s -X POST http://localhost:8081/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "email": "test@example.com",
     "password": "test123456"
   }' | jq -r '.token')
 
-# 创建任务
+echo $TOKEN
+```
+
+### Create & Query Task
+
+```bash
+# Create task
 curl -X POST http://localhost:8081/api/tasks \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{
-    "keyword": "测试商品",
+    "keyword": "test item",
     "platform": 1,
     "min_price": 100,
     "max_price": 1000
   }'
 
-# 查询任务
+# Query tasks
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/tasks
 
-# 查询时间线
+# Query timeline
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/timeline
 ```
 
 ---
 
-## 步骤 4: 基础日志检查
+## Step 4: Log Verification
 
 ```bash
+# API logs
 docker compose logs -f api
+
+# Crawler logs
 docker compose logs -f crawler
 ```
 
-确认：
-- scheduler 启动
-- crawler gRPC 启动
-- 任务能被调度执行
+**Expected**:
+- Scheduler started successfully
+- Crawler gRPC server listening
+- Tasks being scheduled and executed
+
+---
+
+## Step 5: Crawler Verification
+
+Check that crawler is processing tasks:
+
+```bash
+# Watch crawler logs for task execution
+docker compose logs -f crawler | grep -E "fetching|found items|crawl completed"
+```
+
+**Expected output pattern**:
+```
+fetching items task_id=xxx
+found items count=N
+crawl completed duration=Xs
+```
+
+---
+
+## Step 6: Redis Queue Verification
+
+```bash
+# Connect to Redis
+docker compose exec redis redis-cli
+
+# Check queue lengths
+LLEN goodshunter:queue:tasks
+LLEN goodshunter:queue:results
+LLEN goodshunter:queue:tasks:processing
+```
+
+---
+
+## Troubleshooting
+
+### API Not Responding
+
+```bash
+docker compose logs api | tail -50
+docker compose restart api
+```
+
+### Crawler Not Processing Tasks
+
+```bash
+# Check if crawler is connected to Redis
+docker compose logs crawler | grep -i redis
+
+# Check rate limiter
+docker compose exec redis redis-cli GET goodshunter:ratelimit:global
+```
+
+### Database Connection Issues
+
+```bash
+# Check MySQL status
+docker compose exec mysql mysql -u root -p -e "SELECT 1"
+
+# Check API database connection
+docker compose logs api | grep -i mysql
+```

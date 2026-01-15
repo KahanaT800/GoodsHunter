@@ -1,41 +1,239 @@
-# GoodsHunter 系统规模画像（基于当前 .env）
+# GoodsHunter Configuration Reference
 
-本文档对当前配置下的处理能力、瓶颈与容量边界进行说明，便于部署与扩容决策。
+Complete environment variable reference and system capacity planning guide.
 
-## 1. 流量入口与调度节奏
+---
 
-触发频率：
-- 轮询模式：每 3 分钟（`APP_SCHEDULE_INTERVAL=3m`）扫描数据库中的待执行任务。
-- Redis Streams 模式：独立消费循环每 1 秒读取一次 Stream（ticker=1s），不受 3 分钟调度间隔限制；调度间隔仅用于周期性发布任务。
+## Environment Variables
 
-任务缓冲区：
-- Redis Streams 的 Stream：服务端限制 `MAXLEN=100000`，同时受 Redis 内存约束，作为第一级缓冲。
-- 内存队列：`APP_QUEUE_CAPACITY=1000`，轮询与 Redis 模式下均为阻塞式入队，队列满时对生产端形成背压，不发生直接丢弃。
-- 轮询批量：`APP_QUEUE_BATCH_SIZE=100`，轮询模式按 ID 游标分页拉取，批量大小限制为队列容量的 1/5。
+### Core Settings
 
-## 2. 并发处理能力
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `APP_ENV` | Runtime environment: `local` / `prod` | `local` |
+| `APP_LOG_LEVEL` | Log level: `debug` / `info` / `warn` / `error` | `info` |
+| `APP_HTTP_ADDR` | API server listen address | `:8081` |
+| `APP_SCHEDULE_INTERVAL` | Task scheduling interval (e.g., `5m`) | `5m` |
+| `APP_NEW_ITEM_DURATION` | Duration for "new" item highlight | `1h` |
+| `APP_GUEST_IDLE_TIMEOUT` | Guest session idle timeout | `10m` |
+| `APP_GUEST_HEARTBEAT` | Guest heartbeat interval | `5m` |
+| `APP_MAX_TASKS_PER_USER` | Max tasks per user | `3` |
+| `APP_MAX_ITEMS_PER_TASK` | Max items retained per task | `300` |
 
-- Worker Pool：`APP_WORKER_POOL_SIZE=50`，Scheduler 最多并行处理 50 个任务。
-- 实际抓取并发仍受限于全局限流与浏览器并发上限。
+### Redis & Distributed Queue
 
-## 3. 实际执行瓶颈
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REDIS_ADDR` | **Required on Worker**. Master Redis address | `redis:6379` |
+| `REDIS_PASSWORD` | Redis authentication password | (Empty) |
+| `WORKER_ID` | Unique node identifier (e.g., `worker-01`) | `worker-01` |
+| `JANITOR_INTERVAL` | Janitor scan interval for stuck tasks | `10m` |
+| `JANITOR_TIMEOUT` | Task stuck threshold before rescue | `30m` |
 
-- 全局限流：`APP_RATE_LIMIT=3`，即每秒 3 个令牌。
-- 桶容量：`APP_RATE_BURST=5`，允许短时峰值。
-- 浏览器并发：`BROWSER_MAX_CONCURRENCY=5`，限制同时打开的页面数量。
+### Rate Limiting
 
-结论：并发峰值由 `APP_RATE_BURST` 与 `BROWSER_MAX_CONCURRENCY` 共同决定，且当前两者一致，有利于资源匹配与稳定性。
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `APP_RATE_LIMIT` | Requests per second (Token Bucket rate) | `3` |
+| `APP_RATE_BURST` | Max burst requests allowed | `5` |
+| `APP_DEDUP_WINDOW` | URL deduplication window (seconds) | `3600` |
 
-## 4. 超时与失败处理
+### Proxy & Network
 
-- 单次任务超时：2 分钟。超时会终止当前任务并记录失败。
-- 限流等待：使用与任务相同的 Context 超时预算，等待时间会挤占执行时间。
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HTTP_PROXY` / `BROWSER_PROXY_URL` | Proxy URL for browser connections | (Empty) |
+| `PROXY_AUTO_SWITCH` | Enable automatic proxy switching on failures | `false` |
+| `PROXY_FAILURE_THRESHOLD` | Consecutive failures before switching to proxy | `10` |
+| `PROXY_COOLDOWN` | Duration to stay in proxy mode after switching | `10m` |
+| `FORCE_PROXY_ONCE` | Force proxy mode for next crawl (debug) | `false` |
 
-建议：当 `goodshunter_ratelimit_wait_duration_seconds` 长期偏高时，可调整为更大的总体超时预算（例如 5 分钟），或为限流器设置独立短超时（例如 30 秒）以尽快重试。
+### Browser Settings
 
-## 5. 容量评估与建议
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHROME_BIN` | Path to Chrome/Chromium binary | (Auto-detect) |
+| `BROWSER_HEADLESS` | Run Chrome in headless mode | `true` |
+| `BROWSER_MAX_CONCURRENCY` | Max concurrent browser pages | `3` |
+| `BROWSER_MAX_FETCH_COUNT` | Max items to fetch per crawl | `50` |
+| `BROWSER_PAGE_TIMEOUT` | Page load/element wait timeout | `2m` |
+| `BROWSER_DEBUG_SCREENSHOT` | Save screenshots on timeout/block | `false` |
 
-- Worker Pool（50）与 Rate（3）的关系：多数 Worker 会处于等待令牌状态，这是有意的“宽进严出”策略，用于抵御突发流量。
-- 浏览器并发与内存：`BROWSER_MAX_CONCURRENCY=5` 在 t3.small（2GB）上已接近上限，不建议随意上调。
+### Worker Lifecycle
 
-在当前配置下，吞吐量上限约为 3 tasks/s，约等于 180 tasks/min。该规模适用于单机生产部署，并具备一定的突发缓冲能力。
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MAX_TASKS` | Tasks before worker self-restart (memory leak prevention) | `500` |
+
+### Database
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DB_DSN` | Full MySQL DSN (overrides individual settings) | (See config.json) |
+| `DB_HOST` | MySQL host | `localhost` |
+| `DB_PORT` | MySQL port | `3306` |
+| `DB_USER` | MySQL user | `root` |
+| `DB_PASSWORD` | MySQL password | (Empty) |
+| `DB_NAME` | MySQL database name | `goodshunter` |
+
+### Email Notifications
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SMTP_HOST` | SMTP server host | `smtp.gmail.com` |
+| `SMTP_PORT` | SMTP server port | `587` |
+| `SMTP_USER` | SMTP username | (Empty) |
+| `SMTP_PASS` | SMTP password | (Empty) |
+| `SMTP_FROM` | Sender email address | (Empty) |
+
+### Security
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `JWT_SECRET` | JWT signing secret | `dev_secret_change_me` |
+| `INVITE_CODE` / `APP_INVITE_CODE` | Registration invite code (empty = disabled) | (Empty) |
+
+### Observability (Grafana Cloud)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL` | Prometheus remote write endpoint | (Empty) |
+| `GRAFANA_CLOUD_PROM_USERNAME` | Prometheus username | (Empty) |
+| `GRAFANA_CLOUD_PROM_API_KEY` | Prometheus API key | (Empty) |
+| `GRAFANA_CLOUD_LOKI_URL` | Loki push endpoint | (Empty) |
+| `GRAFANA_CLOUD_LOKI_USERNAME` | Loki username | (Empty) |
+| `GRAFANA_CLOUD_LOKI_API_KEY` | Loki API key | (Empty) |
+
+---
+
+## Redis Keys Reference
+
+GoodsHunter uses Redis for message queuing and distributed state coordination.
+
+### Message Queues
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `goodshunter:queue:tasks` | List | Pending task queue |
+| `goodshunter:queue:tasks:processing` | List | Processing backup (reliable queue) |
+| `goodshunter:queue:results` | List | Result queue |
+| `goodshunter:queue:tasks:pending` | Set | Task ID deduplication set |
+| `goodshunter:queue:tasks:started` | Hash | Task start timestamps (for Janitor) |
+
+### Distributed State
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `goodshunter:ratelimit:global` | String | Token Bucket state (Lua script) |
+| `goodshunter:cookies:mercari` | String | Cached session cookies (JSON) |
+| `goodshunter:crawler:consecutive_blocks` | String | Block event counter (adaptive throttling) |
+| `goodshunter:crawler:consecutive_failures` | String | Failure counter (proxy switching) |
+| `goodshunter:proxy:cooldown` | String | Proxy mode cooldown timestamp |
+| `goodshunter:dedup:url:*` | String | URL deduplication with TTL |
+
+---
+
+## System Capacity Planning
+
+This section describes processing capacity, bottlenecks, and scaling considerations.
+
+### Concurrency Model
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              Concurrency Hierarchy                       │
+├─────────────────────────────────────────────────────────┤
+│  Semaphore (BROWSER_MAX_CONCURRENCY)                    │
+│       │                                                  │
+│       ▼                                                  │
+│  Rate Limiter (APP_RATE_LIMIT + APP_RATE_BURST)         │
+│       │                                                  │
+│       ▼                                                  │
+│  Browser Pages (actual concurrent crawls)               │
+└─────────────────────────────────────────────────────────┘
+```
+
+The crawler uses a semaphore-based concurrency control where `BROWSER_MAX_CONCURRENCY` limits the number of simultaneous browser pages.
+
+### Bottleneck Analysis
+
+| Constraint | Config | Effect |
+|------------|--------|--------|
+| Rate Limit | `APP_RATE_LIMIT=3` | 3 tokens/second |
+| Rate Burst | `APP_RATE_BURST=5` | Short burst allowance |
+| Browser Pages | `BROWSER_MAX_CONCURRENCY=3` | Max simultaneous pages |
+
+**Peak concurrency** = min(`APP_RATE_BURST`, `BROWSER_MAX_CONCURRENCY`) = **3-5 concurrent crawls**
+
+### Timeout Configuration
+
+| Timeout | Value | Description |
+|---------|-------|-------------|
+| Task timeout | 90s | Single task max execution time |
+| Watchdog timeout | 100s | Failsafe task termination |
+| Page timeout | 2m | Browser page load timeout |
+| Rate limit wait | 30s max | Max wait for rate limiter token |
+
+### Capacity Summary
+
+| Metric | Value |
+|--------|-------|
+| Throughput ceiling | ~3 tasks/second |
+| Per-minute capacity | ~180 tasks/min |
+| Suitable for | Single-node or distributed deployment |
+
+### Memory Considerations
+
+| Instance Type | Browser Concurrency | Notes |
+|---------------|---------------------|-------|
+| t3.micro (1GB) | 1-2 | Minimal, dev only |
+| t3.small (2GB) | 3-5 | Production baseline |
+| t3.medium (4GB) | 5-10 | Comfortable headroom |
+
+**Warning**: `BROWSER_MAX_CONCURRENCY=5` on t3.small (2GB) is near the limit. Do not increase without memory upgrade.
+
+---
+
+## Configuration Examples
+
+### Minimal Worker `.env`
+
+```ini
+REDIS_ADDR=master-ip:6379
+REDIS_PASSWORD=your_password
+WORKER_ID=worker-01
+```
+
+### Production Worker `.env`
+
+```ini
+# Redis Connection
+REDIS_ADDR=master-ip:6379
+REDIS_PASSWORD=your_strong_password
+
+# Worker Identity
+WORKER_ID=home-pc-01
+
+# Browser Settings
+BROWSER_HEADLESS=true
+BROWSER_MAX_CONCURRENCY=3
+MAX_TASKS=500
+
+# Rate Limiting
+APP_RATE_LIMIT=3
+APP_RATE_BURST=5
+
+# Observability
+GRAFANA_CLOUD_PROM_REMOTE_WRITE_URL=https://prometheus-blocks-prod-...
+GRAFANA_CLOUD_PROM_USERNAME=123456
+GRAFANA_CLOUD_PROM_API_KEY=glc_...
+```
+
+### Debug Mode `.env`
+
+```ini
+APP_LOG_LEVEL=debug
+BROWSER_HEADLESS=false
+BROWSER_DEBUG_SCREENSHOT=true
+FORCE_PROXY_ONCE=true
+```

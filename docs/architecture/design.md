@@ -1,380 +1,373 @@
-# GoodsHunter（谷子猎人）设计文档
+# GoodsHunter Architecture & Design
 
-**项目代号**：GoodsHunter  
-**一句话描述**：  
-> 基于 Go 微服务架构的 ACGN 周边商品实时监控与捡漏系统，通过任务化监控、增量去重与多渠道通知，帮助用户第一时间发现高性价比商品。
+> A Go microservices-based real-time ACGN merchandise monitoring system with task-driven crawling, incremental deduplication, and multi-channel notifications.
 
 ---
 
-## 1. 项目背景与目标
+## 1. Background & Goals
 
-### 1.1 项目背景
-ACGN 周边商品（俗称“谷子”）在二手与拍卖平台（如 Mercari、Yahoo Auction）中具有以下典型特征：
+### 1.1 Problem Statement
 
-- 商品上架时间高度碎片化，低价商品生命周期极短；
-- 平台多采用 SPA（单页应用）架构，传统静态爬虫难以适配；
-- 用户需要频繁手动刷新与检索，信息获取效率低。
+ACGN merchandise (anime/game collectibles) on second-hand platforms like Mercari has these characteristics:
 
-### 1.2 项目目标
-GoodsHunter 旨在构建一个 **任务驱动型、实时、可扩展** 的商品监控系统，核心目标包括：
+- **Short lifecycle**: Low-priced items sell within minutes
+- **SPA architecture**: Traditional static crawlers cannot handle dynamic content
+- **Manual inefficiency**: Users must constantly refresh and search manually
 
-- 将用户关注行为抽象为**监控任务（Task）**；
-- 对商品数据进行**周期抓取、增量去重与规则判定**；
-- 通过**时间轴 + 通知**的形式向用户呈现可执行信息；
-- 在实现过程中系统性展示 **Go 后端工程能力与微服务架构设计能力**。
+### 1.2 Project Goals
 
-### 1.3 非目标（Out of Scope）
-- 不覆盖全部二手平台（优先支持 Mercari，保留扩展能力）；
-- 不参与交易与支付流程，仅提供信息聚合与跳转；
-- 不实现复杂 AI 预测模型，仅采用确定性规则引擎。
+GoodsHunter aims to build a **task-driven, real-time, scalable** monitoring system:
 
----
+- Abstract user intent into persistent **monitoring tasks**
+- Perform **periodic crawling with incremental deduplication**
+- Deliver actionable information via **Timeline UI + notifications**
+- Demonstrate **Go backend engineering and microservices architecture**
 
-## 2. 系统整体架构
+### 1.3 Non-Goals
 
-### 2.1 架构设计原则
-- **控制层与计算层分离**：API 服务不直接运行浏览器实例；
-- **任务驱动模型**：所有采集行为均由任务调度触发；
-- **无状态爬虫服务**：Crawler 可随时横向扩展或重启；
-- **增量处理优先**：仅对新出现或发生变化的商品进行处理。
-
-### 2.2 系统组件概览
-
-| 组件 | 职责 |
-|---|---|
-| Web Frontend | 用户交互、任务管理、时间轴展示 |
-| API Service（guzi-api） | 业务中枢、鉴权、Scheduler、结果处理、通知 |
-| Crawler Service（guzi-crawler） | 页面渲染、DOM 解析、去重检查 |
-| MySQL | 持久化用户、任务与商品数据 |
-| Redis | 去重、缓存、临时状态存储 |
-| Notification Channel | Email / Telegram / Discord |
-
-### 2.3 核心数据流
-1. 用户通过前端创建或启动监控任务；
-2. API 服务记录任务配置并加入调度队列；
-3. Scheduler 按任务周期向 Crawler 发起 gRPC 抓取请求；
-4. Crawler 渲染页面并解析商品信息；
-5. 新商品或变更结果返回 API 服务；
-6. API 服务持久化数据、更新时间轴并触发通知。
-
-### 2.4 服务流程设计（关键调用链）
-- 任务创建：`POST /tasks` -> 校验参数 -> 生成任务记录（待运行）-> 返回任务 ID。
-- 调度触发：Scheduler 周期扫描 `status=running` 任务 -> 根据 `interval_seconds` 生成执行计划 -> 触发 gRPC `FetchItems`。
-- 抓取执行：Crawler 接收 `FetchRequest` -> 打开页面/懒加载滚动 -> DOM 解析 -> Redis 去重/价格变化判定 -> 返回增量结果。
-- 结果入库：API 收到结果 -> GORM upsert `items` -> 写入 `task_items` 时间轴 -> 更新任务运行时间与错误字段。
-- 通知分发：对符合规则的事件进行频控 -> 按渠道构造模板 -> 发送（Discord/Webhook 等）-> 记录发送状态。
-- 观测与恢复：全链路记录日志与指标；连续失败达到阈值时将任务标记为 `failed` 并告警。
+- Full platform coverage (Mercari first, extensible design)
+- Transaction/payment processing (information aggregation only)
+- Complex AI prediction (deterministic rule engine only)
 
 ---
 
-## 3. 非功能与运维要求
-- 性能：单任务抓取端到端延迟（调用 gRPC 至返回结果）≤ 5s；调度周期最小粒度 1 分钟。
-- 并发：单实例支持并发抓取任务 ≥ 5；API QPS 50 以内稳定；超限时降级/排队。
-- 稳定性：抓取失败自动重试 2 次（指数退避），连续失败标记任务异常并告警。
-- 观测性：暴露 Prometheus 指标（抓取成功率、延迟、错误码分布），健康检查 `/healthz`。
-- 安全：JWT 鉴权，配置/密钥通过环境变量或密文文件注入，敏感日志脱敏。
-- 日志：Crawler 在错误时保存 HTML 片段或截图以便定位。
-- WSL2 兼容：优先使用 headless Chrome；若需手动安装，使用 `apt-get install chromium-browser fonts-noto-cjk`，必要时通过 `launcher.New().Bin("/usr/bin/chromium-browser").NoSandbox(true)` 指定路径。
+## 2. System Architecture
+
+### 2.1 Design Principles
+
+| Principle | Description |
+|-----------|-------------|
+| **Control/Compute Separation** | API service does not run browser instances |
+| **Task-Driven Model** | All crawling triggered by task scheduler |
+| **Stateless Crawlers** | Crawler nodes can scale horizontally or restart freely |
+| **Incremental Processing** | Only process new or changed items |
+
+### 2.2 Component Overview
+
+| Component | Responsibility |
+|-----------|----------------|
+| Web Frontend | User interaction, task management, timeline display |
+| API Service | Business logic, auth, scheduling, result processing, notifications |
+| Crawler Service | Page rendering, DOM parsing, deduplication |
+| MySQL | Persistent storage for users, tasks, items |
+| Redis | Message queues, distributed state, caching |
+| Notification Channels | Email, Telegram, Discord |
+
+### 2.3 Data Flow
+
+```
+1. User creates/starts monitoring task via frontend
+2. API records task config and adds to scheduler queue
+3. Scheduler triggers Crawler via Redis queue
+4. Crawler renders page, parses items, checks dedup
+5. New/changed items returned to API via result queue
+6. API persists data, updates timeline, triggers notifications
+```
+
+### 2.4 Key Processing Flows
+
+**Task Creation:**
+```
+POST /tasks → Validate params → Create task record → Return task ID
+```
+
+**Scheduling:**
+```
+Scheduler scans running tasks → Push to Redis queue → Worker picks up
+```
+
+**Crawling:**
+```
+Worker receives task → Open page → Scroll/wait → Parse DOM → Dedup check → Push result
+```
+
+**Result Processing:**
+```
+API pops result → Upsert items → Update timeline → Send notifications
+```
 
 ---
 
-## 4. 前端设计（Frontend & UX）
+## 3. Distributed Architecture (V2.0+)
 
-### 3.1 设计目标
-- **简单**：减少无关信息干扰；
-- **高效**：高频操作可一键完成；
-- **视觉舒适**：符合二次元用户审美取向。
+### 3.1 Master-Worker Topology
 
-### 3.2 核心页面设计
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Master Node                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │ API Service │  │   MySQL     │  │       Redis         │  │
+│  │ + Scheduler │  │             │  │ Queues + State      │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+        ┌──────────┐    ┌──────────┐    ┌──────────┐
+        │ Worker 1 │    │ Worker 2 │    │ Worker N │
+        │ (Crawler)│    │ (Crawler)│    │ (Crawler)│
+        └──────────┘    └──────────┘    └──────────┘
+```
 
-#### 3.2.1 控制台（Dashboard）
-- 布局：卡片式 / 看板风格；
-- 每张任务卡片包含：
-  - 任务名称（如“初音未来 2024”）
-  - 状态指示灯  
-    - 绿色：运行中  
-    - 黄色：暂停  
-    - 红色：异常
-  - Start / Stop 开关
-  - 编辑 / 删除按钮
+### 3.2 Redis Data Structures
 
-#### 3.2.2 捡漏时间轴（Timeline）
-- 布局：时间流（类似 Twitter / 微博）；
-- 商品条目包含：
-  - 商品图片（大图）
-  - 当前价格（高亮显示）
-  - 上架时间（相对时间，如“2分钟前”）
-  - 商品直达链接
-  - 操作：收藏 / 标记已读
-- 事件标签：
-  - `New`：首次出现
-  - `PriceDrop`：价格下降
-  - `Restock`：重新上架
+**Message Queues:**
 
-#### 3.2.3 新建任务向导（Task Wizard）
-- Step 1：输入关键词与排除词；
-- Step 2：设定预算区间（JPY）；
-- Step 3：选择通知渠道（Email / Telegram / Discord）。
+| Key | Type | Purpose |
+|-----|------|---------|
+| `goodshunter:queue:tasks` | List | Pending task queue |
+| `goodshunter:queue:tasks:processing` | List | Processing backup (reliable queue) |
+| `goodshunter:queue:results` | List | Result queue |
+| `goodshunter:queue:tasks:pending` | Set | Task ID deduplication |
+| `goodshunter:queue:tasks:started` | Hash | Task start timestamps |
 
-### 3.3 前端技术方案
-- SPA 单页模式（Fetch / AJAX）；
-- 后端 REST API；
-- 原生 HTML + JS 或轻量 Admin 模板。
+**Distributed State:**
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `goodshunter:ratelimit:global` | String | Token bucket state (Lua script) |
+| `goodshunter:cookies:mercari` | String | Session cookie cache |
+| `goodshunter:crawler:consecutive_blocks` | String | Block event counter |
+| `goodshunter:proxy:cooldown` | String | Proxy mode cooldown |
+| `goodshunter:dedup:url:*` | String | URL deduplication with TTL |
+
+### 3.3 Reliable Queue Pattern
+
+```
+1. Worker: BRPOPLPUSH tasks → processing (atomic)
+2. Worker: Process task
+3. Worker: LPUSH results
+4. Worker: LREM processing (ACK)
+5. Janitor: Rescue stuck tasks from processing → tasks
+```
 
 ---
 
-## 5. 后端架构设计
+## 4. Anti-Detection System (V2.1)
 
-### 5.1 API 服务（guzi-api）
+### 4.1 Request Pipeline
 
-#### 5.1.1 职责
-- 提供 RESTful API；
-- 用户鉴权（JWT）；
-- 任务管理与调度；
-- 接收抓取结果并处理业务逻辑；
-- 通知分发。
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Request Pipeline                          │
+├─────────────────────────────────────────────────────────────┤
+│  1. Rate Limiter (Redis Lua Script - Token Bucket)          │
+│  2. Request Jitter (800ms ~ 3.5s random delay)              │
+│  3. Cookie Injection (Redis-cached session cookies)         │
+│  4. Stealth Scripts (go-rod/stealth + enhanced patches)     │
+│  5. Human Behavior Simulation (mouse move + scroll)         │
+│  6. Block Detection & Classification                         │
+│  7. Adaptive Throttling (auto-sleep on consecutive blocks)  │
+└─────────────────────────────────────────────────────────────┘
+```
 
-#### 5.1.2 核心模块
-- Auth Middleware
-- Task Controller
-- Scheduler（Ticker / Cron）
-- Result Ingest
-- Notification Dispatcher
+### 4.2 Stealth Script Coverage
 
-#### 5.1.3 任务与调度策略
-- 状态机：`pending -> running -> paused -> failed -> stopped`，连续失败 N 次（默认 3）进入 failed，手动恢复。
-- 调度：最小粒度 1 分钟，调度并发上限（如 5）防止压垮 Crawler，超限排队。
-- 重试：抓取调用失败重试 2 次（退避），记录 `last_error` 与 `last_success_at`。
-- 背压：当 Crawler 返回资源紧张错误时，API 将任务延后 N 秒再调度。
+| Detection Vector | Mitigation |
+|------------------|------------|
+| `navigator.webdriver` | Deleted from prototype |
+| `navigator.plugins` | Simulated with realistic plugin list |
+| `chrome.runtime` / `chrome.csi` | Patched for headless mode |
+| WebGL Renderer | Spoofed to "Intel Iris OpenGL Engine" |
+| Selenium/Puppeteer traces | Removed 20+ known detection properties |
+| iframe `contentWindow` | Patched to include `chrome` object |
+| Function `toString()` | Overridden to return `[native code]` |
 
-#### 5.1.4 REST 接口约定（最小集）
-- `GET /tasks?status=&page=&size=` 分页查询；`POST /tasks` 创建任务；`POST /tasks/{id}/start|pause|stop` 状态切换。
-- `GET /items?task_id=&page=&size=` 时间轴查询，支持事件过滤。
-- 统一返回 `{code, message, data}`；429/503 用于限流/背压；请求超时 8s。
+### 4.3 Human Behavior Simulation
 
-### 5.2 爬虫微服务（guzi-crawler）
+- **Mouse Movement**: Random coordinates within viewport
+- **Smooth Scrolling**: 200-500px random distance
+- **Request Jitter**: 800ms–3.5s delay between requests
 
-#### 5.2.1 职责
-- 监听 gRPC 抓取请求；
-- 管理 Headless Chrome 实例；
-- 渲染 SPA 页面并解析 DOM；
-- 商品数据去重判断。
+### 4.4 Cookie Persistence
 
-#### 5.2.2 设计特点
-- 无状态设计；
-- 浏览器池限制并发（如最多 5 个 Tab）；
-- 页面加载超时控制；
-- User-Agent 管理与基础反爬策略。
-- 反爬与稳定性：预热浏览器实例；失败自动刷新页面；必要时代理池/UA 池；关键操作超时 15s；错误时保存 HTML/截图便于诊断。
+| Feature | Description |
+|---------|-------------|
+| Cache Location | Redis with 30min TTL |
+| Reuse Strategy | Load before request, save after success |
+| Refresh Policy | 5% random refresh + 2h max age |
+| Invalidation | Clear on 403 detection |
 
-### 5.3 目录结构与代码组织（建议）
+### 4.5 Adaptive Throttling
+
+When consecutive blocks are detected:
+
+1. Increment counter in Redis (cross-node sync)
+2. After 3 consecutive blocks → enter cooldown (30-60s)
+3. Reset counter on successful request
+
+### 4.6 Block Detection & Classification
+
+| Block Type | Detection Signals |
+|------------|-------------------|
+| `cloudflare_challenge` | JS challenge, Turnstile, challenge iframe |
+| `captcha` | reCAPTCHA, hCAPTCHA elements |
+| `403_forbidden` | 403 status, "Access Denied" text |
+| `429_rate_limited` | 429 status, "Too Many Requests" |
+| `blank_page` | Empty title, minimal content |
+| `connection_error` | ERR_PROXY, ERR_CONNECTION |
+| `js_loading_stuck` | Header exists but no items loaded |
+
+---
+
+## 5. Task Lifecycle & Reliability
+
+### 5.1 Task State Machine
+
+```
+pending → running → paused → stopped
+              ↓
+           failed (after N consecutive failures)
+```
+
+### 5.2 Watchdog Mechanism
+
+```
+Task Received → Semaphore Acquire → Watchdog Start (100s)
+                                          │
+                               FetchItems (90s timeout)
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ↓                               ↓
+                      Success                          Timeout
+                          │                               │
+                   Push Result                    Push Error Result
+                   AckTask ✓                      (No Ack - Janitor rescues)
+                          │                               │
+                   Release Semaphore              Release Semaphore
+```
+
+### 5.3 Self-Healing Workers
+
+- **Suicide on Quota**: Worker exits after `MAX_TASKS` (default: 500)
+- **Docker Restart**: `restart: always` spins up fresh instance
+- **Memory Leak Prevention**: Clean state on each restart
+
+---
+
+## 6. Data Model
+
+### 6.1 MySQL Schema (Core Tables)
+
+**users**
+```sql
+id, email, password_hash, created_at
+```
+
+**tasks**
+```sql
+id, user_id, keyword, exclude_keywords, 
+min_price, max_price, interval_seconds,
+status, last_run_at, last_success_at, last_error
+```
+
+**items**
+```sql
+id, source, source_item_id, title, price,
+url, image_url, posted_at
+UNIQUE INDEX (source, source_item_id)
+```
+
+**task_items** (Timeline)
+```sql
+id, task_id, item_id, event_type, 
+seen, favorited, created_at
+INDEX (task_id, created_at)
+```
+
+### 6.2 Deduplication Strategy
+
+```
+1. Generate item_key = source + source_item_id
+2. Check Redis dedup set
+3. If not exists → Add to set, return as new
+4. If exists → Check price change, return event type
+```
+
+---
+
+## 7. Notification System
+
+### 7.1 Trigger Conditions
+
+- New item matching task criteria
+- Price drop exceeding threshold (configurable, default 5%)
+
+### 7.2 Channels
+
+| Channel | Implementation |
+|---------|----------------|
+| Email | SMTP |
+| Telegram | Bot API |
+| Discord | Webhook |
+
+### 7.3 Rate Limiting
+
+- Same task + same item: 30min minimum interval
+- Batch multiple price drops into single notification
+
+---
+
+## 8. Technology Stack
+
+| Domain | Technology |
+|--------|------------|
+| Language | Go 1.23+ |
+| Web Framework | Gin |
+| Browser Automation | go-rod |
+| Database | MySQL 8.0 |
+| Cache/Queue | Redis 7.x |
+| Configuration | Viper |
+| Observability | Grafana Alloy (Prometheus + Loki) |
+| Deployment | Docker / Docker Compose |
+
+---
+
+## 9. Project Structure
+
 ```
 .
 ├── cmd/
-│   ├── api/              # guzi-api 可执行入口（main.go）
-│   └── crawler/          # guzi-crawler 可执行入口（main.go）
+│   ├── api/              # API service entrypoint
+│   └── crawler/          # Crawler service entrypoint
 ├── internal/
-│   ├── api/              # API 服务内部模块（router, middleware, handlers）
-│   ├── crawler/          # Crawler 内部模块（browser pool, parser, dedup）
-│   ├── scheduler/        # Scheduler 逻辑
-│   ├── store/            # 数据访问层（gorm, redis）
-│   ├── notification/     # 通知渠道实现
-│   └── config/           # 配置加载
-├── pkg/                  # 可复用库（可选）
-├── proto/                # .proto 与生成代码
-├── scripts/              # 辅助脚本（如 make proto, lint）
-├── docker/               # Dockerfile, compose 相关文件
-└── web/                  # 前端静态资源（index.html, main.js）
-```
-原则：`cmd` 只做参数解析和 wiring；业务逻辑在 `internal`；对外复用的 helper 才放 `pkg`；配置与密钥通过环境变量注入。
-
----
-
-## 6. gRPC 通信设计
-
-### 6.1 通信模式
-- 第一阶段采用同步 RPC（FetchItems）；
-- 后续可演进为异步回调模式。
-
-### 6.2 核心数据结构（概念）
-- **FetchRequest**
-  - task_id
-  - keyword / exclude_keywords
-  - min_price / max_price
-  - limit
-- **Item**
-  - source
-  - source_item_id
-  - title
-  - price
-  - url
-  - image_url
-  - posted_at
-- **错误约定**：使用 gRPC status code；超时 8s；客户端重试 2 次，幂等。
-
-### 6.3 示例 proto 片段
-```proto
-service CrawlerService {
-  rpc FetchItems(FetchRequest) returns (FetchResponse) {}
-}
-
-message FetchRequest {
-  string task_id = 1;
-  string keyword = 2;
-  repeated string exclude_keywords = 3;
-  int32 min_price = 4;
-  int32 max_price = 5;
-  int32 limit = 6;
-}
-
-message Item {
-  string source = 1;
-  string source_item_id = 2;
-  string title = 3;
-  int32 price = 4;
-  string url = 5;
-  string image_url = 6;
-  int64 posted_at = 7;
-}
+│   ├── api/              # API handlers, middleware
+│   ├── crawler/          # Browser automation, parsing
+│   ├── config/           # Configuration loading
+│   ├── model/            # Data models
+│   └── pkg/              # Shared utilities
+│       ├── dedup/        # Deduplication logic
+│       ├── logger/       # Structured logging
+│       ├── metrics/      # Prometheus metrics
+│       ├── notify/       # Notification channels
+│       ├── queue/        # In-memory queue
+│       ├── ratelimit/    # Distributed rate limiter
+│       └── redisqueue/   # Redis queue client
+├── proto/                # Protobuf definitions
+├── web/                  # Frontend assets
+├── configs/              # Configuration examples
+├── deploy/               # Deployment configs (Alloy)
+└── docs/                 # Documentation
 ```
 
 ---
 
-## 7. 数据存储设计
+## 10. Future Directions
 
-### 7.1 MySQL 表结构（概要）
-
-#### users
-- id
-- email
-- password_hash
-- created_at
-
-#### tasks
-- id
-- user_id
-- keyword
-- exclude_keywords
-- min_price
-- max_price
-- interval_seconds
-- status
-- last_run_at
-- last_success_at
-- last_error
-
-#### items
-- id
-- source
-- source_item_id
-- title
-- price
-- url
-- image_url
-- posted_at
-- 索引与约束：`items(source, source_item_id)` 唯一约束；`tasks(user_id, status)` 组合索引；`task_items(task_id, created_at)` 索引。
-- TTL：历史 `task_items` 归档/清理策略（如保留 90 天）。
-
-#### task_items（时间轴）
-- id
-- task_id
-- item_id
-- event_type
-- seen
-- favorited
-- created_at
-
-### 7.2 Redis 设计
-- 去重集合  
-  - `dedup:{task_id}` → Set / BloomFilter
-- 上次价格记录  
-  - `last_price:{task_id}:{item_key}`
-- Timeline 热缓存（可选）  
-  - `timeline:{task_id}`
-- 失效策略：去重集合按任务活跃度定期清理（如 7 天未运行则清空）。
+- **Multi-Platform**: Yahoo Auction, Surugaya, Mandarake
+- **Event Streaming**: Kafka / Redis Streams for async processing
+- **Rule DSL**: User-defined matching rules
+- **Recommendation**: Tag-based and behavior-based suggestions
 
 ---
 
-## 8. 规则与去重策略
+## 11. Summary
 
-### 8.1 去重流程
-1. 生成 `item_key = source + source_item_id`；
-2. 查询 Redis 去重集合；
-3. 不存在则写入 Redis 并返回；
-4. 存在则根据价格变化判定事件类型。
+GoodsHunter is a **task-driven, event-oriented** merchandise monitoring system featuring:
 
-### 8.2 规则引擎（Rule Engine Lite）
-- 价格低于预算；
-- 价格低于历史最低；
-- 关键词 AND / NOT 匹配；
-- 事件判定阈值：价格下降超过 5% 或固定阈值（可配置）。
+- Clear separation of concerns (API / Scheduler / Crawler)
+- Reliable distributed task queue with zero-loss guarantee
+- Multi-layer anti-detection with adaptive throttling (V2.1)
+- Full observability with Grafana Cloud integration
 
----
-
-## 9. 通知系统设计
-
-### 9.1 通知触发条件
-- 新商品首次命中规则；
-- 商品价格下降并满足阈值。
-
-### 9.2 通知渠道
-- Email（SMTP）
-- Telegram Bot
-- Discord Webhook（可扩展）
-- 频控：同一任务同一商品的通知最小间隔 30 分钟；批量合并多条降价事件。
-- 模板：包含标题、价格、事件类型、跳转链接、时间。
-
----
-
-## 10. 技术栈选型
-
-| 领域 | 技术 |
-|---|---|
-| 编程语言 | Go 1.21+ |
-| Web 框架 | Gin |
-| 微服务通信 | gRPC + Protobuf |
-| 网页采集 | go-rod |
-| 数据库 | MySQL 8.0 |
-| 缓存 | Redis |
-| 配置管理 | Viper |
-| 部署 | Docker / Docker Compose |
-
----
-
-## 11. 开发里程碑（Milestones）
-
-### MS1：Crawler POC
-- 单文件抓取 Mercari；
-- 解决 SPA 渲染与懒加载问题。
-
-### MS2：gRPC 微服务拆分
-- API 与 Crawler 通信；
-- proto 定义与代码生成。
-
-### MS3：持久化与增量监控
-- 引入 MySQL 与 Redis；
-- 定时调度与去重逻辑。
-
-### MS4：Web 接入与通知
-- 前端页面接入；
-- 邮件 / TG 推送；
-- Docker Compose 一键启动。
-
----
-
-## 12. 可扩展方向
-- 多平台支持（Yahoo Auction、Surugaya）；
-- 异步事件流（Kafka / Redis Streams）；
-- 规则 DSL；
-- 基于标签与行为的推荐系统。
-
----
-
-## 13. 总结
-GoodsHunter 是一个以 **任务与事件驱动** 为核心的商品监控系统，其设计重点在于：
-
-- 清晰的系统分层；
-- 增量数据处理；
-- 微服务通信与工程化能力。
-
-该项目适合作为 Go 后端 / 微服务方向的综合展示项目。
+The project demonstrates production-grade Go backend engineering and microservices architecture.
