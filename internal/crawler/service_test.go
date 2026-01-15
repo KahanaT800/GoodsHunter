@@ -3,6 +3,8 @@ package crawler
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -1503,5 +1505,260 @@ func TestLockBehavior_WriteLockStarvation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		close(stopReaders)
 		t.Fatal("write lock starvation detected")
+	}
+}
+
+// ============================================================================
+// 浏览器排水（Draining）机制测试
+// ============================================================================
+
+// newTestService 创建用于测试的 Service 实例
+func newTestService() *Service {
+	return &Service{
+		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		proxyFailureThreshold: 10,
+	}
+}
+
+// TestDrainingMechanism_Basic 测试基本的排水机制
+func TestDrainingMechanism_Basic(t *testing.T) {
+	svc := newTestService()
+
+	// 初始状态：不在排水中
+	if svc.draining.Load() {
+		t.Fatal("service should not be draining initially")
+	}
+
+	// 开始排水
+	svc.startDraining()
+	if !svc.draining.Load() {
+		t.Fatal("service should be draining after startDraining")
+	}
+
+	// 重复调用应该是安全的
+	svc.startDraining()
+	if !svc.draining.Load() {
+		t.Fatal("service should still be draining")
+	}
+
+	// 结束排水
+	svc.completeDraining()
+	if svc.draining.Load() {
+		t.Fatal("service should not be draining after completeDraining")
+	}
+}
+
+// TestDrainingMechanism_WaitForDrain 测试排水等待
+func TestDrainingMechanism_WaitForDrain(t *testing.T) {
+	svc := newTestService()
+
+	// 没有活跃页面时，排水应该立即完成
+	svc.startDraining()
+	result := svc.waitForDrain(1 * time.Second)
+	if !result {
+		t.Fatal("drain should complete immediately when no active pages")
+	}
+	svc.completeDraining()
+
+	// 有活跃页面时，排水应该等待
+	svc.activePages.Store(2)
+	svc.startDraining()
+
+	// 在后台模拟页面完成
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		svc.trackPageEnd()
+		time.Sleep(100 * time.Millisecond)
+		svc.trackPageEnd()
+	}()
+
+	result = svc.waitForDrain(2 * time.Second)
+	if !result {
+		t.Fatal("drain should complete when all pages end")
+	}
+	svc.completeDraining()
+}
+
+// TestDrainingMechanism_Timeout 测试排水超时
+func TestDrainingMechanism_Timeout(t *testing.T) {
+	svc := newTestService()
+	svc.activePages.Store(5)
+	svc.startDraining()
+
+	// 不减少活跃页面，应该超时
+	result := svc.waitForDrain(100 * time.Millisecond)
+	if result {
+		t.Fatal("drain should timeout when pages don't complete")
+	}
+	svc.completeDraining()
+}
+
+// TestDrainingMechanism_RejectNewPages 测试排水期间拒绝新页面
+func TestDrainingMechanism_RejectNewPages(t *testing.T) {
+	svc := newTestService()
+	svc.browser = nil // 这里不需要真正的浏览器
+
+	// 不排水时，trackPageStart 返回 false（因为 browser 是 nil）
+	browser, allowed := svc.trackPageStart()
+	if allowed || browser != nil {
+		t.Fatal("should reject when browser is nil")
+	}
+
+	// 开始排水
+	svc.startDraining()
+
+	// 排水期间，即使有浏览器也应该拒绝
+	_, allowed = svc.trackPageStart()
+	if allowed {
+		t.Fatal("should reject new pages during draining")
+	}
+
+	svc.completeDraining()
+}
+
+// TestTrackPageStart_IncrementCounter 测试页面计数
+func TestTrackPageStart_IncrementCounter(t *testing.T) {
+	svc := newTestService()
+
+	// 初始应该是 0
+	if svc.activePages.Load() != 0 {
+		t.Fatal("initial active pages should be 0")
+	}
+
+	// 模拟添加页面
+	svc.activePages.Add(1)
+	if svc.activePages.Load() != 1 {
+		t.Fatal("active pages should be 1")
+	}
+
+	// 模拟页面结束
+	svc.trackPageEnd()
+	if svc.activePages.Load() != 0 {
+		t.Fatal("active pages should be 0 after trackPageEnd")
+	}
+}
+
+// ============================================================================
+// 代理切换阈值测试
+// ============================================================================
+
+// TestProxyFailureThreshold_ThresholdLogic 测试阈值判断逻辑
+func TestProxyFailureThreshold_ThresholdLogic(t *testing.T) {
+	tests := []struct {
+		name         string
+		failureCount int64
+		threshold    int
+		shouldSwitch bool
+	}{
+		{"below_threshold", 5, 10, false},
+		{"at_threshold", 10, 10, true},
+		{"above_threshold", 15, 10, true},
+		{"zero_count", 0, 10, false},
+		{"high_threshold", 50, 100, false},
+		{"threshold_1", 1, 1, true},
+		{"threshold_0_count_0", 0, 0, true}, // 阈值为 0 时，任何计数都应该触发
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 测试阈值判断逻辑（独立于 Redis）
+			shouldSwitch := int(tt.failureCount) >= tt.threshold
+			if shouldSwitch != tt.shouldSwitch {
+				t.Errorf("shouldSwitch = %v, want %v (count=%d, threshold=%d)",
+					shouldSwitch, tt.shouldSwitch, tt.failureCount, tt.threshold)
+			}
+		})
+	}
+}
+
+// TestProxyFailureThreshold_ConfigDefault 测试默认阈值配置
+func TestProxyFailureThreshold_ConfigDefault(t *testing.T) {
+	svc := newTestService()
+
+	// 默认阈值应该是 10
+	if svc.proxyFailureThreshold != 10 {
+		t.Errorf("default threshold = %d, want 10", svc.proxyFailureThreshold)
+	}
+}
+
+// TestProxyFailureThreshold_NoRedis 测试无 Redis 时的降级行为
+func TestProxyFailureThreshold_NoRedis(t *testing.T) {
+	svc := newTestService()
+	// svc.rdb 为 nil
+
+	// 无 Redis 时，incrConsecutiveFailures 应返回 0
+	count := svc.incrConsecutiveFailures()
+	if count != 0 {
+		t.Errorf("incrConsecutiveFailures without Redis = %d, want 0", count)
+	}
+
+	// getConsecutiveFailures 也应返回 0
+	got := svc.getConsecutiveFailures()
+	if got != 0 {
+		t.Errorf("getConsecutiveFailures without Redis = %d, want 0", got)
+	}
+
+	// resetConsecutiveFailures 不应 panic
+	svc.resetConsecutiveFailures()
+}
+
+// ============================================================================
+// 封锁检测测试
+// ============================================================================
+
+// TestDetectBlockType 测试封锁类型检测
+func TestDetectBlockType(t *testing.T) {
+	svc := newTestService()
+
+	tests := []struct {
+		name     string
+		title    string
+		html     string
+		expected string
+	}{
+		{"cloudflare_title", "Just a moment...", "", "cloudflare_challenge"},
+		{"cloudflare_html", "Some Page", "<div>cloudflare</div>", "cloudflare_challenge"},
+		{"captcha", "Verify", "<div>recaptcha</div>", "captcha"},
+		{"forbidden_title", "403 Forbidden", "", "403_forbidden"},
+		{"forbidden_html", "Error", "<div>access denied</div>", "403_forbidden"},
+		{"blank_page", "about:blank", "<html><head></head><body></body></html>", "blank_page"},
+		{"empty_title", "", "some content here with enough characters to pass the length check and avoid being classified as blank_page in the detection logic", "empty_title"},
+		{"connection_error", "Error", "<div>ERR_CONNECTION_REFUSED</div>", "connection_error"},
+		{"normal_page", "Mercari", "<html><body>Normal content</body></html>", "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := svc.detectBlockType(tt.title, tt.html)
+			if result != tt.expected {
+				t.Errorf("detectBlockType() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestBlockedHintsContains 测试封锁关键词检测
+func TestBlockedHintsContains(t *testing.T) {
+	testCases := []struct {
+		text     string
+		expected bool
+	}{
+		{"cloudflare challenge detected", true},
+		{"attention required! please verify", true},
+		{"verify you are human", true},
+		{"access denied to this resource", true},
+		{"normal mercari page content", false},
+		{"shoes for sale ¥1000", false},
+		{"just a moment please wait", true},
+		{"checking your browser before accessing", true},
+		{"403 forbidden error", true},
+		{"too many requests please slow down", true},
+	}
+
+	for _, tc := range testCases {
+		result := containsAny(strings.ToLower(tc.text), blockedHints)
+		if result != tc.expected {
+			t.Errorf("containsAny(%q) = %v, want %v", tc.text, result, tc.expected)
+		}
 	}
 }

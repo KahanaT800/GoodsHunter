@@ -24,26 +24,28 @@ type Config struct {
 
 // AppConfig 应用程序基础配置。
 type AppConfig struct {
-	Env              string        `json:"env"`                // 运行环境: local / prod
-	LogLevel         string        `json:"log_level"`          // 日志级别: debug / info / warn / error
-	HTTPAddr         string        `json:"http_addr"`          // API 服务监听地址
-	ScheduleInterval time.Duration `json:"schedule_interval"`  // 调度间隔（如 "5m"）
-	NewItemDuration  time.Duration `json:"new_item_duration"`  // 新商品热度持续时间（如 "10m"）
-	GuestIdleTimeout time.Duration `json:"guest_idle_timeout"` // Guest 无操作超时（如 "10m"）
-	GuestHeartbeat   time.Duration `json:"guest_heartbeat"`    // Guest 心跳间隔（如 "5m"）
-	MaxTasksPerUser  int           `json:"max_tasks_per_user"` // 每个用户最大任务数
-	MaxItemsPerTask  int           `json:"max_items_per_task"` // 每个任务保留的最大商品数
-	WorkerPoolSize   int           `json:"worker_pool_size"`   // Worker Pool 大小（并发任务数）
-	QueueCapacity    int           `json:"queue_capacity"`     // 队列容量
-	JWTSecret        string        `json:"jwt_secret"`         // JWT 签名密钥
-	RateLimit        float64       `json:"rate_limit"`         // 限流速率（token/s）
-	RateBurst        float64       `json:"rate_burst"`         // 限流桶容量
-	QueueBatchSize   int           `json:"queue_batch_size"`   // 轮询批量入队大小
-	DedupWindow      int           `json:"dedup_window"`       // URL 去重窗口（秒）
-	ProxyCooldown    time.Duration `json:"proxy_cooldown"`     // 直连失败后代理冷却时间
-	MaxTasks         int           `json:"max_tasks"`          // 重启前最大任务数
-	JanitorInterval  time.Duration `json:"janitor_interval"`   // Janitor 扫描间隔
-	JanitorTimeout   time.Duration `json:"janitor_timeout"`    // Janitor 超时阈值
+	Env                   string        `json:"env"`                     // 运行环境: local / prod
+	LogLevel              string        `json:"log_level"`               // 日志级别: debug / info / warn / error
+	HTTPAddr              string        `json:"http_addr"`               // API 服务监听地址
+	ScheduleInterval      time.Duration `json:"schedule_interval"`       // 调度间隔（如 "5m"）
+	NewItemDuration       time.Duration `json:"new_item_duration"`       // 新商品热度持续时间（如 "10m"）
+	GuestIdleTimeout      time.Duration `json:"guest_idle_timeout"`      // Guest 无操作超时（如 "10m"）
+	GuestHeartbeat        time.Duration `json:"guest_heartbeat"`         // Guest 心跳间隔（如 "5m"）
+	MaxTasksPerUser       int           `json:"max_tasks_per_user"`      // 每个用户最大任务数
+	MaxItemsPerTask       int           `json:"max_items_per_task"`      // 每个任务保留的最大商品数
+	WorkerPoolSize        int           `json:"worker_pool_size"`        // Worker Pool 大小（并发任务数）
+	QueueCapacity         int           `json:"queue_capacity"`          // 队列容量
+	JWTSecret             string        `json:"jwt_secret"`              // JWT 签名密钥
+	RateLimit             float64       `json:"rate_limit"`              // 限流速率（token/s）
+	RateBurst             float64       `json:"rate_burst"`              // 限流桶容量
+	QueueBatchSize        int           `json:"queue_batch_size"`        // 轮询批量入队大小
+	DedupWindow           int           `json:"dedup_window"`            // URL 去重窗口（秒）
+	ProxyCooldown         time.Duration `json:"proxy_cooldown"`          // 直连失败后代理冷却时间
+	ProxyFailureThreshold int           `json:"proxy_failure_threshold"` // 代理切换阈值（连续失败 N 次后切换）
+	ProxyAutoSwitch       bool          `json:"proxy_auto_switch"`       // 是否启用自动代理切换（默认关闭）
+	MaxTasks              int           `json:"max_tasks"`               // 重启前最大任务数
+	JanitorInterval       time.Duration `json:"janitor_interval"`        // Janitor 扫描间隔
+	JanitorTimeout        time.Duration `json:"janitor_timeout"`         // Janitor 超时阈值
 }
 
 // MySQLConfig MySQL 数据库配置。
@@ -168,26 +170,28 @@ func Save(path string, cfg *Config) error {
 func getDefaultConfig() *Config {
 	return &Config{
 		App: AppConfig{
-			Env:              "local",
-			LogLevel:         "info",
-			HTTPAddr:         ":8081",
-			ScheduleInterval: 5 * time.Minute,
-			NewItemDuration:  1 * time.Hour,
-			GuestIdleTimeout: 10 * time.Minute,
-			GuestHeartbeat:   5 * time.Minute,
-			MaxTasksPerUser:  3,
-			MaxItemsPerTask:  300,
-			WorkerPoolSize:   50,
-			QueueCapacity:    1000,
-			JWTSecret:        "dev_secret_change_me",
-			RateLimit:        3,
-			RateBurst:        5,
-			QueueBatchSize:   100,
-			DedupWindow:      3600,
-			ProxyCooldown:    10 * time.Minute,
-			MaxTasks:         500,
-			JanitorInterval:  10 * time.Minute,
-			JanitorTimeout:   30 * time.Minute,
+			Env:                   "local",
+			LogLevel:              "info",
+			HTTPAddr:              ":8081",
+			ScheduleInterval:      5 * time.Minute,
+			NewItemDuration:       1 * time.Hour,
+			GuestIdleTimeout:      10 * time.Minute,
+			GuestHeartbeat:        5 * time.Minute,
+			MaxTasksPerUser:       3,
+			MaxItemsPerTask:       300,
+			WorkerPoolSize:        50,
+			QueueCapacity:         1000,
+			JWTSecret:             "dev_secret_change_me",
+			RateLimit:             3,
+			RateBurst:             5,
+			QueueBatchSize:        100,
+			DedupWindow:           3600,
+			ProxyCooldown:         10 * time.Minute,
+			ProxyFailureThreshold: 10,    // 默认连续失败 10 次后才切换代理
+			ProxyAutoSwitch:       false, // 默认关闭自动代理切换
+			MaxTasks:              500,
+			JanitorInterval:       10 * time.Minute,
+			JanitorTimeout:        30 * time.Minute,
 		},
 		MySQL: MySQLConfig{
 			DSN: "root:password@tcp(localhost:3306)/goodshunter?parseTime=true&loc=Local",
@@ -270,6 +274,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.App.ProxyCooldown == 0 {
 		cfg.App.ProxyCooldown = defaults.App.ProxyCooldown
+	}
+	if cfg.App.ProxyFailureThreshold == 0 {
+		cfg.App.ProxyFailureThreshold = defaults.App.ProxyFailureThreshold
 	}
 	if cfg.App.MaxTasks == 0 {
 		cfg.App.MaxTasks = defaults.App.MaxTasks
@@ -391,6 +398,16 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("PROXY_COOLDOWN"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.App.ProxyCooldown = d
+		}
+	}
+	if v := os.Getenv("PROXY_FAILURE_THRESHOLD"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.App.ProxyFailureThreshold = i
+		}
+	}
+	if v := os.Getenv("PROXY_AUTO_SWITCH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.App.ProxyAutoSwitch = b
 		}
 	}
 	if v := os.Getenv("MAX_TASKS"); v != "" {

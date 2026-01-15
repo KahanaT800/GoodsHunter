@@ -1,6 +1,8 @@
 package crawler
 
 import (
+	"io"
+	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
@@ -106,7 +108,9 @@ func TestBlockedPageReturnsError(t *testing.T) {
 	page := browser.MustPage()
 	page.MustNavigate("data:text/html," + url.PathEscape(html))
 
-	svc := &Service{}
+	svc := &Service{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
 	if !svc.isBlockedPage(page) {
 		t.Fatalf("expected blocked page detection")
 	}
