@@ -10,7 +10,14 @@ GoodsHunter technical documentation.
 docs/
 ├── README.md                           # This file
 ├── architecture/
-│   └── design.md                       # System architecture & design
+│   ├── design.md                       # System architecture & design
+│   └── adr/                            # Architecture Decision Records
+│       ├── README.md
+│       ├── 0001-reliable-queue-pattern.md
+│       ├── 0002-distributed-rate-limiting.md
+│       ├── 0003-cookie-persistence.md
+│       ├── 0004-worker-suicide-strategy.md
+│       └── 0005-adaptive-throttling.md
 ├── ops/
 │   ├── configuration.md                # Environment variables & capacity planning
 │   ├── deployment_modes.md             # Deployment modes & service management
@@ -33,6 +40,7 @@ docs/
 | Document | Description |
 |----------|-------------|
 | [design.md](architecture/design.md) | Complete system architecture, anti-detection features, data model |
+| [ADR](architecture/adr/) | Architecture Decision Records (技术决策记录) |
 
 ### Operations
 
@@ -57,6 +65,20 @@ Import these JSON files into Grafana:
 | [grafana_system_overview.json](ops/grafana/grafana_system_overview.json) | System metrics (CPU, memory, containers) |
 | [grafana_business_metrics.json](ops/grafana/grafana_business_metrics.json) | Crawler metrics (success rate, latency) |
 | [grafana_distributed_cluster.json](ops/grafana/grafana_distributed_cluster.json) | Multi-node cluster overview |
+
+---
+
+### Architecture Decision Records (ADR)
+
+记录项目中重要的技术决策：
+
+| ADR | Title |
+|-----|-------|
+| [ADR-0001](architecture/adr/0001-reliable-queue-pattern.md) | Redis 可靠队列模式 |
+| [ADR-0002](architecture/adr/0002-distributed-rate-limiting.md) | 分布式速率限制 |
+| [ADR-0003](architecture/adr/0003-cookie-persistence.md) | Cookie 持久化策略 |
+| [ADR-0004](architecture/adr/0004-worker-suicide-strategy.md) | Worker 自杀策略 |
+| [ADR-0005](architecture/adr/0005-adaptive-throttling.md) | 自适应限流机制 |
 
 ---
 

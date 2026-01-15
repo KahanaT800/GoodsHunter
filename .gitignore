@@ -31,3 +31,6 @@ bin/
 *.swp
 *.swo
 *~
+
+# Agent相关文件
+CLAUDE.md

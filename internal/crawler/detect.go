@@ -136,44 +136,111 @@ func (s *Service) isBlockedPage(page *rod.Page) bool {
 }
 
 // detectBlockType 检测页面被拦截的类型
+// 增强版：支持 Mercari JP 特有的日文错误页面和多种封锁场景
 func (s *Service) detectBlockType(title, html string) string {
 	lowerTitle := strings.ToLower(title)
 	lowerHTML := strings.ToLower(html)
 
-	// Cloudflare 拦截（增强检测）
-	if strings.Contains(lowerTitle, "just a moment") ||
-		strings.Contains(lowerHTML, "cloudflare") ||
-		strings.Contains(lowerHTML, "cf-browser-verification") ||
-		strings.Contains(lowerHTML, "challenge-platform") ||
-		strings.Contains(lowerHTML, `iframe`) && strings.Contains(lowerHTML, "challenges.cloudflare.com") ||
-		strings.Contains(lowerHTML, `id="challenge-form"`) ||
-		strings.Contains(lowerHTML, `id="challenge-running"`) ||
-		strings.Contains(lowerHTML, `id="challenge-stage"`) ||
-		strings.Contains(lowerHTML, "turnstile") { // Cloudflare Turnstile
+	// Cloudflare 拦截（增强检测，包含日文页面）
+	cloudflareIndicators := []string{
+		"just a moment",
+		"cloudflare",
+		"cf-browser-verification",
+		"challenge-platform",
+		"challenges.cloudflare.com",
+		`id="challenge-form"`,
+		`id="challenge-running"`,
+		`id="challenge-stage"`,
+		"turnstile",
+		"cf-turnstile",
+		"ray id:",      // Cloudflare Ray ID
+		"please wait",  // Cloudflare 等待页面
+		"しばらくお待ちください", // 日文：请稍等
+		"ブラウザを確認しています", // 日文：正在验证浏览器
+	}
+	for _, indicator := range cloudflareIndicators {
+		if strings.Contains(lowerHTML, indicator) || strings.Contains(lowerTitle, indicator) {
+			return "cloudflare_challenge"
+		}
+	}
+	// iframe 指向 Cloudflare
+	if strings.Contains(lowerHTML, `iframe`) && strings.Contains(lowerHTML, "cloudflare") {
 		return "cloudflare_challenge"
 	}
 
-	// 人机验证
-	if strings.Contains(lowerHTML, "captcha") ||
-		strings.Contains(lowerHTML, "recaptcha") ||
-		strings.Contains(lowerHTML, "hcaptcha") ||
-		strings.Contains(lowerHTML, "verify you are human") {
-		return "captcha"
+	// 人机验证（CAPTCHA）
+	captchaIndicators := []string{
+		"captcha",
+		"recaptcha",
+		"hcaptcha",
+		"verify you are human",
+		"私はロボットではありません", // 日文：我不是机器人
+		"認証が必要です",        // 日文：需要验证
+		"ロボット",            // 日文：机器人
+	}
+	for _, indicator := range captchaIndicators {
+		if strings.Contains(lowerHTML, indicator) {
+			return "captcha"
+		}
 	}
 
-	// 403 Forbidden（IP 被封）
-	if strings.Contains(lowerTitle, "403") ||
-		strings.Contains(lowerTitle, "forbidden") ||
-		strings.Contains(lowerHTML, "access denied") ||
-		strings.Contains(lowerHTML, "403 error") {
-		return "403_forbidden"
+	// 403 Forbidden（IP 被封）- 增强 Mercari JP 特征
+	forbidden403Indicators := []string{
+		"403",
+		"forbidden",
+		"access denied",
+		"アクセスが拒否されました",   // 日文：访问被拒绝
+		"アクセスできません",       // 日文：无法访问
+		"このページにアクセスする権限", // 日文：没有访问此页面的权限
+		"お探しのページは",        // 日文：您查找的页面...（可能被删除/禁止）
+		"エラーが発生しました",      // 日文：发生错误
+		"サーバーエラー",          // 日文：服务器错误
+		"リクエストを処理できません",  // 日文：无法处理请求
+		"不正なアクセス",          // 日文：非法访问
+		"blocked",
+		"denied",
+	}
+	for _, indicator := range forbidden403Indicators {
+		if strings.Contains(lowerHTML, indicator) || strings.Contains(lowerTitle, indicator) {
+			return "403_forbidden"
+		}
 	}
 
 	// 429 Too Many Requests（速率限制）
-	if strings.Contains(lowerTitle, "429") ||
-		strings.Contains(lowerHTML, "too many requests") ||
-		strings.Contains(lowerHTML, "rate limit") {
-		return "429_rate_limited"
+	rateLimitIndicators := []string{
+		"429",
+		"too many requests",
+		"rate limit",
+		"リクエストが多すぎます",     // 日文：请求过多
+		"しばらく時間をおいてから",    // 日文：请稍后再试
+		"アクセスが集中しています",    // 日文：访问集中
+		"混み合っています",          // 日文：拥挤
+		"時間をおいて再度アクセス",    // 日文：请稍后再访问
+		"temporarily unavailable",
+		"service unavailable",
+	}
+	for _, indicator := range rateLimitIndicators {
+		if strings.Contains(lowerHTML, indicator) || strings.Contains(lowerTitle, indicator) {
+			return "429_rate_limited"
+		}
+	}
+
+	// Mercari 特有的错误页面检测
+	// Mercari 错误页面通常有特定的 class 或显示模式
+	mercariErrorIndicators := []string{
+		"mererrorpage",         // Mercari 错误页面 class
+		"error-page",           // 通用错误页面
+		"page-not-found",       // 404 类错误
+		"something went wrong", // 通用错误
+		"問題が発生しました",           // 日文：发生了问题
+		"ページが見つかりません",         // 日文：页面未找到
+		"メンテナンス中",              // 日文：维护中
+		"サービスを一時停止",           // 日文：服务暂停
+	}
+	for _, indicator := range mercariErrorIndicators {
+		if strings.Contains(lowerHTML, indicator) || strings.Contains(lowerTitle, indicator) {
+			return "mercari_error_page"
+		}
 	}
 
 	// 完全空白页
@@ -185,10 +252,35 @@ func (s *Service) detectBlockType(title, html string) string {
 	}
 
 	// 连接错误
-	if strings.Contains(lowerHTML, "err_connection") ||
-		strings.Contains(lowerHTML, "err_proxy") ||
-		strings.Contains(lowerHTML, "proxy error") {
-		return "connection_error"
+	connectionErrorIndicators := []string{
+		"err_connection",
+		"err_proxy",
+		"err_tunnel",
+		"err_name_not_resolved",
+		"err_internet_disconnected",
+		"err_ssl",
+		"err_cert",
+		"proxy error",
+		"connection refused",
+		"connection reset",
+		"connection timed out",
+		"ネットワークエラー", // 日文：网络错误
+		"接続できません",    // 日文：无法连接
+	}
+	for _, indicator := range connectionErrorIndicators {
+		if strings.Contains(lowerHTML, indicator) {
+			return "connection_error"
+		}
+	}
+
+	// 检测页面内容过少但有基础结构（可能是被拦截后的简化页面）
+	if len(html) > 0 && len(html) < 500 {
+		// 排除正常的空搜索结果页面
+		if !strings.Contains(lowerHTML, "meremptystate") &&
+			!strings.Contains(lowerHTML, "item-cell") &&
+			!strings.Contains(lowerHTML, "search") {
+			return "suspicious_minimal_page"
+		}
 	}
 
 	return "unknown"
@@ -294,6 +386,11 @@ func (s *Service) logPageTimeout(phase string, taskID string, url string, page *
 
 // saveDebugScreenshot 保存调试截图，返回截图路径
 // 需要通过配置 browser.debug_screenshot=true 或环境变量 BROWSER_DEBUG_SCREENSHOT=true 开启
+//
+// 健壮性改进：
+// 1. 截图前先调用 StopLoading 停止页面加载，避免资源竞争
+// 2. 使用 page.Context() 传递超时，使 rod 内部操作可被取消
+// 3. 增加重试机制和降级策略（全页截图失败时尝试 viewport 截图）
 func (s *Service) saveDebugScreenshot(taskID, phase string, page *rod.Page) string {
 	// 检查配置开关
 	if !s.cfg.Browser.DebugScreenshot {
@@ -318,37 +415,156 @@ func (s *Service) saveDebugScreenshot(taskID, phase string, page *rod.Page) stri
 	filename := fmt.Sprintf("%s_%s_%s.png", taskID, phase, timestamp)
 	filepath := fmt.Sprintf("%s/%s", screenshotDir, filename)
 
-	// 设置截图超时（使用独立的 context，不依赖任务 context）
-	screenshotCtx, cancel := context.WithTimeout(context.Background(), debugScreenshotTimeout)
-	defer cancel()
-
-	// 保存截图
-	done := make(chan error, 1)
+	// 第一步：尝试停止页面加载（2秒超时）
+	// 这对于浏览器卡在 JS Challenge 或大量资源加载时非常重要
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	stopDone := make(chan struct{}, 1)
 	go func() {
-		data, err := page.Screenshot(false, nil)
-		if err != nil {
-			done <- err
-			return
-		}
-		done <- os.WriteFile(filepath, data, 0644)
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Debug("StopLoading panic recovered",
+					slog.String("task_id", taskID),
+					slog.Any("panic", r))
+			}
+		}()
+		// StopLoading 可以中断正在进行的网络请求和脚本执行
+		_ = page.StopLoading()
+		stopDone <- struct{}{}
 	}()
 
 	select {
-	case err := <-done:
+	case <-stopDone:
+		s.logger.Debug("page loading stopped before screenshot",
+			slog.String("task_id", taskID))
+	case <-stopCtx.Done():
+		s.logger.Debug("StopLoading timeout, continuing with screenshot",
+			slog.String("task_id", taskID))
+	}
+	stopCancel()
+
+	// 第二步：执行截图（使用带超时的 page context）
+	// 这样 rod 内部的 CDP 调用也会受到超时限制
+	screenshotCtx, screenshotCancel := context.WithTimeout(context.Background(), s.screenshotTimeout)
+	defer screenshotCancel()
+
+	// 使用带超时的 page 进行截图
+	timedPage := page.Context(screenshotCtx)
+
+	type screenshotResult struct {
+		data []byte
+		err  error
+	}
+	resultCh := make(chan screenshotResult, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				resultCh <- screenshotResult{nil, fmt.Errorf("screenshot panic: %v", r)}
+			}
+		}()
+
+		// 尝试全页截图
+		data, err := timedPage.Screenshot(false, nil)
 		if err != nil {
-			s.logger.Warn("failed to save screenshot",
+			// 全页截图失败，尝试仅截取 viewport（更快，资源消耗更少）
+			s.logger.Debug("full page screenshot failed, trying viewport only",
 				slog.String("task_id", taskID),
+				slog.String("error", err.Error()))
+
+			// viewport 截图：fullPage=false 且不指定 clip
+			data, err = timedPage.Screenshot(false, nil)
+		}
+		resultCh <- screenshotResult{data, err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			s.logger.Warn("screenshot capture failed",
+				slog.String("task_id", taskID),
+				slog.String("phase", phase),
+				slog.String("error", result.err.Error()))
+
+			// 降级：尝试保存 HTML 快照作为替代
+			s.saveHTMLSnapshot(taskID, phase, page)
+			return ""
+		}
+
+		// 写入文件
+		if err := os.WriteFile(filepath, result.data, 0644); err != nil {
+			s.logger.Warn("failed to write screenshot file",
+				slog.String("task_id", taskID),
+				slog.String("path", filepath),
 				slog.String("error", err.Error()))
 			return ""
 		}
+
 		s.logger.Info("debug screenshot saved",
 			slog.String("task_id", taskID),
-			slog.String("path", filepath))
+			slog.String("phase", phase),
+			slog.String("path", filepath),
+			slog.Int("size_bytes", len(result.data)))
 		return filepath
+
 	case <-screenshotCtx.Done():
 		s.logger.Warn("screenshot timeout",
-			slog.String("task_id", taskID))
+			slog.String("task_id", taskID),
+			slog.String("phase", phase),
+			slog.Duration("timeout", s.screenshotTimeout))
+
+		// 超时时也尝试保存 HTML 快照
+		s.saveHTMLSnapshot(taskID, phase, page)
 		return ""
+	}
+}
+
+// saveHTMLSnapshot 保存 HTML 快照作为截图的降级方案
+// 当截图超时或失败时，HTML 文本仍可能有助于诊断问题
+func (s *Service) saveHTMLSnapshot(taskID, phase string, page *rod.Page) {
+	snapshotCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	htmlCh := make(chan string, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				htmlCh <- ""
+			}
+		}()
+
+		timedPage := page.Context(snapshotCtx)
+		if v, err := timedPage.Eval("document.documentElement.outerHTML"); err == nil {
+			htmlCh <- v.Value.String()
+		} else {
+			htmlCh <- ""
+		}
+	}()
+
+	var html string
+	select {
+	case html = <-htmlCh:
+	case <-snapshotCtx.Done():
+		return
+	}
+
+	if html == "" || len(html) < 100 {
+		return
+	}
+
+	// 截断 HTML 到合理大小（最多 500KB）
+	if len(html) > 500*1024 {
+		html = html[:500*1024] + "\n<!-- truncated -->"
+	}
+
+	screenshotDir := "/tmp/goodshunter/screenshots"
+	timestamp := time.Now().Format("20060102_150405")
+	filepath := fmt.Sprintf("%s/%s_%s_%s.html", screenshotDir, taskID, phase, timestamp)
+
+	if err := os.WriteFile(filepath, []byte(html), 0644); err == nil {
+		s.logger.Info("HTML snapshot saved (screenshot fallback)",
+			slog.String("task_id", taskID),
+			slog.String("phase", phase),
+			slog.String("path", filepath))
 	}
 }
 

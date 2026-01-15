@@ -53,9 +53,9 @@ const (
 	// 浏览器排水（Draining）超时
 	drainTimeout = 60 * time.Second // 等待当前任务完成的最大时间
 
-	// 截图和诊断的独立超时
-	debugScreenshotTimeout = 10 * time.Second // 调试截图超时
-	debugHTMLTimeout       = 5 * time.Second  // 获取 HTML 超时
+	// 截图和诊断的独立超时（默认值，可通过配置覆盖）
+	defaultScreenshotTimeout = 15 * time.Second // 调试截图超时（默认 15 秒，可通过 BROWSER_SCREENSHOT_TIMEOUT 配置）
+	debugHTMLTimeout         = 5 * time.Second  // 获取 HTML 超时
 )
 
 // Service 负责浏览器调度与页面解析。
@@ -106,6 +106,9 @@ type Service struct {
 
 	// 自适应限流器 - 连续失败后自动降频
 	adaptiveThrottler *AdaptiveThrottler
+
+	// 截图超时（可配置）
+	screenshotTimeout time.Duration
 }
 
 // crawlerStats 爬虫统计信息
@@ -200,6 +203,12 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 	}
 	selectedUA := userAgents[rand.Intn(len(userAgents))]
 
+	// 截图超时配置（使用配置值或默认值）
+	screenshotTimeout := cfg.Browser.ScreenshotTimeout
+	if screenshotTimeout <= 0 {
+		screenshotTimeout = defaultScreenshotTimeout
+	}
+
 	service := &Service{
 		browser:               browser,
 		rdb:                   rdb,
@@ -220,6 +229,7 @@ func NewService(ctx context.Context, cfg *config.Config, logger *slog.Logger, re
 		proxyAutoSwitch:       cfg.App.ProxyAutoSwitch,
 		cookieManager:         NewCookieManager(rdb, logger),
 		adaptiveThrottler:     NewAdaptiveThrottler(rdb, logger),
+		screenshotTimeout:     screenshotTimeout,
 	}
 	metrics.CrawlerProxyMode.Set(0)
 	logger.Info("crawler service configured",

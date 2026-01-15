@@ -19,13 +19,13 @@
 ## Screenshots
 
 ### Web Management Interface
-![Guest Dashboard](image/guesten.png)
+![Guest Dashboard](/docs/image/guesten.png)
 
 ### System Monitoring ([Live Demo](https://lycmuna.grafana.net/goto/afa3n3hqjpu68b?orgId=stacks-1490156))
-[![System Dashboard](image/grafana_sys.png)](https://lycmuna.grafana.net/goto/afa3n3hqjpu68b?orgId=stacks-1490156)
+[![System Dashboard](/docs/image/grafana_sys.png)](https://lycmuna.grafana.net/goto/afa3n3hqjpu68b?orgId=stacks-1490156)
 
 ### Business Metrics ([Live Demo](https://lycmuna.grafana.net/goto/dfa3n1ojc4p34b?orgId=stacks-1490156))
-[![Business Dashboard](image/grafana_business.png)](https://lycmuna.grafana.net/goto/dfa3n1ojc4p34b?orgId=stacks-1490156)
+[![Business Dashboard](/docs/image/grafana_business.png)](https://lycmuna.grafana.net/goto/dfa3n1ojc4p34b?orgId=stacks-1490156)
 
 ---
 
