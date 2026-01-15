@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/url"
 	"os"
 	"regexp"
@@ -43,7 +44,7 @@ const (
 	browserHealthTimeout   = 5 * time.Second        // 健康检查单次超时
 	stuckTaskCheckInterval = 1 * time.Minute        // 卡住任务检查间隔
 	stuckTaskRescueTimeout = 10 * time.Second       // 卡住任务恢复超时
-	stuckTaskThreshold     = 2 * time.Minute        // 任务被认定为卡住的阈值
+	stuckTaskThreshold     = 5 * time.Minute        // 任务被认定为卡住的阈值（需大于 taskTimeout + watchdogTimeout）
 	taskTimeout            = 90 * time.Second       // 单个任务最大执行时间
 	watchdogTimeout        = 100 * time.Second      // 看门狗超时（比任务超时稍长）
 	pageCreateTimeout      = 10 * time.Second       // 页面创建超时
@@ -55,7 +56,134 @@ const (
 	elementCountTimeout    = 5 * time.Second        // 元素计数超时
 	pageTextCheckTimeout   = 2 * time.Second        // 页面文本检查超时
 	scrollWaitInterval     = 500 * time.Millisecond // 滚动后等待间隔
+
+	// 请求间随机延迟（Jitter）配置 - 降低被识别为爬虫的风险
+	jitterMinDelay = 500 * time.Millisecond  // 最小随机延迟
+	jitterMaxDelay = 2000 * time.Millisecond // 最大随机延迟
 )
+
+// enhancedStealthJS 增强版反检测脚本
+// 补充 go-rod/stealth 可能未覆盖的检测点
+const enhancedStealthJS = `
+(function() {
+    'use strict';
+
+    // 1. 确保 navigator.webdriver 被正确隐藏
+    // 某些 Cloudflare 版本会在 defineProperty 之后再次检测
+    try {
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+    } catch (e) {}
+
+    // 2. 隐藏自动化特征
+    try {
+        // 移除 Chrome 自动化控制相关属性
+        delete Object.getPrototypeOf(navigator).webdriver;
+        
+        // 重写 navigator.plugins 使其看起来像真实浏览器
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const plugins = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' }
+                ];
+                plugins.length = 3;
+                return plugins;
+            }
+        });
+    } catch (e) {}
+
+    // 3. 隐藏无头模式特征
+    try {
+        // 确保 window.chrome 存在且有正确的属性
+        if (!window.chrome) {
+            window.chrome = {};
+        }
+        if (!window.chrome.runtime) {
+            window.chrome.runtime = {};
+        }
+        
+        // 添加 chrome.csi 和 chrome.loadTimes（真实 Chrome 有这些）
+        if (!window.chrome.csi) {
+            window.chrome.csi = function() { return {}; };
+        }
+        if (!window.chrome.loadTimes) {
+            window.chrome.loadTimes = function() { return {}; };
+        }
+    } catch (e) {}
+
+    // 4. 模拟真实的 WebGL 渲染器信息
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37445) {
+                return 'Intel Inc.';
+            }
+            // UNMASKED_RENDERER_WEBGL
+            if (parameter === 37446) {
+                return 'Intel Iris OpenGL Engine';
+            }
+            return getParameter.call(this, parameter);
+        };
+    } catch (e) {}
+
+    // 5. 隐藏 Selenium/Puppeteer 痕迹
+    try {
+        // 删除可能的 __selenium、__nightmare、__puppeteer 等属性
+        const props = ['__webdriver_script_fn', '__driver_evaluate', '__webdriver_evaluate',
+                       '__selenium_evaluate', '__fxdriver_evaluate', '__driver_unwrapped',
+                       '__webdriver_unwrapped', '__selenium_unwrapped', '__fxdriver_unwrapped',
+                       '_Selenium_IDE_Recorder', '_selenium', 'calledSelenium',
+                       '_WEBDRIVER_ELEM_CACHE', 'ChromeDriverw', 'driver-evaluate',
+                       'webdriver-evaluate', 'selenium-evaluate', 'webdriverCommand',
+                       'webdriver-evaluate-response', '__webdriverFunc', '__$webdriverAsyncExecutor',
+                       '__lastWatirAlert', '__lastWatirConfirm', '__lastWatirPrompt',
+                       '_phantom', '__nightmare', '_puppeteer'];
+        
+        for (const prop of props) {
+            try {
+                if (window.hasOwnProperty(prop)) {
+                    delete window[prop];
+                }
+                if (document.hasOwnProperty(prop)) {
+                    delete document[prop];
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+
+    // 6. 修复 iframe contentWindow 检测
+    try {
+        const originalContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+                const iframe = originalContentWindow.get.call(this);
+                try {
+                    iframe.chrome = window.chrome;
+                } catch (e) {}
+                return iframe;
+            }
+        });
+    } catch (e) {}
+
+    // 7. 防止 toString 检测（某些网站会检查函数是否被修改）
+    try {
+        const oldToString = Function.prototype.toString;
+        Function.prototype.toString = function() {
+            if (this === window.navigator.permissions.query) {
+                return 'function query() { [native code] }';
+            }
+            return oldToString.call(this);
+        };
+    } catch (e) {}
+})();
+`
 
 // Service 负责浏览器调度与页面解析。
 //
@@ -416,15 +544,22 @@ func (s *Service) StartWorker(ctx context.Context) error {
 			var resp *pb.FetchResponse
 			var err error
 
+			// 标记任务是否真正完成（用于决定是否调用 AckTask）
+			taskCompleted := false
+
 			select {
 			case result := <-resultCh:
 				resp = result.resp
 				err = result.err
+				taskCompleted = true // 任务真正完成了（无论成功或失败）
 			case <-taskCtx.Done():
 				err = fmt.Errorf("task context timeout: %w", taskCtx.Err())
 				s.logger.Error("task context timeout",
 					slog.String("task_id", taskID),
 					slog.Duration("elapsed", time.Since(taskStart)))
+				// 超时时 taskCompleted = false，不调用 AckTask
+				// 任务会留在 processing queue，由 Janitor 来 rescue
+				// 同时 pending set 保持 taskID，防止调度器重复推送
 			}
 
 			if err != nil {
@@ -452,14 +587,21 @@ func (s *Service) StartWorker(ctx context.Context) error {
 				}
 			}
 
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), redisOperationTimeout)
-			defer ackCancel()
-			if ackErr := s.redisQueue.AckTask(ackCtx, t); ackErr != nil {
-				s.logger.Error("failed to ack task",
-					slog.String("task_id", taskID),
-					slog.String("error", ackErr.Error()))
+			// 只有任务真正完成时才调用 AckTask
+			// 超时的任务会留在 processing queue，由 Janitor 来处理
+			if taskCompleted {
+				ackCtx, ackCancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+				defer ackCancel()
+				if ackErr := s.redisQueue.AckTask(ackCtx, t); ackErr != nil {
+					s.logger.Error("failed to ack task",
+						slog.String("task_id", taskID),
+						slog.String("error", ackErr.Error()))
+				} else {
+					s.logger.Debug("task acked", slog.String("task_id", taskID))
+				}
 			} else {
-				s.logger.Debug("task acked", slog.String("task_id", taskID))
+				s.logger.Warn("task not acked (timeout), will be rescued by janitor",
+					slog.String("task_id", taskID))
 			}
 		}(task)
 	}
@@ -515,13 +657,22 @@ func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 	// 读取并设置 HTTP 代理
 	if useProxy {
 		if cfg.Browser.ProxyURL == "" {
+			logger.Error("proxy mode requested but no proxy url configured",
+				slog.String("hint", "set HTTP_PROXY or BROWSER_PROXY_URL environment variable, or browser.proxy_url in config"))
 			return nil, fmt.Errorf("proxy enabled but no proxy url configured")
 		}
 		parsed, err := url.Parse(cfg.Browser.ProxyURL)
 		if err != nil {
+			logger.Error("failed to parse proxy url",
+				slog.String("proxy_url", cfg.Browser.ProxyURL),
+				slog.String("error", err.Error()))
 			return nil, fmt.Errorf("parse proxy url: %w", err)
 		}
 		if parsed.Scheme == "" || parsed.Host == "" {
+			logger.Error("invalid proxy url format",
+				slog.String("proxy_url", cfg.Browser.ProxyURL),
+				slog.String("scheme", parsed.Scheme),
+				slog.String("host", parsed.Host))
 			return nil, fmt.Errorf("invalid proxy url: %s", cfg.Browser.ProxyURL)
 		}
 		proxyServer = fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
@@ -532,13 +683,19 @@ func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 			}
 		}
 		l = l.Proxy(proxyServer)
+		logger.Info("configuring browser with proxy",
+			slog.String("proxy_server", proxyServer),
+			slog.Bool("has_auth", proxyUser != ""))
 		if proxyUser != "" {
-			logger.Info("using http proxy",
+			logger.Info("using http proxy with authentication",
 				slog.String("server", proxyServer),
 				slog.String("auth_user", proxyUser))
 		} else {
-			logger.Info("using http proxy", slog.String("server", proxyServer))
+			logger.Info("using http proxy without authentication",
+				slog.String("server", proxyServer))
 		}
+	} else {
+		logger.Debug("starting browser in direct mode (no proxy)")
 	}
 
 	wsURL, err := l.Launch()
@@ -551,7 +708,25 @@ func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		return nil, fmt.Errorf("connect browser: %w", err)
 	}
 	if proxyUser != "" {
-		go browser.MustHandleAuth(proxyUser, proxyPass)()
+		// 使用 HandleAuth 处理代理认证
+		// 注意：HandleAuth 返回的函数会阻塞等待认证请求，需要在 goroutine 中运行
+		authReady := make(chan struct{})
+		go func() {
+			// 通知主 goroutine 认证处理器已启动
+			close(authReady)
+			err := browser.HandleAuth(proxyUser, proxyPass)()
+			if err != nil {
+				// 浏览器关闭时会返回 context canceled，这是正常的，不需要记录错误
+				// 只记录非预期的错误
+				if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+					logger.Warn("proxy auth handler exited with error", slog.String("error", err.Error()))
+				}
+			}
+		}()
+		// 等待认证处理器启动（非阻塞，只是确保 goroutine 已开始执行）
+		<-authReady
+		// 给认证处理器一点时间完成初始化
+		time.Sleep(50 * time.Millisecond)
 		logger.Info("proxy authentication handler registered")
 	}
 
@@ -566,6 +741,7 @@ func startBrowser(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 func (s *Service) ensureBrowserState(ctx context.Context) error {
 	shouldUseProxy, err := s.getProxyState(ctx)
 	if err != nil {
+		s.logger.Warn("failed to get proxy state", slog.String("error", err.Error()))
 		return err
 	}
 	s.mu.RLock()
@@ -573,11 +749,23 @@ func (s *Service) ensureBrowserState(ctx context.Context) error {
 	s.mu.RUnlock()
 
 	if shouldUseProxy == currentIsProxy {
+		s.logger.Debug("browser mode unchanged",
+			slog.Bool("is_proxy", currentIsProxy))
 		return nil
 	}
 
 	// 检测到需要切换模式
+	fromMode := "direct"
+	toMode := "direct"
+	if currentIsProxy {
+		fromMode = "proxy"
+	}
+	if shouldUseProxy {
+		toMode = "proxy"
+	}
 	s.logger.Info("browser mode switch detected",
+		slog.String("from", fromMode),
+		slog.String("to", toMode),
 		slog.Bool("current_is_proxy", currentIsProxy),
 		slog.Bool("should_use_proxy", shouldUseProxy))
 
@@ -598,7 +786,14 @@ func (s *Service) ensureBrowserState(ctx context.Context) error {
 	if err := s.rotateBrowser(shouldUseProxy); err != nil {
 		s.logger.Error("failed to rotate browser",
 			slog.Bool("to_proxy", shouldUseProxy),
-			slog.String("error", err.Error()))
+			slog.String("error", err.Error()),
+			slog.String("hint", "check proxy configuration if switching to proxy mode"))
+		// 如果切换失败，清除代理缓存以避免持续重试失败的切换
+		if shouldUseProxy {
+			s.proxyCache = false
+			s.proxyCacheUntil = time.Now().Add(proxyCacheTTL)
+			s.logger.Warn("cleared proxy cache due to rotation failure, will retry direct mode")
+		}
 		return err
 	}
 
@@ -612,19 +807,44 @@ func (s *Service) ensureBrowserState(ctx context.Context) error {
 	if shouldUseProxy {
 		metrics.CrawlerProxySwitchToProxyTotal.Inc()
 	}
-	s.logger.Info("crawler mode switched successfully", slog.String("mode", mode))
+	s.logger.Info("crawler mode switched successfully",
+		slog.String("mode", mode),
+		slog.Bool("using_proxy", shouldUseProxy))
 	return nil
 }
 
 func (s *Service) logPageTimeout(phase string, taskID string, url string, page *rod.Page, err error) {
 	readyState := "unknown"
+	pageTitle := "unknown"
+	pageHTML := ""
+	screenshotPath := ""
+
 	if page != nil {
+		// 获取 readyState
 		if v, evalErr := page.Eval("document.readyState"); evalErr == nil {
 			if state := v.Value.String(); state != "" {
 				readyState = state
 			}
 		}
+
+		// 获取页面标题
+		if v, evalErr := page.Eval("document.title"); evalErr == nil {
+			if title := v.Value.String(); title != "" {
+				pageTitle = title
+			}
+		}
+
+		// 获取页面 HTML 片段（前 2000 字符用于诊断）
+		if v, evalErr := page.Eval("document.documentElement.outerHTML.substring(0, 2000)"); evalErr == nil {
+			pageHTML = v.Value.String()
+		}
+
+		// 保存截图用于诊断
+		screenshotPath = s.saveDebugScreenshot(taskID, phase, page)
 	}
+
+	// 判断被拦截类型
+	blockType := s.detectBlockType(pageTitle, pageHTML)
 
 	s.logger.Warn("page timeout",
 		slog.String("phase", phase),
@@ -632,7 +852,116 @@ func (s *Service) logPageTimeout(phase string, taskID string, url string, page *
 		slog.String("url", url),
 		slog.Duration("timeout", s.pageTimeout),
 		slog.String("ready_state", readyState),
+		slog.String("page_title", pageTitle),
+		slog.String("block_type", blockType),
+		slog.String("screenshot", screenshotPath),
 		slog.String("error", err.Error()))
+}
+
+// saveDebugScreenshot 保存调试截图，返回截图路径
+// 需要通过配置 browser.debug_screenshot=true 或环境变量 BROWSER_DEBUG_SCREENSHOT=true 开启
+func (s *Service) saveDebugScreenshot(taskID, phase string, page *rod.Page) string {
+	// 检查配置开关
+	if !s.cfg.Browser.DebugScreenshot {
+		return ""
+	}
+
+	if page == nil {
+		return ""
+	}
+
+	// 创建截图目录
+	screenshotDir := "/tmp/goodshunter/screenshots"
+	if err := os.MkdirAll(screenshotDir, 0755); err != nil {
+		s.logger.Warn("failed to create screenshot directory",
+			slog.String("dir", screenshotDir),
+			slog.String("error", err.Error()))
+		return ""
+	}
+
+	// 生成文件名：taskID_phase_timestamp.png
+	timestamp := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("%s_%s_%s.png", taskID, phase, timestamp)
+	filepath := fmt.Sprintf("%s/%s", screenshotDir, filename)
+
+	// 设置截图超时
+	screenshotCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 保存截图
+	done := make(chan error, 1)
+	go func() {
+		data, err := page.Screenshot(false, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- os.WriteFile(filepath, data, 0644)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			s.logger.Warn("failed to save screenshot",
+				slog.String("task_id", taskID),
+				slog.String("error", err.Error()))
+			return ""
+		}
+		s.logger.Info("debug screenshot saved",
+			slog.String("task_id", taskID),
+			slog.String("path", filepath))
+		return filepath
+	case <-screenshotCtx.Done():
+		s.logger.Warn("screenshot timeout",
+			slog.String("task_id", taskID))
+		return ""
+	}
+}
+
+// detectBlockType 检测页面被拦截的类型
+func (s *Service) detectBlockType(title, html string) string {
+	lowerTitle := strings.ToLower(title)
+	lowerHTML := strings.ToLower(html)
+
+	// Cloudflare 拦截
+	if strings.Contains(lowerTitle, "just a moment") ||
+		strings.Contains(lowerHTML, "cloudflare") ||
+		strings.Contains(lowerHTML, "cf-browser-verification") ||
+		strings.Contains(lowerHTML, "challenge-platform") {
+		return "cloudflare_challenge"
+	}
+
+	// 人机验证
+	if strings.Contains(lowerHTML, "captcha") ||
+		strings.Contains(lowerHTML, "recaptcha") ||
+		strings.Contains(lowerHTML, "hcaptcha") ||
+		strings.Contains(lowerHTML, "verify you are human") {
+		return "captcha"
+	}
+
+	// 403 Forbidden
+	if strings.Contains(lowerTitle, "403") ||
+		strings.Contains(lowerTitle, "forbidden") ||
+		strings.Contains(lowerHTML, "access denied") {
+		return "403_forbidden"
+	}
+
+	// 完全空白页
+	if title == "" || title == "about:blank" {
+		if len(html) < 100 || strings.Contains(html, "<html><head></head><body></body></html>") {
+			return "blank_page"
+		}
+		return "empty_title"
+	}
+
+	// 连接错误
+	if strings.Contains(lowerHTML, "err_connection") ||
+		strings.Contains(lowerHTML, "err_proxy") ||
+		strings.Contains(lowerHTML, "proxy error") {
+		return "connection_error"
+	}
+
+	return "unknown"
 }
 
 // rotateBrowser 切换浏览器实例（需在持有 s.mu 写锁时调用）。
@@ -652,6 +981,104 @@ func (s *Service) rotateBrowser(useProxy bool) error {
 		}
 	}
 	return nil
+}
+
+// checkProxyHealth 检查代理健康状态
+// 在切换到代理模式前调用，确保代理隧道可用
+func (s *Service) checkProxyHealth(ctx context.Context) (bool, error) {
+	if s.cfg.Browser.ProxyURL == "" {
+		return false, errors.New("no proxy configured")
+	}
+
+	// 使用 httpbin.org 检测代理连接性和 IP
+	testURL := "https://httpbin.org/ip"
+	checkTimeout := 15 * time.Second
+
+	checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+
+	// 创建一个临时的代理浏览器进行检测
+	s.logger.Info("checking proxy health",
+		slog.String("test_url", testURL))
+
+	testBrowser, err := startBrowser(checkCtx, s.cfg, s.logger, true)
+	if err != nil {
+		s.logger.Warn("proxy health check failed: cannot start browser",
+			slog.String("error", err.Error()))
+		return false, err
+	}
+	defer func() { _ = testBrowser.Close() }()
+
+	// 创建页面并访问测试 URL
+	page, err := testBrowser.Context(checkCtx).Page(proto.TargetCreateTarget{URL: testURL})
+	if err != nil {
+		s.logger.Warn("proxy health check failed: cannot create page",
+			slog.String("error", err.Error()))
+		return false, err
+	}
+	defer func() { _ = page.Close() }()
+
+	// 等待页面加载
+	waitErr := page.Context(checkCtx).WaitLoad()
+	if waitErr != nil {
+		s.logger.Warn("proxy health check failed: page load timeout",
+			slog.String("error", waitErr.Error()))
+		return false, waitErr
+	}
+
+	// 检查页面是否包含 IP 信息
+	info, infoErr := page.Info()
+	if infoErr == nil && info.Title != "" && info.Title != "about:blank" {
+		// 尝试获取响应内容
+		body := s.getPageBodyText(page)
+		if strings.Contains(body, "origin") {
+			s.logger.Info("proxy health check passed",
+				slog.String("title", info.Title),
+				slog.Bool("has_origin", true))
+			return true, nil
+		}
+	}
+
+	// 即使没有获取到完整内容，只要页面能加载就认为代理可用
+	if info != nil && info.Title != "about:blank" {
+		s.logger.Info("proxy health check passed (partial)",
+			slog.String("title", info.Title))
+		return true, nil
+	}
+
+	s.logger.Warn("proxy health check failed: blank page or blocked")
+	return false, errors.New("proxy returned blank page")
+}
+
+// checkProxyHealthWithRetry 带重试的代理健康检查
+func (s *Service) checkProxyHealthWithRetry(ctx context.Context, maxRetries int) bool {
+	for i := 0; i < maxRetries; i++ {
+		if ctx.Err() != nil {
+			return false
+		}
+
+		healthy, err := s.checkProxyHealth(ctx)
+		if healthy {
+			return true
+		}
+
+		if i < maxRetries-1 {
+			// 指数退避重试
+			backoff := time.Duration(1<<uint(i)) * time.Second
+			s.logger.Info("proxy health check retry",
+				slog.Int("attempt", i+1),
+				slog.Int("max_retries", maxRetries),
+				slog.Duration("backoff", backoff),
+				slog.String("last_error", err.Error()))
+
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func (s *Service) isUsingProxy() bool {
@@ -746,6 +1173,32 @@ func boolToGauge(v bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+// ClearProxyCooldown 清除代理冷却，强制切换回直连模式。
+//
+// 调用此函数后，下一次 ensureBrowserState 会检测到需要切换回直连模式。
+func (s *Service) ClearProxyCooldown(ctx context.Context) error {
+	if s.rdb == nil {
+		return errors.New("redis client is not initialized")
+	}
+
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), redisShortTimeout)
+	defer redisCancel()
+
+	if err := s.rdb.Del(redisCtx, proxyCooldownKey).Err(); err != nil {
+		s.logger.Warn("clear proxy cooldown from redis failed",
+			slog.String("error", err.Error()))
+		// 仍然更新本地缓存
+	}
+
+	s.mu.Lock()
+	s.proxyCache = false
+	s.proxyCacheUntil = time.Now().Add(proxyCacheTTL)
+	s.mu.Unlock()
+
+	s.logger.Info("proxy cooldown cleared, will switch to direct mode on next request")
+	return nil
 }
 
 // FetchItems 处理抓取请求。
@@ -845,7 +1298,14 @@ func (s *Service) FetchItems(ctx context.Context, req *pb.FetchRequest) (*pb.Fet
 
 func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
-	s.logger.Debug("doCrawl started", slog.String("task_id", taskID), slog.Int("attempt", attempt))
+	currentMode := "direct"
+	if s.isUsingProxy() {
+		currentMode = "proxy"
+	}
+	s.logger.Debug("doCrawl started",
+		slog.String("task_id", taskID),
+		slog.Int("attempt", attempt),
+		slog.String("mode", currentMode))
 
 	// 使用独立的 context 确保浏览器状态检查不受任务 ctx 影响
 	// 这对于任务超时后需要切换代理模式的场景至关重要
@@ -855,15 +1315,25 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 		s.logger.Warn("ensureBrowserState failed", slog.String("task_id", taskID), slog.String("error", err.Error()))
 		return nil, fmt.Errorf("ensure browser state: %w", err)
 	}
-	s.logger.Debug("browser state ensured", slog.String("task_id", taskID))
+
+	// 确认实际使用的模式（可能在 ensureBrowserState 中发生切换）
+	actualMode := "direct"
+	if s.isUsingProxy() {
+		actualMode = "proxy"
+	}
+	s.logger.Debug("browser state ensured",
+		slog.String("task_id", taskID),
+		slog.String("actual_mode", actualMode))
 
 	if attempt == 0 && !s.isUsingProxy() && atomic.CompareAndSwapUint32(&s.forceProxyOnce, 1, 0) {
-		s.logger.Warn("direct connection failed, activating proxy",
+		s.logger.Warn("forcing proxy activation due to FORCE_PROXY_ONCE env",
 			slog.String("reason", "forced"),
 			slog.Duration("cooldown", s.cfg.App.ProxyCooldown))
 		if err := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); err != nil {
 			return nil, err
 		}
+		s.logger.Info("proxy cooldown set, retrying with proxy mode",
+			slog.String("task_id", taskID))
 		return s.doCrawl(ctx, req, attempt+1)
 	}
 
@@ -873,9 +1343,27 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 	}
 
 	if attempt == 0 && !s.isUsingProxy() && shouldActivateProxy(err) {
-		s.logger.Warn("direct connection failed, activating proxy",
+		s.logger.Warn("direct connection failed, checking proxy before activation",
 			slog.Duration("cooldown", s.cfg.App.ProxyCooldown),
-			slog.String("trigger_error", err.Error()))
+			slog.String("trigger_error", err.Error()),
+			slog.String("error_type", classifyCrawlerError(err)))
+
+		// 先进行代理健康检查（使用独立 context，不受任务 ctx 超时影响）
+		healthCtx, healthCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		proxyHealthy := s.checkProxyHealthWithRetry(healthCtx, 2)
+		healthCancel()
+
+		if !proxyHealthy {
+			s.logger.Warn("proxy health check failed, staying in direct mode",
+				slog.String("task_id", taskID),
+				slog.String("hint", "check proxy configuration or consider using residential proxy"))
+			metrics.CrawlerErrorsTotal.WithLabelValues("internal", "proxy_unhealthy").Inc()
+			// 代理不可用，不切换模式，直接返回原始错误
+			return nil, fmt.Errorf("direct failed and proxy unhealthy: %w", err)
+		}
+
+		s.logger.Info("proxy health check passed, activating proxy mode",
+			slog.String("task_id", taskID))
 
 		if setErr := s.setProxyCooldown(ctx, s.cfg.App.ProxyCooldown); setErr != nil {
 			s.logger.Error("failed to set proxy cooldown", slog.String("error", setErr.Error()))
@@ -901,7 +1389,13 @@ func (s *Service) doCrawl(ctx context.Context, req *pb.FetchRequest, attempt int
 func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	taskID := req.GetTaskId()
 	crawlStart := time.Now()
-	s.logger.Debug("crawlOnce started", slog.String("task_id", taskID))
+	crawlMode := "direct"
+	if s.isUsingProxy() {
+		crawlMode = "proxy"
+	}
+	s.logger.Debug("crawlOnce started",
+		slog.String("task_id", taskID),
+		slog.String("mode", crawlMode))
 
 	if s.rateLimiter != nil {
 		s.logger.Debug("waiting for rate limit", slog.String("task_id", taskID))
@@ -938,6 +1432,22 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 				break RateLimitLoop
 			case <-time.After(50 * time.Millisecond):
 			}
+		}
+	}
+
+	// 添加随机延迟（Jitter）降低被识别为爬虫的风险
+	// 仅在直连模式下使用，代理模式下跳过（代理本身已提供一定程度的保护）
+	if !s.isUsingProxy() {
+		jitter := jitterMinDelay + time.Duration(rand.Int63n(int64(jitterMaxDelay-jitterMinDelay)))
+		s.logger.Debug("applying request jitter",
+			slog.String("task_id", taskID),
+			slog.Duration("jitter", jitter))
+
+		select {
+		case <-time.After(jitter):
+			// 延迟完成
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled during jitter: %w", ctx.Err())
 		}
 	}
 
@@ -1002,7 +1512,15 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 	defer stealthTimer.Stop()
 	stealthDone := make(chan error, 1)
 	go func() {
+		// 1. 应用 go-rod/stealth 的基础脚本
 		_, evalErr := basePage.EvalOnNewDocument(stealth.JS)
+		if evalErr != nil {
+			stealthDone <- evalErr
+			return
+		}
+
+		// 2. 应用增强的反检测脚本
+		_, evalErr = basePage.EvalOnNewDocument(enhancedStealthJS)
 		stealthDone <- evalErr
 	}()
 

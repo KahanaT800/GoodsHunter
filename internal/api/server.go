@@ -39,6 +39,7 @@ type Server struct {
 	logger        *slog.Logger
 	db            *gorm.DB
 	rdb           *redis.Client
+	redisQueue    *redisqueue.Client
 	router        *gin.Engine
 	sched         *scheduler.Scheduler
 	auth          *auth.Handler
@@ -149,6 +150,7 @@ func NewServer(ctx context.Context, cfg *config.Config, logger *slog.Logger, red
 		logger:        logger,
 		db:            db,
 		rdb:           rdb,
+		redisQueue:    redisQueue,
 		router:        r,
 		sched:         sched,
 		auth:          auth.NewHandler(db, cfg.Security.JWTSecret, cfg.Security.InviteCode, emailNotifier, logger),
@@ -364,6 +366,15 @@ func (s *Server) handleDeleteTask(c *gin.Context) {
 	// 停止调度器
 	s.sched.StopTask(uint(taskIDUint))
 
+	// 清理 Redis 队列中的任务残留
+	if s.redisQueue != nil {
+		if err := s.redisQueue.RemoveFromPendingSet(c.Request.Context(), id); err != nil {
+			s.logger.Warn("remove task from pending set failed",
+				slog.String("task_id", id),
+				slog.String("error", err.Error()))
+		}
+	}
+
 	// 1. 获取所有关联的商品ID
 	var itemIDs []uint
 	s.db.Model(&model.TaskItem{}).
@@ -438,6 +449,14 @@ func (s *Server) handleDeleteAccount(c *gin.Context) {
 
 	for _, id := range taskIDs {
 		s.sched.StopTask(id)
+		// 清理 Redis 队列中的任务残留
+		if s.redisQueue != nil {
+			if err := s.redisQueue.RemoveFromPendingSet(c.Request.Context(), strconv.FormatUint(uint64(id), 10)); err != nil {
+				s.logger.Warn("remove task from pending set failed",
+					slog.Uint64("task_id", uint64(id)),
+					slog.String("error", err.Error()))
+			}
+		}
 	}
 
 	var itemIDs []uint

@@ -29,7 +29,8 @@
     "proxy_url": "",
     "headless": true,
     "max_concurrency": 5,
-    "max_fetch_count": 50
+    "max_fetch_count": 50,
+    "debug_screenshot": false
   },
   "email": {
     "smtp_host": "smtp.gmail.com",

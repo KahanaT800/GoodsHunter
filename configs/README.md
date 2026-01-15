@@ -65,12 +65,14 @@ GoodsHunter 支持通过 **JSON 配置文件** 和 **环境变量** 两种方式
 
 ### 爬虫引擎 (Browser)
 
-| JSON 字段 (`browser.*`) | 环境变量 | 说明 |
-|-----------------------|----------|------|
-| `bin_path` | `CHROME_BIN` | Chrome 可执行文件路径 |
-| `proxy_url` | `BROWSER_PROXY_URL` | 代理 (如 `http://127.0.0.1:7890`) |
-| `headless` | `BROWSER_HEADLESS` | 是否无头模式 (`true`/`false`) |
-| `max_concurrency` | `BROWSER_MAX_CONCURRENCY` | 单实例并发数 |
+| JSON 字段 (`browser.*`) | 环境变量 | 说明 | 默认值 |
+|-----------------------|----------|------|--------|
+| `bin_path` | `CHROME_BIN` | Chrome 可执行文件路径 | - |
+| `proxy_url` | `BROWSER_PROXY_URL` | 代理 (如 `http://127.0.0.1:7890`) | - |
+| `headless` | `BROWSER_HEADLESS` | 是否无头模式 (`true`/`false`) | `true` |
+| `max_concurrency` | `BROWSER_MAX_CONCURRENCY` | 单实例并发数 | `3` |
+| `max_fetch_count` | `BROWSER_MAX_FETCH_COUNT` | 每次爬取最大商品数 | `50` |
+| `debug_screenshot` | `BROWSER_DEBUG_SCREENSHOT` | 超时时保存调试截图 | `false` |
 
 ### 安全与鉴权 (Security)
 
@@ -110,7 +112,8 @@ GoodsHunter 支持通过 **JSON 配置文件** 和 **环境变量** 两种方式
   },
   "browser": {
     "headless": true,
-    "max_concurrency": 5
+    "max_concurrency": 5,
+    "debug_screenshot": false
   },
   "security": {
     "jwt_secret": "change-me-in-production"

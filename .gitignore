@@ -31,5 +31,3 @@ bin/
 *.swp
 *.swo
 *~
-
-.env.example

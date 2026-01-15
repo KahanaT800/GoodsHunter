@@ -72,6 +72,7 @@ services:
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
       BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-3}
       BROWSER_MAX_FETCH_COUNT: ${BROWSER_MAX_FETCH_COUNT:-50}
+      BROWSER_DEBUG_SCREENSHOT: ${BROWSER_DEBUG_SCREENSHOT:-false}
     depends_on:
       mysql:
         condition: service_healthy
