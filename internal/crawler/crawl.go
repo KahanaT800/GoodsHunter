@@ -742,7 +742,12 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 		}
 	}
 
-	// 使用增强的 DOM 检测（更精确地识别 JS 挑战）
+	// 注意：封锁检测已移至 Race() 超时后执行
+	// 原因：Mercari 是 React SPA，WaitLoad/WaitRequestIdle 完成后 React 可能还在渲染
+	// 过早检测会导致误判，应该先给页面足够时间加载商品
+
+	// 只做早期的"明确封锁"检测（Cloudflare iframe/challenge-form 等）
+	// 这些特征即使在页面未完全加载时也能准确识别
 	if domBlockType := s.detectBlockTypeFromPage(ctx, page); domBlockType != "" {
 		s.logger.Warn("detected blocked page via DOM inspection",
 			slog.String("task_id", taskID),
@@ -750,25 +755,6 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 		s.saveDebugScreenshot(taskID, "blocked_"+domBlockType, page)
 		s.handleBlockEvent(ctx, taskID, domBlockType)
 		return nil, fmt.Errorf("blocked_page: %s", domBlockType)
-	}
-
-	if s.isBlockedPage(page) {
-		// 获取更多诊断信息
-		blockType := "unknown"
-		if info != nil {
-			blockType = s.detectBlockType(info.Title, s.getPageBodyText(page))
-		}
-		s.logger.Warn("detected blocked page",
-			slog.String("task_id", taskID),
-			slog.String("block_type", blockType))
-
-		// 保存截图用于诊断
-		s.saveDebugScreenshot(taskID, "blocked_"+blockType, page)
-
-		// 记录封锁事件
-		s.handleBlockEvent(ctx, taskID, blockType)
-
-		return nil, fmt.Errorf("blocked_page: %s", blockType)
 	}
 
 	// 调试：检查页面关键元素是否存在，帮助诊断空 Grid 问题
@@ -848,6 +834,22 @@ func (s *Service) crawlOnce(ctx context.Context, req *pb.FetchRequest) (*pb.Fetc
 			s.saveDebugScreenshot(taskID, "challenge_page", page)
 			return nil, fmt.Errorf("blocked_page: challenge")
 		}
+
+		// Race 超时/失败后，再检测是否被封锁
+		// 此时页面已有足够时间加载，如果还没商品，可能确实被封锁了
+		if s.isBlockedPage(page) {
+			blockType := "unknown"
+			if info != nil {
+				blockType = s.detectBlockType(info.Title, s.getPageBodyText(page))
+			}
+			s.logger.Warn("detected blocked page after race timeout",
+				slog.String("task_id", taskID),
+				slog.String("block_type", blockType))
+			s.saveDebugScreenshot(taskID, "blocked_"+blockType, page)
+			s.handleBlockEvent(ctx, taskID, blockType)
+			return nil, fmt.Errorf("blocked_page: %s", blockType)
+		}
+
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
 			s.logPageTimeout("wait_for_items", taskID, url, page, err)
 		}

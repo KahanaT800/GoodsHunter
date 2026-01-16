@@ -103,13 +103,16 @@ func (s *Service) isBlockedPage(page *rod.Page) bool {
 		}
 
 		// 检查标题中的封锁特征
+		// 注意：使用更精确的关键词，避免误判正常页面
 		blockedTitles := []string{
 			"just a moment",
 			"attention required",
 			"access denied",
 			"403 forbidden",
-			"error",
+			"429 too many",
 			"blocked",
+			"cloudflare",
+			// 注意：移除了 "error"，因为太宽泛，容易误判
 		}
 		for _, blocked := range blockedTitles {
 			if strings.Contains(title, blocked) {
@@ -290,6 +293,8 @@ func (s *Service) detectBlockType(title, html string) string {
 }
 
 // detectBlockTypeFromPage 从页面 DOM 检测拦截类型（更精确的检测）
+// 注意：此函数只检测明确的封锁特征（Cloudflare、CAPTCHA 等），
+// 不再检测"疑似 JS 挑战"，因为在网络慢的情况下会导致大量误判。
 func (s *Service) detectBlockTypeFromPage(ctx context.Context, page *rod.Page) string {
 	detectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -302,33 +307,29 @@ func (s *Service) detectBlockTypeFromPage(ctx context.Context, page *rod.Page) s
 	}
 
 	// 2. 检测 challenge-form（Cloudflare JS Challenge）
-	if form, err := p.Element(`#challenge-form, #challenge-running, [id*="challenge"]`); err == nil && form != nil {
+	// 注意：使用更精确的选择器，避免匹配正常页面中包含 "challenge" 的元素
+	if form, err := p.Element(`#challenge-form, #challenge-running, #challenge-stage`); err == nil && form != nil {
 		return "cloudflare_challenge"
 	}
 
 	// 3. 检测 Turnstile widget
-	if turnstile, err := p.Element(`[class*="turnstile"], .cf-turnstile`); err == nil && turnstile != nil {
+	if turnstile, err := p.Element(`.cf-turnstile, [data-sitekey]`); err == nil && turnstile != nil {
 		return "cloudflare_challenge"
 	}
 
-	// 4. 检测 CAPTCHA 元素
-	if captcha, err := p.Element(`[class*="captcha"], [id*="captcha"], .g-recaptcha, .h-captcha`); err == nil && captcha != nil {
+	// 4. 检测 CAPTCHA 元素（使用更精确的选择器）
+	if captcha, err := p.Element(`.g-recaptcha, .h-captcha, [class*="recaptcha"], [class*="hcaptcha"]`); err == nil && captcha != nil {
 		return "captcha"
 	}
 
-	// 5. 检测错误页面特征（有 header 但没有商品列表）
-	hasHeader, _ := p.Element(`header, [data-testid="header"]`)
-	hasItemCell, _ := p.Element(`[data-testid="item-cell"]`)
-	hasEmptyState, _ := p.Element(`.merEmptyState`)
-
-	// 页面框架存在，但既没有商品也没有空状态提示 = 可能是 JS 挑战或动态加载问题
-	if hasHeader != nil && hasItemCell == nil && hasEmptyState == nil {
-		// 检查是否有加载中的状态
-		if loading, err := p.Element(`[class*="loading"], [class*="Loading"], [class*="skeleton"]`); err == nil && loading != nil {
-			return "js_loading_stuck"
-		}
-		return "js_challenge_suspected"
+	// 5. 检测 Cloudflare 特有的 Ray ID 显示（明确的封锁标志）
+	if rayId, err := p.Element(`[class*="ray-id"], .ray_id`); err == nil && rayId != nil {
+		return "cloudflare_challenge"
 	}
+
+	// 注意：移除了 "js_challenge_suspected" 检测
+	// 原因：在网络慢的情况下，页面框架加载但商品未渲染是正常的加载过程，
+	// 不应该被判定为封锁。后续的 Race() 等待会正确处理这种情况。
 
 	return ""
 }
