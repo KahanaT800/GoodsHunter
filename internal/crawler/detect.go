@@ -155,7 +155,7 @@ func (s *Service) detectBlockType(title, html string) string {
 		"cf-turnstile",
 		"ray id:",      // Cloudflare Ray ID
 		"please wait",  // Cloudflare 等待页面
-		"しばらくお待ちください", // 日文：请稍等
+		"しばらくお待ちください",  // 日文：请稍等
 		"ブラウザを確認しています", // 日文：正在验证浏览器
 	}
 	for _, indicator := range cloudflareIndicators {
@@ -175,8 +175,8 @@ func (s *Service) detectBlockType(title, html string) string {
 		"hcaptcha",
 		"verify you are human",
 		"私はロボットではありません", // 日文：我不是机器人
-		"認証が必要です",        // 日文：需要验证
-		"ロボット",            // 日文：机器人
+		"認証が必要です",       // 日文：需要验证
+		"ロボット",          // 日文：机器人
 	}
 	for _, indicator := range captchaIndicators {
 		if strings.Contains(lowerHTML, indicator) {
@@ -189,14 +189,14 @@ func (s *Service) detectBlockType(title, html string) string {
 		"403",
 		"forbidden",
 		"access denied",
-		"アクセスが拒否されました",   // 日文：访问被拒绝
-		"アクセスできません",       // 日文：无法访问
+		"アクセスが拒否されました", // 日文：访问被拒绝
+		"アクセスできません",    // 日文：无法访问
 		"このページにアクセスする権限", // 日文：没有访问此页面的权限
-		"お探しのページは",        // 日文：您查找的页面...（可能被删除/禁止）
-		"エラーが発生しました",      // 日文：发生错误
-		"サーバーエラー",          // 日文：服务器错误
+		"お探しのページは",       // 日文：您查找的页面...（可能被删除/禁止）
+		"エラーが発生しました",     // 日文：发生错误
+		"サーバーエラー",        // 日文：服务器错误
 		"リクエストを処理できません",  // 日文：无法处理请求
-		"不正なアクセス",          // 日文：非法访问
+		"不正なアクセス",        // 日文：非法访问
 		"blocked",
 		"denied",
 	}
@@ -211,11 +211,11 @@ func (s *Service) detectBlockType(title, html string) string {
 		"429",
 		"too many requests",
 		"rate limit",
-		"リクエストが多すぎます",     // 日文：请求过多
-		"しばらく時間をおいてから",    // 日文：请稍后再试
-		"アクセスが集中しています",    // 日文：访问集中
-		"混み合っています",          // 日文：拥挤
-		"時間をおいて再度アクセス",    // 日文：请稍后再访问
+		"リクエストが多すぎます",  // 日文：请求过多
+		"しばらく時間をおいてから", // 日文：请稍后再试
+		"アクセスが集中しています", // 日文：访问集中
+		"混み合っています",     // 日文：拥挤
+		"時間をおいて再度アクセス", // 日文：请稍后再访问
 		"temporarily unavailable",
 		"service unavailable",
 	}
@@ -232,10 +232,10 @@ func (s *Service) detectBlockType(title, html string) string {
 		"error-page",           // 通用错误页面
 		"page-not-found",       // 404 类错误
 		"something went wrong", // 通用错误
-		"問題が発生しました",           // 日文：发生了问题
-		"ページが見つかりません",         // 日文：页面未找到
+		"問題が発生しました",            // 日文：发生了问题
+		"ページが見つかりません",          // 日文：页面未找到
 		"メンテナンス中",              // 日文：维护中
-		"サービスを一時停止",           // 日文：服务暂停
+		"サービスを一時停止",            // 日文：服务暂停
 	}
 	for _, indicator := range mercariErrorIndicators {
 		if strings.Contains(lowerHTML, indicator) || strings.Contains(lowerTitle, indicator) {
@@ -265,7 +265,7 @@ func (s *Service) detectBlockType(title, html string) string {
 		"connection reset",
 		"connection timed out",
 		"ネットワークエラー", // 日文：网络错误
-		"接続できません",    // 日文：无法连接
+		"接続できません",   // 日文：无法连接
 	}
 	for _, indicator := range connectionErrorIndicators {
 		if strings.Contains(lowerHTML, indicator) {
@@ -273,12 +273,15 @@ func (s *Service) detectBlockType(title, html string) string {
 		}
 	}
 
-	// 检测页面内容过少但有基础结构（可能是被拦截后的简化页面）
-	if len(html) > 0 && len(html) < 500 {
-		// 排除正常的空搜索结果页面
-		if !strings.Contains(lowerHTML, "meremptystate") &&
-			!strings.Contains(lowerHTML, "item-cell") &&
-			!strings.Contains(lowerHTML, "search") {
+	// 检测页面内容过少（可能是被拦截后的简化页面）
+	// 条件更严格：只有当页面极短（<200字符）且不包含正常 HTML 结构时才触发
+	if len(html) > 0 && len(html) < 200 {
+		// 排除正常页面：有 body 标签或正常的 Mercari 元素
+		hasNormalStructure := strings.Contains(lowerHTML, "<body") ||
+			strings.Contains(lowerHTML, "meremptystate") ||
+			strings.Contains(lowerHTML, "item-cell") ||
+			strings.Contains(lowerHTML, "search")
+		if !hasNormalStructure {
 			return "suspicious_minimal_page"
 		}
 	}

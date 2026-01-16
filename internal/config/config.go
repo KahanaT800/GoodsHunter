@@ -61,14 +61,14 @@ type RedisConfig struct {
 
 // BrowserConfig 爬虫浏览器配置。
 type BrowserConfig struct {
-	BinPath           string        `json:"bin_path"`            // 浏览器可执行文件路径
-	ProxyURL          string        `json:"proxy_url"`           // 代理服务器 URL
-	Headless          bool          `json:"headless"`            // 是否使用无头模式
-	MaxConcurrency    int           `json:"max_concurrency"`     // 最大并发页面数
-	MaxFetchCount     int           `json:"max_fetch_count"`     // 每次爬取最大数量
-	PageTimeout       time.Duration `json:"page_timeout"`        // 页面加载/元素等待超时
-	DebugScreenshot   bool          `json:"debug_screenshot"`    // 是否启用调试截图（超时时保存截图）
-	ScreenshotTimeout time.Duration `json:"screenshot_timeout"`  // 截图操作超时（默认 15s）
+	BinPath           string        `json:"bin_path"`           // 浏览器可执行文件路径
+	ProxyURL          string        `json:"proxy_url"`          // 代理服务器 URL
+	Headless          bool          `json:"headless"`           // 是否使用无头模式
+	MaxConcurrency    int           `json:"max_concurrency"`    // 最大并发页面数
+	MaxFetchCount     int           `json:"max_fetch_count"`    // 每次爬取最大数量
+	PageTimeout       time.Duration `json:"page_timeout"`       // 页面加载/元素等待超时
+	DebugScreenshot   bool          `json:"debug_screenshot"`   // 是否启用调试截图（超时时保存截图）
+	ScreenshotTimeout time.Duration `json:"screenshot_timeout"` // 截图操作超时（默认 15s）
 }
 
 // EmailConfig 邮件通知配置。
@@ -208,7 +208,7 @@ func getDefaultConfig() *Config {
 			MaxConcurrency:    3,
 			MaxFetchCount:     50,
 			PageTimeout:       2 * time.Minute,
-			DebugScreenshot:   false,          // 默认关闭，需要时手动开启
+			DebugScreenshot:   false,            // 默认关闭，需要时手动开启
 			ScreenshotTimeout: 15 * time.Second, // 截图超时（增加到 15 秒）
 		},
 		Email: EmailConfig{
